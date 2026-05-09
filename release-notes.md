@@ -1,3 +1,18 @@
+# MindFS v0.2.4
+
+## 新功能
+- Android 通知栏和锁屏通知
+- Android 版本更新检查
+- e2ee 覆盖全部接口
+
+## 优化和修复
+- 从 release-notes.md 拉取更新版本，避免 github api 限频问题
+- 修复safari 总输入框被键盘顶飞
+- 移除agent主动探测，出错时依然可以选择和发送
+- 修复 codex 交互时的错误识别不准确
+- 修复 codex 切换 provider 后老 session 交互报错
+
+
 # MindFS v0.2.3
 
 ## 优化和修复
