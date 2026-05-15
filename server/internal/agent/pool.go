@@ -162,6 +162,10 @@ func (p *Pool) KillAgentProcess(agentName string, wait time.Duration) (string, b
 		protocol = DefaultProtocol(agentName)
 	}
 	switch protocol {
+	case ProtocolClaudeSDK:
+		p.closeSessionsForAgent(agentName, ProtocolClaudeSDK)
+		log.Printf("[agent/pool] kill_agent_process.claude_closed agent=%s", agentName)
+		return "", true
 	case ProtocolCodexSDK:
 		p.closeSessionsForAgent(agentName, ProtocolCodexSDK)
 		_ = p.codex.Close(agentName)
@@ -242,7 +246,25 @@ func (p *Pool) closeSessions(entries []*sessionEntry) {
 
 // Config returns the pool configuration.
 func (p *Pool) Config() Config {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	return p.cfg
+}
+
+func (p *Pool) SetAgentEnv(agentName string, env map[string]string) error {
+	if agentName == "" {
+		return errors.New("agent required")
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for i := range p.cfg.Agents {
+		if p.cfg.Agents[i].Name != agentName {
+			continue
+		}
+		p.cfg.Agents[i].Env = cloneEnv(env)
+		return nil
+	}
+	return errors.New("agent not configured: " + agentName)
 }
 
 // Get returns an existing session handle if present.

@@ -281,28 +281,59 @@ func (p *Prober) Stop() {
 
 // ProbeAll 探测所有配置的 Agent
 func (p *Prober) ProbeAll(ctx context.Context) {
-	if p.cfg == nil {
+	defs := p.configuredDefinitions()
+	if len(defs) == 0 {
 		return
 	}
-	p.probeConfiguredAgents(ctx, p.cfg.Agents)
+	p.probeConfiguredAgents(ctx, defs)
 }
 
 // ProbeOne probes a single configured agent with recovery-style timeout control.
 func (p *Prober) ProbeOne(ctx context.Context, name string) Status {
-	if p == nil || p.cfg == nil {
+	if p == nil {
 		return unavailableStatus(strings.TrimSpace(name), false, "config not loaded", time.Now().UTC())
 	}
 	trimmed := strings.TrimSpace(name)
 	if trimmed == "" {
 		return unavailableStatus("", false, "agent required", time.Now().UTC())
 	}
-	def, ok := p.cfg.GetAgent(trimmed)
+	def, ok := p.configuredDefinition(trimmed)
 	if !ok {
 		return unavailableStatus(trimmed, false, "agent not configured", time.Now().UTC())
 	}
 	status := probeConfiguredAgentWithPool(ctx, trimmed, def, p.pool, p.probeSessions, probePhaseRecovery)
 	p.setStatus(status)
 	return status
+}
+
+func (p *Prober) SetAgentEnv(agentName string, env map[string]string) error {
+	if p == nil {
+		return errors.New("prober not configured")
+	}
+	agentName = strings.TrimSpace(agentName)
+	if agentName == "" {
+		return errors.New("agent required")
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.cfg == nil {
+		return errors.New("config not loaded")
+	}
+	for i := range p.cfg.Agents {
+		if p.cfg.Agents[i].Name != agentName {
+			continue
+		}
+		p.cfg.Agents[i].Env = cloneEnv(env)
+		return nil
+	}
+	return errors.New("agent not configured: " + agentName)
+}
+
+func (p *Prober) ClearProbeSession(agentName string) error {
+	if p == nil {
+		return nil
+	}
+	return clearProbeSessionBinding(p.probeSessions, agentName)
 }
 
 // ReportRuntimeFailure marks an agent as unavailable due to a real user-facing runtime failure.
@@ -779,14 +810,35 @@ func supportsAgentFastService(agentName string) bool {
 }
 
 func (p *Prober) collectDefinitions(include func(Status, bool) bool) []Definition {
-	defs := make([]Definition, 0, len(p.cfg.Agents))
-	for _, def := range p.cfg.Agents {
+	all := p.configuredDefinitions()
+	defs := make([]Definition, 0, len(all))
+	for _, def := range all {
 		status, ok := p.GetStatus(def.Name)
 		if !include(status, ok) {
 			continue
 		}
 		defs = append(defs, def)
 	}
+	return defs
+}
+
+func (p *Prober) configuredDefinition(name string) (Definition, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.cfg == nil {
+		return Definition{}, false
+	}
+	return p.cfg.GetAgent(name)
+}
+
+func (p *Prober) configuredDefinitions() []Definition {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.cfg == nil {
+		return nil
+	}
+	defs := make([]Definition, len(p.cfg.Agents))
+	copy(defs, p.cfg.Agents)
 	return defs
 }
 

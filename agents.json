@@ -1,72 +1,157 @@
 {
-  "relayBaseURL": "https://relay.a9gent.com",
   "agents": [
     {
       "name": "gemini",
       "command": "gemini",
-      "args": ["--experimental-acp"]
+      "protocol": "acp",
+      "args": [
+        "--experimental-acp"
+      ],
+      "configBackup": {
+        "fileSources": [
+          "~/.gemini/.env",
+          "~/.gemini/settings.json"
+        ],
+        "envKeys": [
+          "GEMINI_API_KEY",
+          "GOOGLE_GEMINI_BASE_URL",
+          "GEMINI_MODEL"
+        ]
+      }
     },
     {
       "name": "codex",
-      "command": "codex"
+      "command": "codex",
+      "protocol": "codex-sdk",
+      "configBackup": {
+        "fileSources": [
+          "~/.codex/auth.json",
+          "~/.codex/config.toml"
+        ]
+      }
     },
     {
       "name": "claude",
-      "command": "claude"
+      "command": "claude",
+      "protocol": "claude-sdk",
+      "configBackup": {
+        "envKeys": [
+          "ANTHROPIC_AUTH_TOKEN",
+          "ANTHROPIC_BASE_URL",
+          "ANTHROPIC_API_KEY",
+          "ANTHROPIC_MODEL",
+          "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+          "ANTHROPIC_DEFAULT_SONNET_MODEL",
+          "ANTHROPIC_DEFAULT_OPUS_MODEL",
+          "AUTH_MODE"
+        ]
+      }
     },
     {
       "name": "cursor",
       "command": "agent",
-      "args": ["acp"]
+      "protocol": "acp",
+      "args": [
+        "acp"
+      ],
+      "configBackup": {}
     },
     {
       "name": "augment",
       "command": "auggie",
-      "args": ["--acp"]
+      "protocol": "acp",
+      "args": [
+        "--acp"
+      ],
+      "configBackup": {}
     },
     {
       "name": "cline",
       "command": "cline",
-      "args": ["--acp"]
+      "protocol": "acp",
+      "args": [
+        "--acp"
+      ],
+      "configBackup": {}
     },
     {
       "name": "copilot",
       "command": "copilot",
-      "args": ["--acp"]
+      "protocol": "acp",
+      "args": [
+        "--acp"
+      ],
+      "configBackup": {}
     },
     {
       "name": "kimi",
       "command": "kimi",
-      "args": ["acp"]
+      "protocol": "acp",
+      "args": [
+        "acp"
+      ],
+      "configBackup": {}
     },
     {
       "name": "kiro",
       "command": "kiro-cli",
-      "args": ["acp"]
+      "protocol": "acp",
+      "args": [
+        "acp"
+      ],
+      "configBackup": {}
     },
     {
       "name": "openclaw",
       "command": "openclaw",
-      "args": ["acp"]
+      "protocol": "acp",
+      "args": [
+        "acp"
+      ],
+      "configBackup": {
+        "fileSources": [
+          "~/.openclaw/openclaw.json"
+        ]
+      }
     },
     {
       "name": "opencode",
       "command": "opencode",
-      "args": ["acp"]
+      "protocol": "acp",
+      "args": [
+        "acp"
+      ],
+      "configBackup": {
+        "fileSources": [
+          "~/.config/opencode/opencode.json",
+          "~/.local/share/opencode/auth.json"
+        ]
+      }
     },
     {
       "name": "qwen",
       "command": "qwen",
-      "args": ["--acp"]
+      "protocol": "acp",
+      "args": [
+        "--acp"
+      ],
+      "configBackup": {}
     },
     {
       "name": "qoder",
       "command": "qodercli",
-      "args": ["--acp"]
+      "protocol": "acp",
+      "args": [
+        "--acp"
+      ],
+      "configBackup": {}
     },
     {
       "name": "pi",
-      "command": "pi-acp"
+      "command": "pi-acp",
+      "protocol": "acp",
+      "configBackup": {}
     }
-  ]
+  ],
+  "relayBaseURL": "https://relay.a9gent.com"
 }

@@ -36,11 +36,19 @@ type Definition struct {
 	// Env are additional environment variables.
 	Env map[string]string `json:"env,omitempty"`
 
+	// ConfigBackup stores default inputs for config backup flows.
+	ConfigBackup ConfigBackupDefaults `json:"configBackup,omitempty"`
+
 	// CwdTemplate is the working directory template ({root} is replaced).
 	CwdTemplate string `json:"cwdTemplate,omitempty"`
 
 	// ProbeArgs are arguments for availability check.
 	ProbeArgs []string `json:"probeArgs,omitempty"`
+}
+
+type ConfigBackupDefaults struct {
+	FileSources []string `json:"fileSources,omitempty"`
+	EnvKeys     []string `json:"envKeys,omitempty"`
 }
 
 // LoadConfig loads agent configuration from the given path or default location.
@@ -90,6 +98,10 @@ func LoadConfig(path string) (Config, error) {
 }
 
 func defaultConfigPath() (string, error) {
+	return ResolveConfigPath()
+}
+
+func ResolveConfigPath() (string, error) {
 	if hinted := strings.TrimSpace(os.Getenv(configPathEnvKey)); hinted != "" {
 		return hinted, nil
 	}

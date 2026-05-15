@@ -11,6 +11,16 @@ import {
 import { appPath } from "../services/base";
 import { protectedJSON } from "../services/api";
 import { bootstrapService } from "../services/bootstrap";
+import { AgentMenuList } from "./AgentMenuList";
+import { fetchAgents, type AgentStatus } from "../services/agents";
+import {
+  createAgentConfigBackup,
+  deleteAgentConfigBackup,
+  fetchAgentConfigBackups,
+  fetchAgentConfigDefaults,
+  switchAgentConfig,
+  type AgentConfigBackup,
+} from "../services/agentConfig";
 
 type BeforeInstallPromptEvent = Event & {
   prompt: () => Promise<void>;
@@ -81,6 +91,24 @@ type FileTreeProps = {
   onGoHome?: () => void;
 };
 
+type AgentConfigFlow = "backup" | "switch";
+type AgentConfigStep = "agent" | "details" | "confirm";
+
+const fileTreeMenuButtonStyle: React.CSSProperties = {
+  width: "100%",
+  border: "none",
+  background: "transparent",
+  color: "var(--text-primary)",
+  borderRadius: "8px",
+  padding: "8px 10px",
+  display: "flex",
+  alignItems: "center",
+  gap: "8px",
+  textAlign: "left",
+  cursor: "pointer",
+  fontSize: "12px",
+};
+
 const ChevronRight = ({ isOpen }: { isOpen: boolean }) => (
   <svg
     width="14"
@@ -135,6 +163,434 @@ const getFileIcon = (filename: string) => {
   );
 };
 
+function ConfigArchiveIcon() {
+  return (
+    <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 512 512" aria-hidden="true">
+      <path d="M0 0h512v512H0z" fill="none" />
+      <path fill="currentColor" fillRule="evenodd" d="M352 168.296c64.802 0 117.334 29.715 117.334 66.37q0 1.34-.093 2.665l.028-.294h.065v165.925c0 36.656-52.532 66.37-117.334 66.37c-63.361 0-114.992-28.408-117.256-63.936l-.077-2.434V237.037h.073a38 38 0 0 1-.073-2.37c0-36.656 52.532-66.371 117.333-66.371m0 218.074c-28.365 0-54.38-5.694-74.667-15.171v22.317l.018 1.196c.684 12.202 32.466 31.954 74.657 31.954c23.075 0 44.362-5.789 59.26-15.367c10.256-6.594 14.782-12.873 15.34-16.01l.059-.623V371.2c-20.286 9.477-46.3 15.17-74.667 15.17m0-85.333c-28.361 0-54.373-5.693-74.658-15.167l-.002 35.906l1.446-.01c1.73 1.73 5.179 4.59 11.254 8.027c15.143 8.566 37.48 13.91 61.96 13.91s46.818-5.344 61.96-13.91c7.501-4.242 11-7.608 12.2-9.05l.507-.003l.003-34.875c-20.287 9.477-46.303 15.172-74.67 15.172m0-90.075c-41.237 0-74.666 10.984-74.666 24.534s33.43 24.533 74.666 24.533c41.238 0 74.667-10.984 74.667-24.533s-33.43-24.534-74.667-24.534M101.72 51.61l30.173 30.173C109.67 104.807 96 136.14 96 170.666c0 42.82 21.026 80.728 53.316 103.965l.018-82.632H192v149.334H42.667v-42.667l68.446.001c-35.432-31.272-57.78-77.027-57.78-128c0-46.309 18.444-88.31 48.386-119.057" />
+    </svg>
+  );
+}
+
+function ConfigSwitchIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.1" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M7 7h11" />
+      <path d="m15 4 3 3-3 3" />
+      <path d="M17 17H6" />
+      <path d="m9 14-3 3 3 3" />
+    </svg>
+  );
+}
+
+function TrashIcon() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M3 6h18" />
+      <path d="M8 6V4h8v2" />
+      <path d="M19 6l-1 14H6L5 6" />
+      <path d="M10 11v5" />
+      <path d="M14 11v5" />
+    </svg>
+  );
+}
+
+function AgentConfigLineEditor({
+  value,
+  onChange,
+  placeholder,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  placeholder: string;
+}) {
+  const refs = React.useRef<Array<HTMLTextAreaElement | null>>([]);
+  const lines = value.length > 0 ? value.split("\n") : [""];
+
+  const emitLines = React.useCallback((nextLines: string[]) => {
+    onChange(nextLines.join("\n"));
+  }, [onChange]);
+
+  React.useLayoutEffect(() => {
+    for (const node of refs.current) {
+      if (!node) {
+        continue;
+      }
+      node.style.height = "auto";
+      node.style.height = `${node.scrollHeight}px`;
+    }
+  }, [lines]);
+
+  return (
+    <div style={agentConfigLineEditorStyle}>
+      {lines.map((line, index) => (
+        <textarea
+          key={index}
+          ref={(node) => {
+            refs.current[index] = node;
+          }}
+          value={line}
+          onChange={(event) => {
+            const nextValue = event.target.value;
+            const nextLines = [...lines];
+            if (nextValue.includes("\n")) {
+              nextLines.splice(index, 1, ...nextValue.split(/\r?\n/));
+            } else {
+              nextLines[index] = nextValue;
+            }
+            emitLines(nextLines);
+          }}
+          onKeyDown={(event) => {
+            const target = event.currentTarget;
+            if (event.key === "Enter") {
+              event.preventDefault();
+              const before = line.slice(0, target.selectionStart);
+              const after = line.slice(target.selectionEnd);
+              const nextLines = [...lines];
+              nextLines.splice(index, 1, before, after);
+              emitLines(nextLines);
+              window.setTimeout(() => refs.current[index + 1]?.focus(), 0);
+              return;
+            }
+            if (event.key === "Backspace" && target.selectionStart === 0 && target.selectionEnd === 0 && index > 0) {
+              event.preventDefault();
+              const previous = lines[index - 1] || "";
+              const nextLines = [...lines];
+              nextLines.splice(index - 1, 2, previous + line);
+              emitLines(nextLines);
+              window.setTimeout(() => {
+                const previousNode = refs.current[index - 1];
+                previousNode?.focus();
+                previousNode?.setSelectionRange(previous.length, previous.length);
+              }, 0);
+              return;
+            }
+            if (event.key === "Delete" && target.selectionStart === line.length && target.selectionEnd === line.length && index < lines.length - 1) {
+              event.preventDefault();
+              const nextLines = [...lines];
+              nextLines.splice(index, 2, line + (lines[index + 1] || ""));
+              emitLines(nextLines);
+              window.setTimeout(() => {
+                const node = refs.current[index];
+                node?.focus();
+                node?.setSelectionRange(line.length, line.length);
+              }, 0);
+            }
+          }}
+          placeholder={lines.length === 1 && !line ? placeholder : ""}
+          rows={1}
+          style={agentConfigLineTextAreaStyle}
+        />
+      ))}
+    </div>
+  );
+}
+
+function AgentConfigPopover({
+  flow,
+  step,
+  agents,
+  selectedAgent,
+  backupName,
+  fileSourcesBody,
+  envBody,
+  backups,
+  selectedBackupID,
+  confirmMessage,
+  busy,
+  error,
+  onChooseAgent,
+  onBackupNameChange,
+  onFileSourcesChange,
+  onEnvBodyChange,
+  onSelectedBackupChange,
+  onDeleteBackup,
+  onSave,
+  onSwitch,
+  onConfirmSwitch,
+  onCancel,
+}: {
+  flow: AgentConfigFlow;
+  step: AgentConfigStep;
+  agents: AgentStatus[];
+  selectedAgent: string;
+  backupName: string;
+  fileSourcesBody: string;
+  envBody: string;
+  backups: AgentConfigBackup[];
+  selectedBackupID: string;
+  confirmMessage: string;
+  busy: boolean;
+  error: string;
+  onChooseAgent: (name: string) => void;
+  onBackupNameChange: (value: string) => void;
+  onFileSourcesChange: (value: string) => void;
+  onEnvBodyChange: (value: string) => void;
+  onSelectedBackupChange: (value: string) => void;
+  onDeleteBackup: (id: string) => void;
+  onSave: () => void;
+  onSwitch: () => void;
+  onConfirmSwitch: () => void;
+  onCancel: () => void;
+}) {
+  const agentTitle = flow === "backup"
+    ? "选择要备份配置的 agent"
+    : "选择要切换配置的 agent";
+  return (
+    <div
+      style={{
+        width: "100%",
+        padding: "10px",
+        borderRadius: "12px",
+        border: "1px solid var(--border-color)",
+        background: "var(--menu-bg)",
+        boxShadow: "0 12px 30px rgba(15, 23, 42, 0.14)",
+        display: "flex",
+        flexDirection: "column",
+        gap: "10px",
+      }}
+    >
+      {step === "agent" ? (
+        <div style={{ fontSize: "12px", fontWeight: 700, color: "var(--text-primary)" }}>
+          {agentTitle}
+        </div>
+      ) : null}
+      {step === "agent" ? (
+        <>
+          {busy ? (
+            <div style={agentConfigHintStyle}>加载中...</div>
+          ) : agents.length === 0 ? (
+            <div style={agentConfigHintStyle}>没有已安装 Agent</div>
+          ) : (
+            <AgentMenuList
+              agents={agents}
+              selectedAgent={selectedAgent}
+              maxHeight="220px"
+              onSelect={onChooseAgent}
+            />
+          )}
+        </>
+      ) : step === "confirm" ? (
+        <>
+          <div style={{ ...agentConfigHintStyle, color: "var(--text-primary)" }}>
+            {confirmMessage || "目标配置文件已存在，请确保已备份"}
+          </div>
+          <div style={agentConfigActionRowStyle}>
+            <button type="button" disabled={busy} onClick={onCancel} style={agentConfigSecondaryButtonStyle(busy)}>
+              取消
+            </button>
+            <button type="button" disabled={busy} onClick={onConfirmSwitch} style={agentConfigPrimaryButtonStyle(busy)}>
+              继续切换
+            </button>
+          </div>
+        </>
+      ) : flow === "backup" ? (
+        <>
+          <div style={agentConfigFieldStyle}>
+            <label style={agentConfigLabelStyle}>备份名称</label>
+            <input
+              value={backupName}
+              onChange={(event) => onBackupNameChange(event.target.value)}
+              placeholder="work"
+              style={agentConfigInputStyle}
+            />
+          </div>
+          <div style={agentConfigFieldStyle}>
+            <label style={agentConfigLabelStyle}>配置来源</label>
+            <AgentConfigLineEditor
+              value={fileSourcesBody}
+              onChange={onFileSourcesChange}
+              placeholder="每行一个文件路径"
+            />
+          </div>
+          <div style={agentConfigFieldStyle}>
+            <label style={agentConfigLabelStyle}>环境变量</label>
+            <AgentConfigLineEditor
+              value={envBody}
+              onChange={onEnvBodyChange}
+              placeholder="KEY=value，每行一个"
+            />
+          </div>
+          <div style={agentConfigActionRowStyle}>
+            <button type="button" disabled={busy} onClick={onCancel} style={agentConfigSecondaryButtonStyle(busy)}>
+              取消
+            </button>
+            <button type="button" disabled={busy} onClick={onSave} style={agentConfigPrimaryButtonStyle(busy)}>
+              保存
+            </button>
+          </div>
+        </>
+      ) : (
+        <>
+          <div style={{ display: "flex", flexDirection: "column", gap: "6px", maxHeight: "230px", overflow: "auto" }}>
+            {busy ? (
+              <div style={agentConfigHintStyle}>加载中...</div>
+            ) : backups.length === 0 ? (
+              <div style={agentConfigHintStyle}>暂无配置备份</div>
+            ) : (
+              backups.map((item) => {
+                const selected = item.id === selectedBackupID;
+                const summary = `${item.sources?.length || 0} 个文件 / ${item.envKeys?.length || 0} 个环境变量`;
+                return (
+                  <div
+                    key={item.id}
+                    onClick={() => onSelectedBackupChange(item.id)}
+                    style={{
+                      border: "1px solid var(--border-color)",
+                      background: selected ? "var(--selection-bg)" : "transparent",
+                      color: selected ? "var(--accent-color)" : "var(--text-primary)",
+                      borderRadius: "8px",
+                      padding: "8px 10px",
+                      textAlign: "left",
+                      cursor: "pointer",
+                    }}
+                  >
+                    <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                      <div style={{ minWidth: 0, flex: 1 }}>
+                        <div style={{ fontSize: "12px", fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{item.name}</div>
+                        <div style={{ marginTop: "4px", fontSize: "11px", color: "var(--text-secondary)" }}>{summary}</div>
+                      </div>
+                      <button
+                        type="button"
+                        aria-label={`删除配置 ${item.name}`}
+                        title="删除"
+                        disabled={busy}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          onDeleteBackup(item.id);
+                        }}
+                        style={agentConfigIconButtonStyle(busy)}
+                      >
+                        <TrashIcon />
+                      </button>
+                    </div>
+                  </div>
+                );
+              })
+            )}
+          </div>
+          <div style={agentConfigActionRowStyle}>
+            <button type="button" disabled={busy} onClick={onCancel} style={agentConfigSecondaryButtonStyle(busy)}>
+              取消
+            </button>
+            <button type="button" disabled={busy || !selectedBackupID} onClick={onSwitch} style={agentConfigPrimaryButtonStyle(busy || !selectedBackupID)}>
+              切换
+            </button>
+          </div>
+        </>
+      )}
+      {error ? <div style={{ ...agentConfigHintStyle, color: "#dc2626" }}>{error}</div> : null}
+    </div>
+  );
+}
+
+const agentConfigFieldStyle: React.CSSProperties = {
+  display: "flex",
+  flexDirection: "column",
+  gap: "6px",
+};
+
+const agentConfigLabelStyle: React.CSSProperties = {
+  fontSize: "11px",
+  fontWeight: 600,
+  color: "var(--text-secondary)",
+};
+
+const agentConfigInputStyle: React.CSSProperties = {
+  width: "100%",
+  borderRadius: "8px",
+  border: "1px solid var(--border-color)",
+  background: "transparent",
+  color: "var(--text-primary)",
+  fontSize: "12px",
+  padding: "8px 10px",
+  outline: "none",
+  boxSizing: "border-box",
+};
+
+const agentConfigLineEditorStyle: React.CSSProperties = {
+  ...agentConfigInputStyle,
+  minHeight: "42px",
+  maxHeight: "260px",
+  overflow: "auto",
+  padding: "6px",
+  display: "flex",
+  flexDirection: "column",
+  gap: "4px",
+};
+
+const agentConfigLineTextAreaStyle: React.CSSProperties = {
+  width: "100%",
+  border: "none",
+  borderRadius: "6px",
+  background: "rgba(148, 163, 184, 0.16)",
+  color: "var(--text-primary)",
+  fontSize: "12px",
+  padding: "4px 8px",
+  outline: "none",
+  boxSizing: "border-box",
+  minHeight: "28px",
+  resize: "none",
+  lineHeight: "20px",
+  overflow: "hidden",
+  fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
+};
+
+const agentConfigHintStyle: React.CSSProperties = {
+  borderRadius: "8px",
+  padding: "8px 10px",
+  fontSize: "12px",
+  color: "var(--text-secondary)",
+  background: "rgba(148, 163, 184, 0.10)",
+  lineHeight: 1.45,
+  wordBreak: "break-word",
+};
+
+const agentConfigActionRowStyle: React.CSSProperties = {
+  display: "grid",
+  gridTemplateColumns: "1fr 1fr",
+  gap: "8px",
+};
+
+const agentConfigPrimaryButtonStyle = (disabled: boolean): React.CSSProperties => ({
+  border: "none",
+  background: "var(--accent-color)",
+  color: "#fff",
+  borderRadius: "8px",
+  padding: "8px 10px",
+  fontSize: "12px",
+  fontWeight: 600,
+  cursor: disabled ? "not-allowed" : "pointer",
+  opacity: disabled ? 0.6 : 1,
+});
+
+const agentConfigSecondaryButtonStyle = (disabled: boolean): React.CSSProperties => ({
+  border: "1px solid var(--border-color)",
+  background: "transparent",
+  color: "var(--text-secondary)",
+  borderRadius: "8px",
+  padding: "8px 10px",
+  fontSize: "12px",
+  fontWeight: 600,
+  cursor: disabled ? "not-allowed" : "pointer",
+  opacity: disabled ? 0.6 : 1,
+});
+
+const agentConfigIconButtonStyle = (disabled: boolean): React.CSSProperties => ({
+  width: "28px",
+  height: "28px",
+  border: "none",
+  borderRadius: "8px",
+  background: "transparent",
+  color: "#dc2626",
+  display: "inline-flex",
+  alignItems: "center",
+  justifyContent: "center",
+  cursor: disabled ? "not-allowed" : "pointer",
+  opacity: disabled ? 0.5 : 0.9,
+  flexShrink: 0,
+});
+
 export function FileTree({
   entries,
   childrenByPath,
@@ -184,6 +640,18 @@ export function FileTree({
     bootstrapService.canUseProtectedAPI(),
   );
   const [activeRelayTipIndex, setActiveRelayTipIndex] = React.useState(0);
+  const [agentConfigFlow, setAgentConfigFlow] = React.useState<AgentConfigFlow | null>(null);
+  const [agentConfigStep, setAgentConfigStep] = React.useState<AgentConfigStep>("agent");
+  const [agentConfigAgents, setAgentConfigAgents] = React.useState<AgentStatus[]>([]);
+  const [agentConfigAgent, setAgentConfigAgent] = React.useState("");
+  const [agentConfigName, setAgentConfigName] = React.useState("");
+  const [agentConfigFileSourcesBody, setAgentConfigFileSourcesBody] = React.useState("");
+  const [agentConfigEnvBody, setAgentConfigEnvBody] = React.useState("");
+  const [agentConfigBackups, setAgentConfigBackups] = React.useState<AgentConfigBackup[]>([]);
+  const [selectedAgentConfigID, setSelectedAgentConfigID] = React.useState("");
+  const [agentConfigConfirmMessage, setAgentConfigConfirmMessage] = React.useState("");
+  const [agentConfigBusy, setAgentConfigBusy] = React.useState(false);
+  const [agentConfigError, setAgentConfigError] = React.useState("");
   const [dismissedRelayTipIds, setDismissedRelayTipIds] = React.useState<string[]>(() => {
     if (typeof window === "undefined") {
       return [];
@@ -208,6 +676,7 @@ export function FileTree({
     }
   });
   const menuRef = React.useRef<HTMLDivElement | null>(null);
+  const agentConfigPopoverRef = React.useRef<HTMLDivElement | null>(null);
   const updateNotesRef = React.useRef<HTMLDivElement | null>(null);
   const createInputRef = React.useRef<HTMLInputElement | null>(null);
   const previousCreatingRootNameRef = React.useRef<string | null>(null);
@@ -559,6 +1028,141 @@ export function FileTree({
     return () => document.removeEventListener("mousedown", handlePointerDown);
   }, [isMenuOpen]);
 
+  const openAgentConfigFlow = React.useCallback((flow: AgentConfigFlow) => {
+    setAgentConfigFlow(flow);
+    setAgentConfigStep("agent");
+    setAgentConfigAgent("");
+    setAgentConfigName("");
+    setAgentConfigFileSourcesBody("");
+    setAgentConfigEnvBody("");
+    setAgentConfigBackups([]);
+    setSelectedAgentConfigID("");
+    setAgentConfigConfirmMessage("");
+    setAgentConfigError("");
+    setIsMenuOpen(false);
+    setAgentConfigBusy(true);
+    fetchAgents(true)
+      .then((items) => {
+        setAgentConfigAgents(items.filter((item) => item.installed));
+      })
+      .catch((error) => {
+        setAgentConfigError(error instanceof Error ? error.message : "加载 Agent 失败");
+      })
+      .finally(() => setAgentConfigBusy(false));
+  }, []);
+
+  const closeAgentConfigFlow = React.useCallback(() => {
+    setAgentConfigFlow(null);
+    setAgentConfigStep("agent");
+    setAgentConfigError("");
+    setAgentConfigConfirmMessage("");
+  }, []);
+
+  React.useEffect(() => {
+    if (!agentConfigFlow || agentConfigStep !== "agent") {
+      return;
+    }
+    const handlePointerDown = (event: MouseEvent) => {
+      if (!agentConfigPopoverRef.current?.contains(event.target as Node)) {
+        closeAgentConfigFlow();
+      }
+    };
+    document.addEventListener("mousedown", handlePointerDown);
+    return () => document.removeEventListener("mousedown", handlePointerDown);
+  }, [agentConfigFlow, agentConfigStep, closeAgentConfigFlow]);
+
+  const chooseAgentForConfig = React.useCallback(async (agentName: string) => {
+    setAgentConfigAgent(agentName);
+    setAgentConfigError("");
+    setAgentConfigBusy(true);
+    try {
+      if (agentConfigFlow === "backup") {
+        const defaults = await fetchAgentConfigDefaults(agentName);
+        setAgentConfigName("");
+        setAgentConfigFileSourcesBody((defaults.file_sources || []).join("\n"));
+        setAgentConfigEnvBody((defaults.env_keys || []).map((key) => `${key}=`).join("\n"));
+        setAgentConfigStep("details");
+      } else {
+        const backups = await fetchAgentConfigBackups(agentName);
+        setAgentConfigBackups(backups);
+        setSelectedAgentConfigID("");
+        setAgentConfigStep("details");
+      }
+    } catch (error) {
+      setAgentConfigError(error instanceof Error ? error.message : "加载配置失败");
+    } finally {
+      setAgentConfigBusy(false);
+    }
+  }, [agentConfigFlow]);
+
+  const saveAgentConfigBackup = React.useCallback(async () => {
+    if (!agentConfigName.trim()) {
+      setAgentConfigError("请填写备份名称");
+      return;
+    }
+    const fileSources = agentConfigFileSourcesBody.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    const envLines = agentConfigEnvBody.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    setAgentConfigBusy(true);
+    setAgentConfigError("");
+    try {
+      await createAgentConfigBackup({
+        agent: agentConfigAgent,
+        name: agentConfigName.trim(),
+        fileSources,
+        envLines,
+      });
+      closeAgentConfigFlow();
+    } catch (error) {
+      setAgentConfigError(error instanceof Error ? error.message : "保存备份失败");
+    } finally {
+      setAgentConfigBusy(false);
+    }
+  }, [agentConfigAgent, agentConfigEnvBody, agentConfigFileSourcesBody, agentConfigName, closeAgentConfigFlow]);
+
+  const runAgentConfigSwitch = React.useCallback(async (confirmOverwrite = false) => {
+    if (!selectedAgentConfigID) {
+      setAgentConfigError("请选择配置");
+      return;
+    }
+    setAgentConfigBusy(true);
+    setAgentConfigError("");
+    try {
+      const result = await switchAgentConfig({ id: selectedAgentConfigID, confirmOverwrite });
+      if (result.needs_confirm) {
+        setAgentConfigConfirmMessage(result.message || "目标配置文件已存在，请确保已备份");
+        setAgentConfigStep("confirm");
+        return;
+      }
+      closeAgentConfigFlow();
+    } catch (error) {
+      setAgentConfigError(error instanceof Error ? error.message : "切换配置失败");
+    } finally {
+      setAgentConfigBusy(false);
+    }
+  }, [closeAgentConfigFlow, selectedAgentConfigID]);
+
+  const deleteSelectedAgentConfigBackup = React.useCallback(async (id: string) => {
+    const trimmedID = String(id || "").trim();
+    if (!trimmedID) {
+      return;
+    }
+    setAgentConfigBusy(true);
+    setAgentConfigError("");
+    try {
+      const result = await deleteAgentConfigBackup(trimmedID);
+      const nextBackups = (result.backups || agentConfigBackups)
+        .filter((item) => item.agent === agentConfigAgent && item.id !== trimmedID);
+      setAgentConfigBackups(nextBackups);
+      if (selectedAgentConfigID === trimmedID) {
+        setSelectedAgentConfigID("");
+      }
+    } catch (error) {
+      setAgentConfigError(error instanceof Error ? error.message : "删除配置失败");
+    } finally {
+      setAgentConfigBusy(false);
+    }
+  }, [agentConfigAgent, agentConfigBackups, selectedAgentConfigID]);
+
   React.useEffect(() => {
     if (visibleRelayTips.length === 0) {
       setActiveRelayTipIndex(0);
@@ -866,6 +1470,22 @@ export function FileTree({
                   </svg>
                   <span>添加项目</span>
                 </button>
+                <button
+                  type="button"
+                  onClick={() => openAgentConfigFlow("backup")}
+                  style={fileTreeMenuButtonStyle}
+                >
+                  <ConfigArchiveIcon />
+                  <span>Agent 配置备份</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => openAgentConfigFlow("switch")}
+                  style={fileTreeMenuButtonStyle}
+                >
+                  <ConfigSwitchIcon />
+                  <span>Agent 配置切换</span>
+                </button>
                 <div style={{ height: "1px", background: "var(--border-color)", margin: "6px 4px" }} />
                 <div style={{ padding: "4px 8px", fontSize: "11px", color: "var(--text-secondary)" }}>全局排序</div>
                 {DIRECTORY_SORT_OPTIONS.map((option) => {
@@ -935,6 +1555,53 @@ export function FileTree({
             </div>
           ) : null}
         </div>
+        {agentConfigFlow ? (
+          <div
+            ref={agentConfigPopoverRef}
+            style={{
+              position: "absolute",
+              top: "calc(100% + 6px)",
+              left: "8px",
+              right: "3px",
+              zIndex: 35,
+            }}
+          >
+            <AgentConfigPopover
+              flow={agentConfigFlow}
+              step={agentConfigStep}
+              agents={agentConfigAgents}
+              selectedAgent={agentConfigAgent}
+              backupName={agentConfigName}
+              fileSourcesBody={agentConfigFileSourcesBody}
+              envBody={agentConfigEnvBody}
+              backups={agentConfigBackups}
+              selectedBackupID={selectedAgentConfigID}
+              confirmMessage={agentConfigConfirmMessage}
+              busy={agentConfigBusy}
+              error={agentConfigError}
+              onChooseAgent={(name) => {
+                void chooseAgentForConfig(name);
+              }}
+              onBackupNameChange={setAgentConfigName}
+              onFileSourcesChange={setAgentConfigFileSourcesBody}
+              onEnvBodyChange={setAgentConfigEnvBody}
+              onSelectedBackupChange={setSelectedAgentConfigID}
+              onDeleteBackup={(id) => {
+                void deleteSelectedAgentConfigBackup(id);
+              }}
+              onSave={() => {
+                void saveAgentConfigBackup();
+              }}
+              onSwitch={() => {
+                void runAgentConfigSwitch(false);
+              }}
+              onConfirmSwitch={() => {
+                void runAgentConfigSwitch(true);
+              }}
+              onCancel={closeAgentConfigFlow}
+            />
+          </div>
+        ) : null}
       </div>
       <div style={{ padding: "8px", flex: 1, minHeight: 0, overflow: "auto" }}>
         {renderEntries(entries, 0, rootId || "")}

@@ -85,6 +85,7 @@ import { DefaultListView } from "./components/DefaultListView";
 import { SessionList } from "./components/SessionList";
 import { ExternalSessionList } from "./components/ExternalSessionList";
 import { AgentIcon } from "./components/AgentIcon";
+import { AgentMenuList } from "./components/AgentMenuList";
 import { ActionBar } from "./components/ActionBar";
 import { ToastContainer } from "./components/Toast";
 import { BottomSheet } from "./components/BottomSheet";
@@ -7323,87 +7324,24 @@ export function App({ onGoHome }: AppProps) {
         >
           <div
             style={{
-              display: "flex",
-              flexDirection: "column",
-              gap: "4px",
-              maxHeight: "180px",
-              overflow: "auto",
+              fontSize: "12px",
+              fontWeight: 700,
+              color: "var(--text-primary)",
             }}
           >
-            {availableAgents.map((item) => {
-              const selected = item.name === externalImportAgent;
-              return (
-                <button
-                  key={item.name}
-                  type="button"
-                  onClick={() => {
-                    setImportMenuOpen(false);
-                    setExternalImportAgent(item.name);
-                    setExternalSelectedKey("");
-                    void enterImportMode(item.name);
-                  }}
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    gap: "8px",
-                    width: "100%",
-                    border: "1px solid transparent",
-                    background: selected
-                      ? "rgba(59, 130, 246, 0.1)"
-                      : "transparent",
-                    color: selected
-                      ? "var(--accent-color)"
-                      : "var(--text-primary)",
-                    borderRadius: "8px",
-                    padding: "8px 10px",
-                    cursor: "pointer",
-                    textAlign: "left",
-                    opacity: 1,
-                  }}
-                >
-                  <AgentIcon
-                    agentName={item.name}
-                    style={{
-                      width: "14px",
-                      height: "14px",
-                      display: "block",
-                    }}
-                  />
-                  <span
-                    style={{
-                      flex: 1,
-                      minWidth: 0,
-                      fontSize: "12px",
-                      fontWeight: 500,
-                    }}
-                  >
-                    {item.name}
-                  </span>
-                  {!item.available ? (
-                    <span
-                      aria-label="当前未就绪"
-                      title="当前未就绪"
-                      style={{
-                        minWidth: "11px",
-                        height: "11px",
-                        padding: "0 2px",
-                        borderRadius: "50%",
-                        background: "#d97706",
-                        color: "#fff",
-                        fontSize: "9px",
-                        lineHeight: "11px",
-                        textAlign: "center",
-                        flexShrink: 0,
-                        fontWeight: 700,
-                      }}
-                    >
-                      !
-                    </span>
-                  ) : null}
-                </button>
-              );
-            })}
+            选择要导入会话的 agent
           </div>
+          <AgentMenuList
+            agents={availableAgents}
+            selectedAgent={externalImportAgent}
+            maxHeight="180px"
+            onSelect={(agentName) => {
+              setImportMenuOpen(false);
+              setExternalImportAgent(agentName);
+              setExternalSelectedKey("");
+              void enterImportMode(agentName);
+            }}
+          />
           <label
             style={{
               display: "flex",
