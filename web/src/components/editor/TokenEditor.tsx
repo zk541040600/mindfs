@@ -18,6 +18,7 @@ import {
   KEY_ENTER_COMMAND,
   LexicalEditor,
   NodeKey,
+  PASTE_COMMAND,
   SerializedTextNode,
   Spread,
   TextNode,
@@ -285,6 +286,95 @@ function triggerChar(tokenType: ActiveTokenType): "@" | "/" | "#" {
   return "/";
 }
 
+function getPasteDataTransfer(event: ClipboardEvent | InputEvent | KeyboardEvent): DataTransfer | null {
+  if (typeof ClipboardEvent !== "undefined" && event instanceof ClipboardEvent) {
+    return event.clipboardData;
+  }
+  if (typeof InputEvent !== "undefined" && event instanceof InputEvent) {
+    return event.dataTransfer;
+  }
+  return null;
+}
+
+function getPlainTextFromPasteEvent(event: ClipboardEvent | InputEvent | KeyboardEvent): string {
+  const dataTransfer = getPasteDataTransfer(event);
+  return dataTransfer?.getData("text/plain") || dataTransfer?.getData("text/uri-list") || "";
+}
+
+function pasteEventHasFiles(event: ClipboardEvent | InputEvent | KeyboardEvent): boolean {
+  const dataTransfer = getPasteDataTransfer(event);
+  return Array.from(dataTransfer?.items || []).some((item) => item.kind === "file");
+}
+
+function isAndroidUserAgent(): boolean {
+  return typeof navigator !== "undefined" && /Android/i.test(navigator.userAgent);
+}
+
+function isKeyboardPasteInput(event: InputEvent): boolean {
+  const data = event.data || "";
+  return event.inputType === "insertFromPaste"
+    || event.inputType === "insertFromPasteAsQuotation"
+    || !!event.dataTransfer
+    || data.includes("\n")
+    || data.includes("\r");
+}
+
+function isPossibleAndroidKeyboardPaste(event: InputEvent): boolean {
+  const data = event.data || "";
+  return isAndroidUserAgent()
+    && event.inputType === "insertText"
+    && !event.isComposing
+    && data.length > 1
+    && !data.includes("\n")
+    && !data.includes("\r");
+}
+
+async function readClipboardTextFallback(): Promise<string> {
+  try {
+    const mod = await import("@capacitor/clipboard");
+    const result = await mod.Clipboard.read();
+    if (result.value) {
+      return result.value;
+    }
+  } catch {
+    // Fall through to the browser clipboard API.
+  }
+  try {
+    return await navigator.clipboard?.readText?.() || "";
+  } catch {
+    return "";
+  }
+}
+
+function $insertPlainTextAtSelection(text: string): boolean {
+  if (text === "") {
+    return false;
+  }
+  let selection = $getSelection();
+  if (!$isRangeSelection(selection)) {
+    $getRoot().selectEnd();
+    selection = $getSelection();
+  }
+  if (!$isRangeSelection(selection)) {
+    return false;
+  }
+  const parts = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
+  for (let index = 0; index < parts.length; index += 1) {
+    const part = parts[index];
+    if (part) {
+      selection.insertText(part);
+    }
+    if (index < parts.length - 1) {
+      selection.insertLineBreak();
+    }
+    selection = $getSelection();
+    if (!$isRangeSelection(selection)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 function EditorBridge({
   onChange,
   onReady,
@@ -298,13 +388,79 @@ function EditorBridge({
 }) {
   const [editor] = useLexicalComposerContext();
   const rootRef = useRef<HTMLDivElement | null>(null);
+  const [rootElement, setRootElement] = useState<HTMLDivElement | null>(null);
 
   useEffect(() => {
     return editor.registerRootListener((rootElement) => {
       rootRef.current = rootElement as HTMLDivElement | null;
+      setRootElement(rootRef.current);
       onReady({ editor, root: rootRef.current });
     });
   }, [editor, onReady]);
+
+  useEffect(() => {
+    if (!rootElement) {
+      return;
+    }
+    const insertFromNativePaste = (event: ClipboardEvent | InputEvent) => {
+      if (pasteEventHasFiles(event)) {
+        return;
+      }
+      const text = getPlainTextFromPasteEvent(event);
+      const inputText = typeof InputEvent !== "undefined" && event instanceof InputEvent ? event.data || "" : "";
+      event.preventDefault();
+      event.stopPropagation();
+      event.stopImmediatePropagation();
+      const insert = (nextText: string) => {
+        if (nextText === "") {
+          return;
+        }
+        editor.update(() => {
+          $insertPlainTextAtSelection(nextText);
+        });
+        rootElement.focus({ preventScroll: true });
+      };
+      if (text !== "") {
+        insert(text);
+        return;
+      }
+      void readClipboardTextFallback().then((clipboardText) => {
+        insert(clipboardText || inputText);
+      });
+    };
+    const insertFromPossibleKeyboardPaste = (event: InputEvent) => {
+      const data = event.data || "";
+      event.preventDefault();
+      event.stopPropagation();
+      event.stopImmediatePropagation();
+      void readClipboardTextFallback().then((clipboardText) => {
+        const normalizedClipboard = clipboardText.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+        const nextText = normalizedClipboard.includes("\n") && normalizedClipboard.startsWith(data)
+          ? clipboardText
+          : data;
+        editor.update(() => {
+          $insertPlainTextAtSelection(nextText);
+        });
+        rootElement.focus({ preventScroll: true });
+      });
+    };
+    const handlePaste = (event: ClipboardEvent) => insertFromNativePaste(event);
+    const handleBeforeInput = (event: InputEvent) => {
+      if (isKeyboardPasteInput(event)) {
+        insertFromNativePaste(event);
+        return;
+      }
+      if (isPossibleAndroidKeyboardPaste(event)) {
+        insertFromPossibleKeyboardPaste(event);
+      }
+    };
+    rootElement.addEventListener("paste", handlePaste, { capture: true });
+    rootElement.addEventListener("beforeinput", handleBeforeInput, { capture: true });
+    return () => {
+      rootElement.removeEventListener("paste", handlePaste, { capture: true });
+      rootElement.removeEventListener("beforeinput", handleBeforeInput, { capture: true });
+    };
+  }, [editor, rootElement]);
 
   useEffect(() => {
     return editor.registerUpdateListener(({ editorState }) => {
@@ -317,6 +473,27 @@ function EditorBridge({
       });
     });
   }, [editor, onChange]);
+
+  useEffect(() => {
+    return editor.registerCommand(
+      PASTE_COMMAND,
+      (event) => {
+        if (pasteEventHasFiles(event)) {
+          return false;
+        }
+        const text = getPlainTextFromPasteEvent(event);
+        if (text === "") {
+          return false;
+        }
+        event.preventDefault();
+        if ($insertPlainTextAtSelection(text)) {
+          return true;
+        }
+        return false;
+      },
+      COMMAND_PRIORITY_HIGH
+    );
+  }, [editor]);
 
   useEffect(() => {
     return editor.registerCommand(

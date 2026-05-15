@@ -367,11 +367,12 @@ export function ActionBar({
 
   const handleEditorChange = useCallback((payload: {
     serializedText: string;
+    displayText: string;
     activeToken: { type: "file" | "slash" | "prompt"; query: string } | null;
   }) => {
     setSerializedInput(payload.serializedText);
     setActiveToken(payload.activeToken);
-    if (payload.serializedText.length === 0) {
+    if (payload.displayText.trim().length === 0) {
       setIsMultiLine(false);
       return;
     }
