@@ -28,6 +28,7 @@ type DefaultListViewProps = {
   showGitHistory?: boolean;
   onToggleGitHistory?: () => void;
   onCreateWorktree?: () => void;
+  onSwitchWorktree?: () => void;
   onRemoveWorktree?: () => void;
   menuOverlay?: React.ReactNode;
 };
@@ -62,7 +63,12 @@ function formatCompactSize(size?: number): string {
   return `${value.toFixed(fractionDigits).replace(/\.0+$|(\.\d*[1-9])0+$/, "$1")} ${units[unitIndex]}`;
 }
 
-function GitBranchMenuIcon({ marker }: { marker?: "plus" | "minus" }) {
+function GitBranchMenuIcon({ marker }: { marker?: "plus" | "minus" | "switch" }) {
+  const markerPath = marker === "plus"
+      ? "M19 16v6M16 19h6"
+    : marker === "minus"
+      ? "M16 19h6"
+      : "M21 17.5h-7M18 14.5l3 3M13.8 21h7M13.8 21l3 3";
   return (
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true" style={{ flexShrink: 0 }}>
       <path
@@ -71,10 +77,11 @@ function GitBranchMenuIcon({ marker }: { marker?: "plus" | "minus" }) {
       />
       {marker ? (
         <path
-          d={marker === "plus" ? "M19 16v6M16 19h6" : "M16 19h6"}
+          d={markerPath}
           stroke="currentColor"
-          strokeWidth="2.6"
+          strokeWidth={marker === "switch" ? "1.7" : "2.6"}
           strokeLinecap="round"
+          strokeLinejoin="round"
         />
       ) : null}
     </svg>
@@ -163,6 +170,7 @@ export function DefaultListView({
   showGitHistory = true,
   onToggleGitHistory,
   onCreateWorktree,
+  onSwitchWorktree,
   onRemoveWorktree,
   menuOverlay = null,
 }: DefaultListViewProps) {
@@ -364,6 +372,32 @@ export function DefaultListView({
                       >
                         <GitBranchMenuIcon marker="plus" />
                         <span>创建 worktree</span>
+                      </button>
+                    ) : null}
+                    {isGitRepo ? (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          onSwitchWorktree?.();
+                          setIsMenuOpen(false);
+                        }}
+                        style={{
+                          width: "100%",
+                          border: "none",
+                          background: "transparent",
+                          color: "var(--text-primary)",
+                          borderRadius: "8px",
+                          padding: "8px 10px",
+                          display: "flex",
+                          alignItems: "center",
+                          gap: "8px",
+                          textAlign: "left",
+                          cursor: "pointer",
+                          fontSize: "12px",
+                        }}
+                      >
+                        <GitBranchMenuIcon marker="switch" />
+                        <span>切换 worktree</span>
                       </button>
                     ) : null}
                     {isGitWorktree ? (
