@@ -7993,7 +7993,9 @@ export function App({ onGoHome }: AppProps) {
           </BottomSheet>
         }
       />
-      {e2eeState.required && !e2eeState.unlocked ? (
+      {bootstrapState.phase === "needs_pairing" &&
+        e2eeState.required &&
+        !e2eeState.unlocked ? (
         <div
           style={{
             position: "fixed",
