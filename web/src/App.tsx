@@ -124,6 +124,8 @@ export type SessionItem = {
   created_at?: string;
   updated_at?: string;
   closed_at?: string;
+  title?: string;
+  agent_session_id?: string;
   context_window?: {
     totalTokens: number;
     modelContextWindow: number;
@@ -990,8 +992,13 @@ export function App({ onGoHome }: AppProps) {
   const [externalSelectedKey, setExternalSelectedKey] = useState("");
   const [externalImportAgent, setExternalImportAgent] = useState("");
   const [externalFilterBound, setExternalFilterBound] = useState(true);
-  const [importingExternalSessionKey, setImportingExternalSessionKey] =
-    useState("");
+  const [selectedExternalImportKeys, setSelectedExternalImportKeys] = useState<
+    Set<string>
+  >(() => new Set());
+  const [importingExternalSessionKeys, setImportingExternalSessionKeys] =
+    useState<Set<string>>(() => new Set());
+  const [confirmingExternalImport, setConfirmingExternalImport] =
+    useState(false);
   const [importMenuOpen, setImportMenuOpen] = useState(false);
   const importMenuRef = useRef<HTMLDivElement | null>(null);
   const projectAddPopoverRef = useRef<HTMLDivElement | null>(null);
@@ -3423,6 +3430,8 @@ export function App({ onGoHome }: AppProps) {
   const exitImportMode = useCallback(() => {
     setSessionListMode("local");
     setExternalSelectedKey("");
+    setSelectedExternalImportKeys(new Set());
+    setImportingExternalSessionKeys(new Set());
     setImportMenuOpen(false);
   }, []);
 
@@ -3435,6 +3444,8 @@ export function App({ onGoHome }: AppProps) {
       }
       setExternalImportAgent(trimmedAgent);
       setExternalSelectedKey("");
+      setSelectedExternalImportKeys(new Set());
+      setImportingExternalSessionKeys(new Set());
       setSessionListMode("import");
       await loadExternalSessions(rootID, trimmedAgent, { replace: true });
     },
@@ -3464,60 +3475,97 @@ export function App({ onGoHome }: AppProps) {
     }
   }, [externalImportAgent, loadExternalSessions, loadingOlderExternalSessions]);
 
-  const handleImportExternalSession = useCallback(
-    async (session: SessionItem) => {
-      const rootID = currentRootIdRef.current || "";
-      const sessionKey = String(
-        (session as any)?.agent_session_id || session?.key || "",
-      ).trim();
-      if (
-        !rootID ||
-        !externalImportAgent ||
-        !sessionKey ||
-        importingExternalSessionKey
-      ) {
+  const toggleExternalImportSelection = useCallback((session: SessionItem) => {
+    const sessionKey = String(
+      session.agent_session_id || session.key || "",
+    ).trim();
+    if (!sessionKey) {
+      return;
+    }
+    setSelectedExternalImportKeys((current) => {
+      const next = new Set(current);
+      if (next.has(sessionKey)) {
+        next.delete(sessionKey);
+      } else {
+        next.add(sessionKey);
+      }
+      return next;
+    });
+  }, []);
+
+  const handleConfirmExternalImport = useCallback(async () => {
+    const rootID = currentRootIdRef.current || "";
+    const sessionKeys = [...selectedExternalImportKeys].filter(Boolean);
+    if (
+      !rootID ||
+      !externalImportAgent ||
+      !sessionKeys.length ||
+      confirmingExternalImport
+    ) {
+      return;
+    }
+    setConfirmingExternalImport(true);
+    setImportingExternalSessionKeys(new Set(sessionKeys));
+    try {
+      const imported = await sessionService.importExternalSessionsBatch(
+        rootID,
+        externalImportAgent,
+        sessionKeys,
+      );
+      const results = imported?.items || [];
+      const successItems = results.filter((item) => item.success && item.session_key);
+      if (!imported || !successItems.length) {
+        reportError("session.import_failed", "导入会话失败");
         return;
       }
-      setImportingExternalSessionKey(sessionKey);
-      try {
-        const imported = await sessionService.importExternalSession(
-          rootID,
-          externalImportAgent,
-          sessionKey,
+      const failedKeys = new Set(
+        results
+          .filter((item) => !item.success)
+          .map((item) => String(item.agent_session_id || "").trim())
+          .filter(Boolean),
+      );
+      if (failedKeys.size > 0) {
+        reportError(
+          "session.import_failed",
+          `部分会话导入失败：${failedKeys.size} 项`,
         );
-        if (!imported?.session_key) {
-          reportError("session.import_failed", "导入会话失败");
-          return;
-        }
+      }
+      setSelectedExternalImportKeys(failedKeys);
+      if (failedKeys.size === 0) {
         exitImportMode();
-        const next = (await sessionService.fetchSessions(
-          rootID,
-          {},
-        )) as SessionItem[];
-        setHasMoreSessions(next.length >= 50);
-        setSessions(next);
+      }
+      const next = (await sessionService.fetchSessions(rootID, {})) as SessionItem[];
+      setHasMoreSessions(next.length >= 50);
+      setSessions(next);
+      const firstImported = successItems[0];
+      if (firstImported?.session_key) {
+        const source = externalSessionsRef.current.find((item) =>
+          String(item.agent_session_id || item.key || "").trim() ===
+          String(firstImported.agent_session_id || "").trim(),
+        );
         await handleSelectSession({
-          key: imported.session_key,
+          key: firstImported.session_key,
           root_id: rootID,
           type: "chat",
           agent: externalImportAgent,
-          name: session.name,
+          name: source?.name,
         } as SessionItem);
-        if (isMobile) {
-          setIsRightOpen(false);
-        }
-      } finally {
-        setImportingExternalSessionKey("");
       }
-    },
-    [
-      exitImportMode,
-      externalImportAgent,
-      handleSelectSession,
-      importingExternalSessionKey,
-      isMobile,
-    ],
-  );
+      if (isMobile && failedKeys.size === 0) {
+        setIsRightOpen(false);
+      }
+    } finally {
+      setConfirmingExternalImport(false);
+      setImportingExternalSessionKeys(new Set());
+    }
+  }, [
+    confirmingExternalImport,
+    exitImportMode,
+    externalImportAgent,
+    handleSelectSession,
+    isMobile,
+    selectedExternalImportKeys,
+  ]);
 
   const handleSendMessage = useCallback(
     async (
@@ -5344,6 +5392,7 @@ export function App({ onGoHome }: AppProps) {
     if (sessionListMode !== "import") return;
     const rootID = currentRootIdRef.current || "";
     if (!rootID || !externalImportAgent) return;
+    setSelectedExternalImportKeys(new Set());
     void loadExternalSessions(rootID, externalImportAgent, { replace: true });
   }, [
     sessionListMode,
@@ -7719,11 +7768,13 @@ export function App({ onGoHome }: AppProps) {
         sessions={externalSessions}
         selectedKey={externalSelectedKey}
         selectedAgent={externalImportAgent}
-        importingKey={importingExternalSessionKey}
+        importingKeys={importingExternalSessionKeys}
+        selectedImportKeys={selectedExternalImportKeys}
         filterBound={externalFilterBound}
         headerAction={sessionImportMenu}
         loading={loadingExternalSessions}
         loadingOlder={loadingOlderExternalSessions}
+        confirmingImport={confirmingExternalImport}
         hasMore={hasMoreExternalSessions}
         onBack={exitImportMode}
         onSelect={(session) =>
@@ -7731,8 +7782,9 @@ export function App({ onGoHome }: AppProps) {
             String(session.key || session.session_key || ""),
           )
         }
-        onImport={(session) => {
-          void handleImportExternalSession(session);
+        onToggleImport={toggleExternalImportSelection}
+        onConfirmImport={() => {
+          void handleConfirmExternalImport();
         }}
         onLoadOlder={() => {
           void handleLoadOlderExternalSessions();
@@ -7756,7 +7808,14 @@ export function App({ onGoHome }: AppProps) {
             ? "未找到匹配会话"
             : sessionSearchOpen
               ? ""
-            : "暂无会话记录"
+            : (
+              <span>
+                这里是空的，
+                <strong style={{ color: "var(--text-primary)", fontWeight: 800 }}>
+                  如果项目中已有会话，请点击上方导入按钮，导入后会话可以继续
+                </strong>
+              </span>
+            )
         }
         onSearchToggle={() => {
           setSessionSearchOpen((prev) => {

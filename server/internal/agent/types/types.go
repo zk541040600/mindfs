@@ -81,6 +81,7 @@ type ExternalSessionSummary struct {
 	Agent          string    `json:"agent"`
 	AgentSessionID string    `json:"agent_session_id"`
 	Cwd            string    `json:"cwd,omitempty"`
+	Title          string    `json:"title,omitempty"`
 	FirstUserText  string    `json:"-"`
 	UpdatedAt      time.Time `json:"updated_at"`
 }
@@ -97,6 +98,8 @@ type ListExternalSessionsInput struct {
 type ListExternalSessionsResult struct {
 	Items []ExternalSessionSummary `json:"items"`
 }
+
+type ExternalSessionVisitFunc func(ExternalSessionSummary) (bool, error)
 
 type ImportExternalSessionInput struct {
 	RootPath       string
@@ -115,6 +118,7 @@ type ImportedExternalSession struct {
 	Agent          string
 	AgentSessionID string
 	Cwd            string
+	Title          string
 	Exchanges      []ImportedExchange
 }
 
@@ -122,6 +126,11 @@ type ExternalSessionImporter interface {
 	AgentName() string
 	ListExternalSessions(ctx context.Context, in ListExternalSessionsInput) (ListExternalSessionsResult, error)
 	ImportExternalSession(ctx context.Context, in ImportExternalSessionInput) (ImportedExternalSession, error)
+}
+
+type StreamingExternalSessionImporter interface {
+	ExternalSessionImporter
+	ScanExternalSessions(ctx context.Context, in ListExternalSessionsInput, visit ExternalSessionVisitFunc) error
 }
 
 type ModelInfo struct {

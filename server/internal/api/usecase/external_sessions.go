@@ -2,6 +2,7 @@ package usecase
 
 import (
 	"context"
+	"errors"
 	"log"
 	"path/filepath"
 	"strings"
@@ -36,6 +37,24 @@ type ImportExternalSessionOutput struct {
 	Agent          string `json:"agent"`
 	AgentSessionID string `json:"agent_session_id"`
 	ImportedCount  int    `json:"imported_count"`
+}
+
+type ImportExternalSessionsBatchInput struct {
+	RootID          string
+	Agent           string
+	AgentSessionIDs []string
+}
+
+type ImportExternalSessionsBatchItem struct {
+	AgentSessionID string `json:"agent_session_id"`
+	SessionKey     string `json:"session_key,omitempty"`
+	ImportedCount  int    `json:"imported_count,omitempty"`
+	Success        bool   `json:"success"`
+	Error          string `json:"error,omitempty"`
+}
+
+type ImportExternalSessionsBatchOutput struct {
+	Items []ImportExternalSessionsBatchItem `json:"items"`
 }
 
 type SyncExternalSessionDeltaInput struct {
@@ -73,58 +92,64 @@ func (s *Service) ListExternalSessions(ctx context.Context, in ListExternalSessi
 	rootPath := normalizeExternalSessionPath(root.RootPath)
 	items := make([]agenttypes.ExternalSessionSummary, 0, limit)
 	seen := make(map[string]struct{})
-	beforeTime := in.BeforeTime
-	for len(items) < limit {
-		batchLimit := externalSessionBatchLimit(limit, len(items))
-		result, err := importer.ListExternalSessions(ctx, agenttypes.ListExternalSessionsInput{
+	visit := func(item agenttypes.ExternalSessionSummary) (bool, error) {
+		if _, ok := seen[item.AgentSessionID]; ok {
+			return true, nil
+		}
+		seen[item.AgentSessionID] = struct{}{}
+		if normalizeExternalSessionPath(item.Cwd) != rootPath {
+			return true, nil
+		}
+		firstUserText := strings.TrimSpace(item.FirstUserText)
+		if strings.HasPrefix(firstUserText, buildSessionNamePrompt("")) {
+			return true, nil
+		}
+		if in.FilterBound {
+			bound, err := manager.HasAgentBinding(ctx, in.Agent, item.AgentSessionID)
+			if err != nil {
+				return false, err
+			}
+			if bound {
+				return true, nil
+			}
+		}
+		item.FirstUserText = stripExternalSessionPrefix(item.FirstUserText)
+		items = append(items, item)
+		return len(items) < limit, nil
+	}
+	if streaming, ok := importer.(agenttypes.StreamingExternalSessionImporter); ok {
+		err := streaming.ScanExternalSessions(ctx, agenttypes.ListExternalSessionsInput{
 			RootPath:    root.RootPath,
 			Agent:       in.Agent,
-			BeforeTime:  beforeTime,
+			BeforeTime:  in.BeforeTime,
 			AfterTime:   in.AfterTime,
-			Limit:       batchLimit,
+			Limit:       limit,
 			FilterBound: false,
-		})
+		}, visit)
 		if err != nil {
 			return ListExternalSessionsOutput{}, err
 		}
-		if len(result.Items) == 0 {
+		return ListExternalSessionsOutput{Items: items}, nil
+	}
+	result, err := importer.ListExternalSessions(ctx, agenttypes.ListExternalSessionsInput{
+		RootPath:    root.RootPath,
+		Agent:       in.Agent,
+		BeforeTime:  in.BeforeTime,
+		AfterTime:   in.AfterTime,
+		Limit:       limit,
+		FilterBound: false,
+	})
+	if err != nil {
+		return ListExternalSessionsOutput{}, err
+	}
+	for _, item := range result.Items {
+		shouldContinue, err := visit(item)
+		if err != nil {
+			return ListExternalSessionsOutput{}, err
+		}
+		if !shouldContinue {
 			break
 		}
-		for _, item := range result.Items {
-			if _, ok := seen[item.AgentSessionID]; ok {
-				continue
-			}
-			seen[item.AgentSessionID] = struct{}{}
-			if normalizeExternalSessionPath(item.Cwd) != rootPath {
-				continue
-			}
-			firstUserText := strings.TrimSpace(item.FirstUserText)
-			if strings.HasPrefix(firstUserText, buildSessionNamePrompt("")) {
-				continue
-			}
-			if in.FilterBound {
-				bound, err := manager.HasAgentBinding(ctx, in.Agent, item.AgentSessionID)
-				if err != nil {
-					return ListExternalSessionsOutput{}, err
-				}
-				if bound {
-					continue
-				}
-			}
-			item.FirstUserText = stripExternalSessionPrefix(item.FirstUserText)
-			items = append(items, item)
-			if len(items) >= limit {
-				break
-			}
-		}
-		if len(result.Items) < batchLimit {
-			break
-		}
-		oldest := result.Items[len(result.Items)-1].UpdatedAt
-		if oldest.IsZero() {
-			break
-		}
-		beforeTime = oldest
 	}
 	return ListExternalSessionsOutput{Items: items}, nil
 }
@@ -186,6 +211,46 @@ func (s *Service) ImportExternalSession(ctx context.Context, in ImportExternalSe
 		AgentSessionID: imported.AgentSessionID,
 		ImportedCount:  importedCount,
 	}, nil
+}
+
+func (s *Service) ImportExternalSessionsBatch(ctx context.Context, in ImportExternalSessionsBatchInput) (ImportExternalSessionsBatchOutput, error) {
+	seen := make(map[string]struct{})
+	ids := make([]string, 0, len(in.AgentSessionIDs))
+	for _, id := range in.AgentSessionIDs {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	if len(ids) == 0 {
+		return ImportExternalSessionsBatchOutput{}, errors.New("agent_session_ids are required")
+	}
+
+	out := ImportExternalSessionsBatchOutput{Items: make([]ImportExternalSessionsBatchItem, 0, len(ids))}
+	for _, id := range ids {
+		imported, err := s.ImportExternalSession(ctx, ImportExternalSessionInput{
+			RootID:         in.RootID,
+			Agent:          in.Agent,
+			AgentSessionID: id,
+		})
+		item := ImportExternalSessionsBatchItem{AgentSessionID: id}
+		if err != nil {
+			item.Success = false
+			item.Error = err.Error()
+			out.Items = append(out.Items, item)
+			continue
+		}
+		item.Success = true
+		item.SessionKey = imported.SessionKey
+		item.ImportedCount = imported.ImportedCount
+		out.Items = append(out.Items, item)
+	}
+	return out, nil
 }
 
 func (s *Service) SyncExternalSessionDelta(ctx context.Context, in SyncExternalSessionDeltaInput) (SyncExternalSessionDeltaOutput, error) {
@@ -299,6 +364,13 @@ func lastExternalSyncTimestamp(exchanges []session.Exchange) time.Time {
 }
 
 func buildImportedSessionName(imported agenttypes.ImportedExternalSession) string {
+	if title := strings.TrimSpace(imported.Title); title != "" {
+		runes := []rune(title)
+		if len(runes) > 80 {
+			title = string(runes[:80])
+		}
+		return title
+	}
 	preview := ""
 	for _, item := range imported.Exchanges {
 		if item.Role != "user" {
@@ -317,17 +389,6 @@ func buildImportedSessionName(imported agenttypes.ImportedExternalSession) strin
 		preview = string(runes[:40])
 	}
 	return preview
-}
-
-func externalSessionBatchLimit(limit, collected int) int {
-	remaining := limit - collected
-	if remaining < 20 {
-		remaining = 20
-	}
-	if remaining < limit {
-		return limit
-	}
-	return remaining
 }
 
 func normalizeExternalSessionPath(path string) string {

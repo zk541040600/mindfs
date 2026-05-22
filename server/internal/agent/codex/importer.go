@@ -24,6 +24,7 @@ type ImporterOptions struct {
 type Importer struct {
 	agentName string
 	baseDir   string
+	titlePath string
 	mu        sync.RWMutex
 	index     map[string]codexSessionFile
 }
@@ -32,15 +33,26 @@ type codexSessionFile struct {
 	Path           string
 	AgentSessionID string
 	Cwd            string
+	Title          string
 	FirstUserText  string
 	UpdatedAt      time.Time
 }
 
+type sessionFileCandidate struct {
+	Path      string
+	UpdatedAt time.Time
+}
+
 func NewImporter(opts ImporterOptions) *Importer {
-	home, _ := os.UserHomeDir()
+	codexHome := strings.TrimSpace(os.Getenv("CODEX_HOME"))
+	if codexHome == "" {
+		home, _ := os.UserHomeDir()
+		codexHome = filepath.Join(strings.TrimSpace(home), ".codex")
+	}
 	return &Importer{
 		agentName: strings.TrimSpace(opts.AgentName),
-		baseDir:   filepath.Join(strings.TrimSpace(home), ".codex", "sessions"),
+		baseDir:   filepath.Join(codexHome, "sessions"),
+		titlePath: filepath.Join(codexHome, "session_index.jsonl"),
 		index:     make(map[string]codexSessionFile),
 	}
 }
@@ -49,28 +61,33 @@ func (i *Importer) AgentName() string {
 	return i.agentName
 }
 
-func (i *Importer) ListExternalSessions(_ context.Context, in agenttypes.ListExternalSessionsInput) (agenttypes.ListExternalSessionsResult, error) {
+func (i *Importer) ListExternalSessions(ctx context.Context, in agenttypes.ListExternalSessionsInput) (agenttypes.ListExternalSessionsResult, error) {
 	limit := in.Limit
 	if limit <= 0 {
 		limit = 20
 	}
-	files, err := i.scanSessionFiles(in.BeforeTime, in.AfterTime, limit)
+	items := make([]agenttypes.ExternalSessionSummary, 0, limit)
+	err := i.ScanExternalSessions(ctx, in, func(item agenttypes.ExternalSessionSummary) (bool, error) {
+		items = append(items, item)
+		return len(items) < limit, nil
+	})
 	if err != nil {
 		return agenttypes.ListExternalSessionsResult{}, err
 	}
-
-	items := make([]agenttypes.ExternalSessionSummary, 0, len(files))
-	for _, item := range files {
-		items = append(items, agenttypes.ExternalSessionSummary{
-			Agent:          i.agentName,
-			AgentSessionID: item.AgentSessionID,
-			Cwd:            item.Cwd,
-			FirstUserText:  item.FirstUserText,
-			UpdatedAt:      item.UpdatedAt,
-		})
-	}
-
 	return agenttypes.ListExternalSessionsResult{Items: items}, nil
+}
+
+func (i *Importer) ScanExternalSessions(ctx context.Context, in agenttypes.ListExternalSessionsInput, visit agenttypes.ExternalSessionVisitFunc) error {
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 20
+	}
+	files, err := i.scanSessionFiles(ctx, in.BeforeTime, in.AfterTime, limit, visit)
+	if err != nil {
+		return err
+	}
+	i.storeSessionFiles(files)
+	return nil
 }
 
 func (i *Importer) ImportExternalSession(_ context.Context, in agenttypes.ImportExternalSessionInput) (agenttypes.ImportedExternalSession, error) {
@@ -92,10 +109,11 @@ func (i *Importer) ImportExternalSession(_ context.Context, in agenttypes.Import
 			Agent:          i.agentName,
 			AgentSessionID: targetID,
 			Cwd:            file.Cwd,
+			Title:          file.Title,
 			Exchanges:      exchanges,
 		}, nil
 	}
-	files, err := i.scanSessionFiles(time.Time{}, time.Time{}, int(^uint(0)>>1))
+	files, err := i.scanSessionFiles(context.Background(), time.Time{}, time.Time{}, int(^uint(0)>>1), nil)
 	if err != nil {
 		return agenttypes.ImportedExternalSession{}, err
 	}
@@ -112,51 +130,100 @@ func (i *Importer) ImportExternalSession(_ context.Context, in agenttypes.Import
 			Agent:          i.agentName,
 			AgentSessionID: targetID,
 			Cwd:            file.Cwd,
+			Title:          file.Title,
 			Exchanges:      exchanges,
 		}, nil
 	}
 	return agenttypes.ImportedExternalSession{}, errors.New("external session not found")
 }
 
-func (i *Importer) scanSessionFiles(before, after time.Time, limit int) ([]codexSessionFile, error) {
+func (i *Importer) scanSessionFiles(ctx context.Context, before, after time.Time, limit int, visit agenttypes.ExternalSessionVisitFunc) ([]codexSessionFile, error) {
 	if strings.TrimSpace(i.baseDir) == "" {
 		return nil, nil
 	}
 	if limit <= 0 {
 		limit = 20
 	}
+	titles := readCodexSessionTitles(i.titlePath)
 	items := make([]codexSessionFile, 0)
-	err := filepath.WalkDir(i.baseDir, func(path string, d os.DirEntry, walkErr error) error {
+	paths, err := sortedSessionJSONLFiles(i.baseDir)
+	if err != nil {
+		return nil, err
+	}
+	for _, candidate := range paths {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if !before.IsZero() && !candidate.UpdatedAt.Before(before) {
+			continue
+		}
+		if !after.IsZero() && !candidate.UpdatedAt.After(after) {
+			break
+		}
+		item, ok, err := inspectCodexSessionFile(candidate.Path)
+		if err != nil {
+			log.Printf("[agent/codex/importer] inspect session file failed path=%s err=%v", candidate.Path, err)
+			continue
+		}
+		if !ok {
+			continue
+		}
+		item.Title = titles[item.AgentSessionID]
+		if visit != nil {
+			shouldContinue, err := visit(agenttypes.ExternalSessionSummary{
+				Agent:          i.agentName,
+				AgentSessionID: item.AgentSessionID,
+				Cwd:            item.Cwd,
+				Title:          item.Title,
+				FirstUserText:  item.FirstUserText,
+				UpdatedAt:      item.UpdatedAt,
+			})
+			if err != nil {
+				return nil, err
+			}
+			items = append(items, item)
+			if !shouldContinue {
+				return items, nil
+			}
+			continue
+		}
+		items = appendSortedCodexSession(items, item)
+		if len(items) > limit {
+			items = items[:limit]
+		}
+	}
+	i.storeSessionFiles(items)
+	return items, nil
+}
+
+func sortedSessionJSONLFiles(baseDir string) ([]sessionFileCandidate, error) {
+	items := make([]sessionFileCandidate, 0)
+	err := filepath.WalkDir(baseDir, func(path string, d os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return nil
 		}
 		if d == nil || d.IsDir() || filepath.Ext(path) != ".jsonl" {
 			return nil
 		}
-		item, ok, err := inspectCodexSessionFile(path)
+		info, err := d.Info()
 		if err != nil {
-			log.Printf("[agent/codex/importer] inspect session file failed path=%s err=%v", path, err)
 			return nil
 		}
-		if !ok {
-			return nil
-		}
-		if !before.IsZero() && !item.UpdatedAt.Before(before) {
-			return nil
-		}
-		if !after.IsZero() && !item.UpdatedAt.After(after) {
-			return nil
-		}
-		items = appendSortedCodexSession(items, item)
-		if len(items) > limit {
-			items = items[:limit]
-		}
+		items = append(items, sessionFileCandidate{
+			Path:      path,
+			UpdatedAt: info.ModTime().UTC(),
+		})
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	i.storeSessionFiles(items)
+	sort.Slice(items, func(i, j int) bool {
+		if !items[i].UpdatedAt.Equal(items[j].UpdatedAt) {
+			return items[i].UpdatedAt.After(items[j].UpdatedAt)
+		}
+		return items[i].Path > items[j].Path
+	})
 	return items, nil
 }
 
@@ -182,6 +249,33 @@ func (i *Importer) lookupSessionFile(sessionID, rootPath string) (codexSessionFi
 		return codexSessionFile{}, false
 	}
 	return item, true
+}
+
+func readCodexSessionTitles(path string) map[string]string {
+	titles := make(map[string]string)
+	file, err := os.Open(path)
+	if err != nil {
+		return titles
+	}
+	defer file.Close()
+
+	_ = forEachJSONLLine(file, func(line string) error {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			return nil
+		}
+		var raw map[string]any
+		if err := json.Unmarshal([]byte(line), &raw); err != nil {
+			return nil
+		}
+		id := strings.TrimSpace(asString(raw["id"]))
+		title := strings.TrimSpace(asString(raw["thread_name"]))
+		if id != "" && title != "" {
+			titles[id] = title
+		}
+		return nil
+	})
+	return titles
 }
 
 func inspectCodexSessionFile(path string) (codexSessionFile, bool, error) {

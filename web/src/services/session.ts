@@ -884,6 +884,37 @@ class SessionService {
       return null;
     }
   }
+
+  async importExternalSessionsBatch(
+    rootId: string,
+    agent: string,
+    agentSessionIds: string[],
+  ): Promise<{
+    items: Array<{
+      agent_session_id: string;
+      session_key?: string;
+      imported_count?: number;
+      success: boolean;
+      error?: string;
+    }>;
+  } | null> {
+    try {
+      return await protectedJSON(appURL("/api/sessions/import/batch"), {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          root_id: rootId,
+          agent,
+          agent_session_ids: agentSessionIds,
+        }),
+      });
+    } catch (err) {
+      console.error("[Session] Failed to import external sessions:", err);
+      return null;
+    }
+  }
 }
 
 export const sessionService = new SessionService();

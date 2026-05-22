@@ -26,7 +26,7 @@ type SessionListProps = {
   searchResultsMode?: boolean;
   searchQuery?: string;
   searchLoading?: boolean;
-  emptyText?: string;
+  emptyText?: React.ReactNode;
   onSearchToggle?: () => void;
   onSearchBack?: () => void;
   onSearchQueryChange?: (query: string) => void;
@@ -280,7 +280,13 @@ export function SessionList({
               style={{
                 fontSize: "12px",
                 color: "var(--text-secondary)",
-                padding: "12px 8px",
+                minHeight: "100%",
+                padding: "12px 18px",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                textAlign: "center",
+                lineHeight: 1.6,
               }}
             >
               {emptyText}

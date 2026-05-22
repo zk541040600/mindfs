@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from "react";
+import React from "react";
 import type { SessionItem } from "./SessionList";
 
 type ExternalSessionListProps = {
@@ -6,14 +6,18 @@ type ExternalSessionListProps = {
   selectedKey?: string;
   selectedAgent?: string;
   importingKey?: string;
+  importingKeys?: Set<string>;
+  selectedImportKeys?: Set<string>;
   filterBound?: boolean;
   headerAction?: React.ReactNode;
   onBack?: () => void;
   onSelect?: (session: SessionItem) => void;
-  onImport?: (session: SessionItem) => void;
+  onToggleImport?: (session: SessionItem) => void;
+  onConfirmImport?: () => void;
   onLoadOlder?: () => void;
   loading?: boolean;
   loadingOlder?: boolean;
+  confirmingImport?: boolean;
   hasMore?: boolean;
 };
 
@@ -22,16 +26,22 @@ export function ExternalSessionList({
   selectedKey = "",
   selectedAgent = "",
   importingKey = "",
+  importingKeys,
+  selectedImportKeys,
   filterBound = true,
   headerAction,
   onBack,
   onSelect,
-  onImport,
+  onToggleImport,
+  onConfirmImport,
   onLoadOlder,
   loading = false,
   loadingOlder = false,
+  confirmingImport = false,
   hasMore = false,
 }: ExternalSessionListProps) {
+  const selectedCount = selectedImportKeys?.size || 0;
+  const busy = confirmingImport || Boolean(importingKey) || Boolean(importingKeys?.size);
   return (
     <div
       style={{
@@ -88,10 +98,14 @@ export function ExternalSessionList({
                 key={session.key}
                 session={session}
                 selected={session.key === selectedKey}
-                importing={String(session.key || "") === importingKey}
-                importDisabled={Boolean(importingKey)}
+                checked={Boolean(selectedImportKeys?.has(externalSessionKey(session)))}
+                importing={
+                  String(session.key || "") === importingKey ||
+                  Boolean(importingKeys?.has(externalSessionKey(session)))
+                }
+                importDisabled={busy}
                 onSelect={onSelect}
-                onImport={onImport}
+                onToggleImport={onToggleImport}
               />
             ))}
             {hasMore ? (
@@ -116,6 +130,41 @@ export function ExternalSessionList({
           </div>
         )}
       </div>
+      {selectedAgent && sessions.length ? (
+        <div
+          style={{
+            flexShrink: 0,
+            borderTop: "1px solid var(--border-color)",
+            padding: "8px 10px",
+            background: "var(--mindfs-topbar-bg, transparent)",
+          }}
+        >
+          <button
+            type="button"
+            disabled={!selectedCount || busy}
+            onClick={onConfirmImport}
+            style={{
+              width: "100%",
+              border: "1px solid var(--border-color)",
+              borderRadius: "10px",
+              background: "var(--accent-color)",
+              color: "#fff",
+              padding: "10px 12px",
+              fontSize: "12px",
+              fontWeight: 600,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              gap: "8px",
+              cursor: !selectedCount || busy ? "not-allowed" : "pointer",
+              opacity: !selectedCount || busy ? 0.72 : 1,
+              whiteSpace: "nowrap",
+            }}
+          >
+            {busy ? "导入中..." : `确认导入 ${selectedCount} 项`}
+          </button>
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -123,32 +172,20 @@ export function ExternalSessionList({
 function ExternalSessionCard({
   session,
   selected,
+  checked,
   importing,
   importDisabled,
   onSelect,
-  onImport,
+  onToggleImport,
 }: {
   session: SessionItem;
   selected: boolean;
+  checked: boolean;
   importing: boolean;
   importDisabled: boolean;
   onSelect?: (session: SessionItem) => void;
-  onImport?: (session: SessionItem) => void;
+  onToggleImport?: (session: SessionItem) => void;
 }) {
-  const [menuOpen, setMenuOpen] = useState(false);
-  const menuRef = useRef<HTMLDivElement | null>(null);
-
-  useEffect(() => {
-    if (!menuOpen) return;
-    const handlePointerDown = (event: MouseEvent) => {
-      if (!menuRef.current?.contains(event.target as Node)) {
-        setMenuOpen(false);
-      }
-    };
-    document.addEventListener("mousedown", handlePointerDown);
-    return () => document.removeEventListener("mousedown", handlePointerDown);
-  }, [menuOpen]);
-
   const displayName = session.name || session.key || "External Session";
   const subtitle = formatTime(session.updated_at || session.created_at || "");
 
@@ -166,13 +203,23 @@ function ExternalSessionCard({
     >
       <button
         type="button"
-        onClick={() => onSelect?.(session)}
+        onClick={() => {
+          if (onToggleImport && !importDisabled) {
+            onToggleImport(session);
+            return;
+          }
+          onSelect?.(session);
+        }}
         style={{
           textAlign: "left",
           padding: "7px 6px 7px 6px",
           borderRadius: "8px",
           border: "1px solid transparent",
-          background: selected ? "rgba(59, 130, 246, 0.1)" : "transparent",
+          background: checked
+            ? "var(--selection-bg)"
+            : selected
+              ? "rgba(59, 130, 246, 0.1)"
+              : "transparent",
           cursor: "pointer",
           flex: 1,
           minWidth: 0,
@@ -187,7 +234,10 @@ function ExternalSessionCard({
             style={{
               fontSize: "13px",
               fontWeight: selected ? 600 : 500,
-              color: selected ? "var(--accent-color)" : "var(--text-primary)",
+              color:
+                checked || selected
+                  ? "var(--accent-color)"
+                  : "var(--text-primary)",
               whiteSpace: "nowrap",
               overflow: "hidden",
               textOverflow: "ellipsis",
@@ -222,82 +272,17 @@ function ExternalSessionCard({
         </div>
       </button>
 
-      <div ref={menuRef} style={{ position: "relative", flexShrink: 0 }}>
-        <button
-          type="button"
-          aria-label="外部会话菜单"
-          onClick={(e) => {
-            e.stopPropagation();
-            if (importDisabled) return;
-            setMenuOpen((open) => !open);
-          }}
-          disabled={importDisabled}
-          style={{
-            width: "24px",
-            height: "24px",
-            borderRadius: "8px",
-            border: "none",
-            background: menuOpen ? "rgba(0, 0, 0, 0.06)" : "transparent",
-            color: importDisabled
-              ? "rgba(100, 116, 139, 0.55)"
-              : "var(--text-secondary)",
-            display: "inline-flex",
-            alignItems: "center",
-            justifyContent: "center",
-            cursor: importDisabled ? "default" : "pointer",
-          }}
-        >
-          <DotsIcon />
-        </button>
-        {menuOpen ? (
-          <div
-            style={{
-              position: "absolute",
-              top: "calc(100% + 6px)",
-              right: 0,
-              minWidth: "120px",
-              padding: "6px",
-              borderRadius: "10px",
-              border: "1px solid var(--border-color)",
-              background: "var(--menu-bg)",
-              boxShadow: "0 12px 30px rgba(15, 23, 42, 0.14)",
-              zIndex: 20,
-            }}
-          >
-            <button
-              type="button"
-              onClick={(e) => {
-                e.stopPropagation();
-                if (importDisabled) return;
-                setMenuOpen(false);
-                onImport?.(session);
-              }}
-              disabled={importDisabled}
-              style={{
-                ...menuItemStyle,
-                color: importDisabled
-                  ? "rgba(100, 116, 139, 0.55)"
-                  : "var(--text-primary)",
-                cursor: importDisabled ? "default" : "pointer",
-              }}
-            >
-              <ImportActionIcon
-                style={{
-                  width: "14px",
-                  height: "14px",
-                  color: importDisabled
-                    ? "rgba(100, 116, 139, 0.55)"
-                    : "#16a34a",
-                  flexShrink: 0,
-                }}
-              />
-              {importing ? "导入中..." : "导入"}
-            </button>
-          </div>
-        ) : null}
-      </div>
+      {importing ? (
+        <div style={{ flexShrink: 0, color: "var(--text-secondary)" }}>
+          <SpinnerIcon />
+        </div>
+      ) : null}
     </div>
   );
+}
+
+function externalSessionKey(session: SessionItem): string {
+  return String((session as any)?.agent_session_id || session.key || "").trim();
 }
 
 function formatTime(value?: string) {
@@ -316,22 +301,6 @@ const emptyStyle: React.CSSProperties = {
   fontSize: "12px",
   color: "var(--text-secondary)",
   padding: "12px 8px",
-};
-
-const menuItemStyle: React.CSSProperties = {
-  width: "100%",
-  border: "none",
-  background: "transparent",
-  color: "var(--text-primary)",
-  borderRadius: "8px",
-  padding: "8px 10px",
-  display: "flex",
-  alignItems: "center",
-  gap: "8px",
-  textAlign: "left",
-  cursor: "pointer",
-  fontSize: "12px",
-  fontWeight: 500,
 };
 
 function iconButtonStyle(withGap: boolean): React.CSSProperties {
@@ -369,22 +338,6 @@ function ChevronLeftIcon() {
   );
 }
 
-function DotsIcon() {
-  return (
-    <svg
-      width="14"
-      height="14"
-      viewBox="0 0 24 24"
-      fill="currentColor"
-      aria-hidden="true"
-    >
-      <circle cx="12" cy="5" r="1.8" />
-      <circle cx="12" cy="12" r="1.8" />
-      <circle cx="12" cy="19" r="1.8" />
-    </svg>
-  );
-}
-
 function SpinnerIcon() {
   return (
     <svg width="10" height="10" viewBox="0 0 16 16" aria-hidden="true">
@@ -413,21 +366,6 @@ function SpinnerIcon() {
           repeatCount="indefinite"
         />
       </path>
-    </svg>
-  );
-}
-
-function ImportActionIcon({ style }: { style?: React.CSSProperties }) {
-  return (
-    <svg
-      width="14"
-      height="14"
-      viewBox="0 0 24 24"
-      fill="currentColor"
-      aria-hidden="true"
-      style={style}
-    >
-      <path d="M1 12h9.8L8.3 9.5l1.4-1.4l4.9 4.9l-4.9 4.9l-1.4-1.4l2.5-2.5H1zM21 2H3c-1.1 0-2 .9-2 2v6.1h2V6h18v14H3v-4H1v4c0 1.1.9 2 2 2h18c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2" />
     </svg>
   );
 }

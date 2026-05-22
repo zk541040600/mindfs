@@ -254,6 +254,7 @@ func (h *HTTPHandler) Routes() http.Handler {
 	r.Get("/api/sessions/search", h.protectedEndpoint(h.handleSessionSearch))
 	r.Get("/api/sessions/external", h.protectedEndpoint(h.handleExternalSessionsList))
 	r.Post("/api/sessions/import", h.protectedEndpoint(h.handleExternalSessionImport))
+	r.Post("/api/sessions/import/batch", h.protectedEndpoint(h.handleExternalSessionImportBatch))
 	r.Get("/api/sessions/{key}", h.protectedEndpoint(h.handleSessionGet))
 	r.Get("/api/sessions/{key}/related-files", h.protectedEndpoint(h.handleSessionRelatedFilesGet))
 	r.Post("/api/sessions/{key}/rename", h.protectedEndpoint(h.handleSessionRename))
@@ -507,6 +508,52 @@ func (h *HTTPHandler) handleExternalSessionImport(w http.ResponseWriter, r *http
 	respondJSON(w, http.StatusOK, out)
 }
 
+func (h *HTTPHandler) handleExternalSessionImportBatch(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		RootID          string   `json:"root_id"`
+		Agent           string   `json:"agent"`
+		AgentSessionIDs []string `json:"agent_session_ids"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, errInvalidRequest("invalid json body"))
+		return
+	}
+	req.RootID = strings.TrimSpace(req.RootID)
+	req.Agent = strings.TrimSpace(req.Agent)
+	if req.RootID == "" || req.Agent == "" || len(req.AgentSessionIDs) == 0 {
+		respondError(w, http.StatusBadRequest, errInvalidRequest("root_id, agent, agent_session_ids are required"))
+		return
+	}
+	uc := h.service()
+	out, err := uc.ImportExternalSessionsBatch(r.Context(), usecase.ImportExternalSessionsBatchInput{
+		RootID:          req.RootID,
+		Agent:           req.Agent,
+		AgentSessionIDs: req.AgentSessionIDs,
+	})
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err)
+		return
+	}
+	if h.AppContext != nil {
+		for _, item := range out.Items {
+			if !item.Success || strings.TrimSpace(item.SessionKey) == "" {
+				continue
+			}
+			h.AppContext.GetSessionStreamHub().BroadcastAll(WSResponse{
+				Type: "session.imported",
+				Payload: map[string]any{
+					"root_id":          req.RootID,
+					"session_key":      item.SessionKey,
+					"agent":            req.Agent,
+					"agent_session_id": item.AgentSessionID,
+					"imported_count":   item.ImportedCount,
+				},
+			})
+		}
+	}
+	respondJSON(w, http.StatusOK, out)
+}
+
 func (h *HTTPHandler) handleSessionGet(w http.ResponseWriter, r *http.Request) {
 	rootID := r.URL.Query().Get("root")
 	key := chi.URLParam(r, "key")
@@ -727,7 +774,10 @@ func sessionListResponse(s *session.Session) map[string]any {
 }
 
 func externalSessionListResponse(s agenttypes.ExternalSessionSummary) map[string]any {
-	name := strings.TrimSpace(s.FirstUserText)
+	name := strings.TrimSpace(s.Title)
+	if name == "" {
+		name = strings.TrimSpace(s.FirstUserText)
+	}
 	if name == "" {
 		name = s.AgentSessionID
 	}
@@ -737,6 +787,7 @@ func externalSessionListResponse(s agenttypes.ExternalSessionSummary) map[string
 		"agent":            s.Agent,
 		"model":            "",
 		"name":             name,
+		"title":            strings.TrimSpace(s.Title),
 		"created_at":       s.UpdatedAt,
 		"updated_at":       s.UpdatedAt,
 		"closed_at":        nil,

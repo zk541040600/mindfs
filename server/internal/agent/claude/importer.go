@@ -36,6 +36,11 @@ type claudeSessionFile struct {
 	UpdatedAt      time.Time
 }
 
+type sessionFileCandidate struct {
+	Path      string
+	UpdatedAt time.Time
+}
+
 func NewImporter(opts ImporterOptions) *Importer {
 	home, _ := os.UserHomeDir()
 	return &Importer{
@@ -49,7 +54,7 @@ func (i *Importer) AgentName() string {
 	return i.agentName
 }
 
-func (i *Importer) ListExternalSessions(_ context.Context, in agenttypes.ListExternalSessionsInput) (agenttypes.ListExternalSessionsResult, error) {
+func (i *Importer) ListExternalSessions(ctx context.Context, in agenttypes.ListExternalSessionsInput) (agenttypes.ListExternalSessionsResult, error) {
 	rootPath := normalizeComparablePath(in.RootPath)
 	if rootPath == "" {
 		return agenttypes.ListExternalSessionsResult{}, errors.New("root path required")
@@ -58,23 +63,32 @@ func (i *Importer) ListExternalSessions(_ context.Context, in agenttypes.ListExt
 	if limit <= 0 {
 		limit = 20
 	}
-	files, err := i.scanSessionFiles(rootPath, in.BeforeTime, in.AfterTime, limit)
+	items := make([]agenttypes.ExternalSessionSummary, 0, limit)
+	err := i.ScanExternalSessions(ctx, in, func(item agenttypes.ExternalSessionSummary) (bool, error) {
+		items = append(items, item)
+		return len(items) < limit, nil
+	})
 	if err != nil {
 		return agenttypes.ListExternalSessionsResult{}, err
 	}
-
-	items := make([]agenttypes.ExternalSessionSummary, 0, len(files))
-	for _, item := range files {
-		items = append(items, agenttypes.ExternalSessionSummary{
-			Agent:          i.agentName,
-			AgentSessionID: item.AgentSessionID,
-			Cwd:            item.Cwd,
-			FirstUserText:  item.FirstUserText,
-			UpdatedAt:      item.UpdatedAt,
-		})
-	}
-
 	return agenttypes.ListExternalSessionsResult{Items: items}, nil
+}
+
+func (i *Importer) ScanExternalSessions(ctx context.Context, in agenttypes.ListExternalSessionsInput, visit agenttypes.ExternalSessionVisitFunc) error {
+	rootPath := normalizeComparablePath(in.RootPath)
+	if rootPath == "" {
+		return errors.New("root path required")
+	}
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 20
+	}
+	files, err := i.scanSessionFiles(ctx, rootPath, in.BeforeTime, in.AfterTime, limit, visit)
+	if err != nil {
+		return err
+	}
+	i.storeSessionFiles(files)
+	return nil
 }
 
 func (i *Importer) ImportExternalSession(_ context.Context, in agenttypes.ImportExternalSessionInput) (agenttypes.ImportedExternalSession, error) {
@@ -99,7 +113,7 @@ func (i *Importer) ImportExternalSession(_ context.Context, in agenttypes.Import
 			Exchanges:      exchanges,
 		}, nil
 	}
-	files, err := i.scanSessionFiles(rootPath, time.Time{}, time.Time{}, int(^uint(0)>>1))
+	files, err := i.scanSessionFiles(context.Background(), rootPath, time.Time{}, time.Time{}, int(^uint(0)>>1), nil)
 	if err != nil {
 		return agenttypes.ImportedExternalSession{}, err
 	}
@@ -122,7 +136,7 @@ func (i *Importer) ImportExternalSession(_ context.Context, in agenttypes.Import
 	return agenttypes.ImportedExternalSession{}, errors.New("external session not found")
 }
 
-func (i *Importer) scanSessionFiles(rootPath string, before, after time.Time, limit int) ([]claudeSessionFile, error) {
+func (i *Importer) scanSessionFiles(ctx context.Context, rootPath string, before, after time.Time, limit int, visit agenttypes.ExternalSessionVisitFunc) ([]claudeSessionFile, error) {
 	if strings.TrimSpace(i.baseDir) == "" {
 		return nil, nil
 	}
@@ -144,37 +158,82 @@ func (i *Importer) scanSessionFiles(rootPath string, before, after time.Time, li
 		limit = 20
 	}
 	items := make([]claudeSessionFile, 0)
-	err = filepath.WalkDir(dir, func(path string, d os.DirEntry, walkErr error) error {
+	paths, err := sortedSessionJSONLFiles(dir)
+	if err != nil {
+		return nil, err
+	}
+	for _, candidate := range paths {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if !before.IsZero() && !candidate.UpdatedAt.Before(before) {
+			continue
+		}
+		if !after.IsZero() && !candidate.UpdatedAt.After(after) {
+			break
+		}
+		item, ok, err := inspectClaudeSessionFile(candidate.Path)
+		if err != nil {
+			log.Printf("[agent/claude/importer] inspect session file failed path=%s err=%v", candidate.Path, err)
+			continue
+		}
+		if !ok {
+			continue
+		}
+		if visit != nil {
+			shouldContinue, err := visit(agenttypes.ExternalSessionSummary{
+				Agent:          i.agentName,
+				AgentSessionID: item.AgentSessionID,
+				Cwd:            item.Cwd,
+				FirstUserText:  item.FirstUserText,
+				UpdatedAt:      item.UpdatedAt,
+			})
+			if err != nil {
+				return nil, err
+			}
+			items = append(items, item)
+			if !shouldContinue {
+				return items, nil
+			}
+			continue
+		}
+		items = appendSortedClaudeSession(items, item)
+		if len(items) > limit {
+			items = items[:limit]
+		}
+	}
+	i.storeSessionFiles(items)
+	return items, nil
+}
+
+func sortedSessionJSONLFiles(baseDir string) ([]sessionFileCandidate, error) {
+	items := make([]sessionFileCandidate, 0)
+	err := filepath.WalkDir(baseDir, func(path string, d os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return nil
 		}
 		if d == nil || d.IsDir() || filepath.Ext(path) != ".jsonl" {
 			return nil
 		}
-		item, ok, err := inspectClaudeSessionFile(path)
+		info, err := d.Info()
 		if err != nil {
-			log.Printf("[agent/claude/importer] inspect session file failed path=%s err=%v", path, err)
 			return nil
 		}
-		if !ok {
-			return nil
-		}
-		if !before.IsZero() && !item.UpdatedAt.Before(before) {
-			return nil
-		}
-		if !after.IsZero() && !item.UpdatedAt.After(after) {
-			return nil
-		}
-		items = appendSortedClaudeSession(items, item)
-		if len(items) > limit {
-			items = items[:limit]
-		}
+		items = append(items, sessionFileCandidate{
+			Path:      path,
+			UpdatedAt: info.ModTime().UTC(),
+		})
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	i.storeSessionFiles(items)
+	sort.Slice(items, func(i, j int) bool {
+		if !items[i].UpdatedAt.Equal(items[j].UpdatedAt) {
+			return items[i].UpdatedAt.After(items[j].UpdatedAt)
+		}
+		return items[i].Path > items[j].Path
+	})
 	return items, nil
 }
 

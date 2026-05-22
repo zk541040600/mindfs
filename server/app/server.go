@@ -21,6 +21,7 @@ import (
 )
 
 const staticDirEnvKey = "MINDFS_STATIC_DIR"
+const externalProjectDiscoveryInterval = time.Minute
 
 type StartOptions struct {
 	NoRelayer    bool
@@ -68,6 +69,8 @@ func Start(ctx context.Context, addr string, opts StartOptions) error {
 	if err := registry.Load(); err != nil {
 		return err
 	}
+	autoAddExternalProjectRoots(registry)
+	startExternalProjectDiscoveryLoop(ctx, registry)
 
 	agentConfig, err := agent.LoadConfig("")
 	if err != nil {
@@ -149,6 +152,68 @@ func Start(ctx context.Context, addr string, opts StartOptions) error {
 		return server.ListenAndServeTLS(opts.CertFile, opts.KeyFile)
 	}
 	return server.ListenAndServe()
+}
+
+func autoAddExternalProjectRoots(registry *fs.Registry) {
+	if registry == nil {
+		return
+	}
+	existing := make(map[string]struct{})
+	for _, root := range registry.List() {
+		normalized := agent.NormalizeComparablePath(root.RootPath)
+		if normalized != "" {
+			existing[normalized] = struct{}{}
+		}
+	}
+	added := 0
+	for _, projectPath := range agent.DiscoverExternalProjectPaths() {
+		normalized := agent.NormalizeComparablePath(projectPath)
+		if normalized == "" {
+			continue
+		}
+		if _, ok := existing[normalized]; ok {
+			continue
+		}
+		if hasMindFSMetadataDir(projectPath) {
+			continue
+		}
+		if _, err := registry.Upsert(projectPath); err != nil {
+			log.Printf("[startup/projects] auto add skipped path=%s err=%v", projectPath, err)
+			continue
+		}
+		existing[normalized] = struct{}{}
+		added++
+	}
+	if added > 0 {
+		log.Printf("[startup/projects] auto added external project roots count=%d", added)
+	}
+}
+
+func hasMindFSMetadataDir(projectPath string) bool {
+	projectPath = strings.TrimSpace(projectPath)
+	if projectPath == "" {
+		return false
+	}
+	info, err := os.Stat(filepath.Join(projectPath, ".mindfs"))
+	return err == nil && info.IsDir()
+}
+
+func startExternalProjectDiscoveryLoop(ctx context.Context, registry *fs.Registry) {
+	if registry == nil {
+		return
+	}
+	ticker := time.NewTicker(externalProjectDiscoveryInterval)
+	go func() {
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				autoAddExternalProjectRoots(registry)
+			}
+		}
+	}()
 }
 
 func resolveStaticDir() string {
