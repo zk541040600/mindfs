@@ -1109,6 +1109,9 @@ if (useInnerScrollContainer && !container) {
         `${tc.kind || ""}`.toLowerCase() === "ask_user" &&
         `${tc.status || ""}`.toLowerCase() !== "complete" &&
         getAskUserQuestions(tc).length > 0;
+      const isUserShell =
+        `${tc.kind || ""}`.toLowerCase() === "execute" &&
+        tc.meta?.source === "userShell";
       const toolUseId =
         tc.callId ||
         (typeof tc.meta?.toolUseId === "string" ? tc.meta.toolUseId : "");
@@ -1139,7 +1142,7 @@ if (useInnerScrollContainer && !container) {
               locations={tc.locations}
               meta={tc.meta}
               rootPath={rootPath || undefined}
-              defaultExpanded={false}
+              defaultExpanded={isUserShell}
             />
           )}
         </div>

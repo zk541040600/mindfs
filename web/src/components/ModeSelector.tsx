@@ -11,7 +11,7 @@ type ModeSelectorProps = {
 };
 
 const modeLabels: Record<SessionMode, string> = {
-  chat: "对话",
+  chat: "agent 对话",
   plugin: "视图插件",
   command: "命令执行",
 };
@@ -82,8 +82,8 @@ export function ModeSelector({
           if (compact) e.currentTarget.style.background = "transparent";
         }}
       >
-        <div style={{ width: "16px", height: "16px", display: "flex", alignItems: "center", justifyContent: "center" }}>
-          <ModeIcon type={mode} size={16} />
+        <div style={{ width: "18px", height: "18px", display: "flex", alignItems: "center", justifyContent: "center" }}>
+          <ModeIcon type={mode} size={18} />
         </div>
       </button>
 
@@ -136,7 +136,7 @@ export function ModeSelector({
                 whiteSpace: "nowrap",
               }}
             >
-              <ModeIcon type={m} size={16} />
+              <ModeIcon type={m} size={18} />
               <span>{modeLabels[m]}</span>
             </button>
           ))}

@@ -155,16 +155,16 @@ function ShellSelector({
           display: "inline-flex",
           alignItems: "center",
           justifyContent: "center",
-          maxWidth: compact ? "76px" : "96px",
+          maxWidth: compact ? "72px" : "92px",
           height: compact ? "24px" : "28px",
           border: "none",
-          borderRadius: "999px",
-          background: "#2563eb",
-          color: "#fff",
+          borderRadius: "8px",
+          background: "transparent",
+          color: "inherit",
           fontSize: "11px",
           fontWeight: 700,
           lineHeight: 1,
-          padding: "0 8px",
+          padding: "0 3px",
           outline: "none",
           cursor: shells.length === 0 ? "default" : "pointer",
           opacity: shells.length === 0 ? 0.45 : 1,
@@ -176,6 +176,14 @@ function ShellSelector({
             overflow: "hidden",
             textOverflow: "ellipsis",
             whiteSpace: "nowrap",
+            display: "inline-block",
+            maxWidth: "100%",
+            padding: "1px 4px",
+            borderRadius: "6px",
+            background: "#1d4ed8",
+            color: "#fff",
+            lineHeight: 1.2,
+            boxSizing: "border-box",
           }}
         >
           {selected?.label || "shell"}
@@ -526,7 +534,7 @@ export function ActionBar({
             ? items.filter((item) => item.name.trim() !== activeToken.query.trim())
             : items;
           setCandidates(nextItems);
-          setActiveCandidateIndex(0);
+          setActiveCandidateIndex(activeToken.type === "command" ? -1 : 0);
         })
         .catch((err) => {
           if (controller.signal.aborted) return;
@@ -544,6 +552,9 @@ export function ActionBar({
   useEffect(() => {
     if (candidates.length === 0) {
       candidateItemRefs.current = [];
+      return;
+    }
+    if (activeCandidateIndex < 0) {
       return;
     }
     const activeItem = candidateItemRefs.current[activeCandidateIndex];
@@ -704,17 +715,19 @@ export function ActionBar({
     if (candidates.length > 0) {
       if (e.key === "ArrowDown") {
         e.preventDefault();
-        setActiveCandidateIndex((prev) => (prev + 1) % candidates.length);
+        setActiveCandidateIndex((prev) => (prev < 0 ? 0 : (prev + 1) % candidates.length));
         return;
       }
       if (e.key === "ArrowUp") {
         e.preventDefault();
-        setActiveCandidateIndex((prev) => (prev - 1 + candidates.length) % candidates.length);
+        setActiveCandidateIndex((prev) => (prev < 0 ? candidates.length - 1 : (prev - 1 + candidates.length) % candidates.length));
         return;
       }
       if (e.key === "Tab") {
         e.preventDefault();
-        applyCandidate(candidates[activeCandidateIndex] || candidates[0]);
+        if (activeCandidateIndex >= 0) {
+          applyCandidate(candidates[activeCandidateIndex]);
+        }
         return;
       }
       if (e.key === "Escape") {
@@ -735,10 +748,18 @@ export function ActionBar({
       return false;
     }
     if (candidates.length > 0) {
-      event?.preventDefault();
-      event?.stopPropagation();
-      applyCandidate(candidates[activeCandidateIndex] || candidates[0]);
-      return true;
+      if (activeCandidateIndex >= 0) {
+        event?.preventDefault();
+        event?.stopPropagation();
+        applyCandidate(candidates[activeCandidateIndex]);
+        return true;
+      }
+      if (mode !== "command") {
+        event?.preventDefault();
+        event?.stopPropagation();
+        applyCandidate(candidates[0]);
+        return true;
+      }
     }
     if (!isMobile || (mobileEnterKeySends && mode === "chat")) {
       event?.preventDefault();

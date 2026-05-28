@@ -250,12 +250,17 @@ export const ToolCallCard = memo(function ToolCallCard({
   const [expanded, setExpanded] = useState(defaultExpanded);
   const labelKind = (kind || "").trim();
   const labelTitle = (title || "").trim();
+  const normalizedKind = labelKind.toLowerCase();
+  const isUserShell = normalizedKind === "execute" && meta?.source === "userShell";
+  const userShellText = useMemo(
+    () => (content || []).map((item) => ("text" in item ? item.text || "" : "")).join("") || result || "",
+    [content, result],
+  );
   const hasContent = !!(content && content.length > 0);
   const hasLocations = !!(locations && locations.length > 0);
   const hasResult = !!result;
-  const hasDetails = hasContent || hasLocations || hasResult;
-  const normalizedKind = labelKind.toLowerCase();
-  const isUserShell = normalizedKind === "execute" && meta?.source === "userShell";
+  const hasUserShellOutput = userShellText.trim().length > 0;
+  const hasDetails = isUserShell ? hasUserShellOutput : hasContent || hasLocations || hasResult;
   const icon = renderToolIcon(normalizedKind);
   const normalizedStatus = (status || "").toLowerCase();
   const detailSections = useMemo(() => buildDetailSections(content, locations, rootPath), [content, locations, rootPath]);
@@ -284,10 +289,14 @@ export const ToolCallCard = memo(function ToolCallCard({
   const isFailed = normalizedStatus === "failed" || normalizedStatus === "error";
   const hasStructuredDetails = detailSections.length > 0;
   useEffect(() => {
-    if (!isRunning || !hasDetails) {
+    if (!hasDetails) {
       setExpanded(false);
+      return;
     }
-  }, [hasDetails, isRunning]);
+    if (defaultExpanded) {
+      setExpanded(true);
+    }
+  }, [defaultExpanded, hasDetails]);
   
   const statusColor = statusColors[normalizedStatus] || "#9ca3af";
 
@@ -401,7 +410,7 @@ export const ToolCallCard = memo(function ToolCallCard({
           }}
         >
           {isUserShell ? (
-            <XtermOutput text={(content || []).map((item) => ("text" in item ? item.text || "" : "")).join("") || result || ""} />
+            <XtermOutput text={userShellText} />
           ) : hasStructuredDetails ? (
             <div style={{ display: "flex", flexDirection: "column", gap: "14px", marginTop: "10px" }}>
               {detailSections.map((section, index) => (
