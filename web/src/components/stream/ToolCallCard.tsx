@@ -254,6 +254,9 @@ export const ToolCallCard = memo(function ToolCallCard({
   const labelKind = (kind || "").trim();
   const labelTitle = (title || "").trim();
   const normalizedKind = labelKind.toLowerCase();
+  const isCollabTool = meta?.rawType === "collabToolCall" || meta?.type === "collabAgentToolCall";
+  const collabToolName = typeof meta?.tool === "string" ? meta.tool.trim() : "";
+  const isCollabWait = isCollabTool && collabToolName === "wait";
   const isUserShell = normalizedKind === "execute" && meta?.source === "userShell";
   const userShellText = useMemo(
     () => (content || []).map((item) => ("text" in item ? item.text || "" : "")).join("") || result || "",
@@ -263,7 +266,8 @@ export const ToolCallCard = memo(function ToolCallCard({
   const hasLocations = !!(locations && locations.length > 0);
   const hasResult = !!result;
   const hasUserShellOutput = userShellText.trim().length > 0;
-  const hasDetails = isUserShell ? hasUserShellOutput : hasContent || hasLocations || hasResult;
+  const hasCollabDetails = isCollabTool && !isCollabWait && Boolean(meta?.prompt);
+  const hasDetails = isUserShell ? hasUserShellOutput : hasContent || hasLocations || hasResult || hasCollabDetails;
   const icon = renderToolIcon(normalizedKind);
   const normalizedStatus = (status || "").toLowerCase();
   const detailSections = useMemo(() => buildDetailSections(content, locations, rootPath), [content, locations, rootPath]);
@@ -284,6 +288,8 @@ export const ToolCallCard = memo(function ToolCallCard({
   }, [detailSections, locations, rootPath]);
   const label = isUserShell
     ? String(meta?.command || labelTitle || "command")
+    : isCollabTool
+    ? labelTitle || collabToolName || "subagent"
     : isFileChange
     ? labelKind || "edit"
     : [labelKind, labelTitle].filter(Boolean).join(" ").trim() || labelKind || labelTitle || "tool";
@@ -414,6 +420,8 @@ export const ToolCallCard = memo(function ToolCallCard({
         >
           {isUserShell ? (
             <XtermOutput text={userShellText} />
+          ) : isCollabTool ? (
+            <CollabToolDetails meta={meta} />
           ) : hasStructuredDetails ? (
             <div style={{ display: "flex", flexDirection: "column", gap: "14px", marginTop: "10px" }}>
               {detailSections.map((section, index) => (
@@ -476,6 +484,15 @@ export const ToolCallCard = memo(function ToolCallCard({
     </div>
   );
 });
+
+function CollabToolDetails({ meta }: { meta?: Record<string, unknown> }) {
+  const prompt = typeof meta?.prompt === "string" ? meta.prompt.trim() : "";
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: "10px", marginTop: "10px", minWidth: 0 }}>
+      {prompt ? <MarkdownViewer content={prompt} /> : null}
+    </div>
+  );
+}
 
 function prefixDiffLines(text: string, prefix: "+" | "-"): string[] {
   return text.split("\n").map((line) => `${prefix}${line}`);

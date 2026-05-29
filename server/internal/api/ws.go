@@ -213,13 +213,16 @@ func (h *WSHandler) broadcastSessionMetaUpdated(rootID string, sess *session.Ses
 		Payload: map[string]any{
 			"root_id": rootID,
 			"session": map[string]any{
-				"key":          sess.Key,
-				"name":         sess.Name,
-				"model":        sess.Model,
-				"mode":         session.InferModeFromSession(sess),
-				"effort":       session.InferEffortFromSession(sess),
-				"fast_service": session.InferFastServiceFromSession(sess),
-				"updated_at":   sess.UpdatedAt,
+				"key":                 sess.Key,
+				"type":                sess.Type,
+				"parent_session_key":  sess.ParentSessionKey,
+				"parent_tool_call_id": sess.ParentToolCallID,
+				"name":                sess.Name,
+				"model":               sess.Model,
+				"mode":                session.InferModeFromSession(sess),
+				"effort":              session.InferEffortFromSession(sess),
+				"fast_service":        session.InferFastServiceFromSession(sess),
+				"updated_at":          sess.UpdatedAt,
 			},
 		},
 	}
@@ -456,6 +459,23 @@ func (h *WSHandler) handleSessionMessage(ctx context.Context, conn *websocket.Co
 				return
 			}
 			streamHub.BroadcastSessionStream(rootID, key, event)
+		},
+		OnSubSessionCreated: func(created *session.Session) {
+			h.broadcastSessionMetaUpdated(rootID, created)
+			if created != nil {
+				streamHub.SetPendingReply(rootID, created.Key, created.Name)
+			}
+		},
+		OnSubSessionUpdate: func(sessionKey string, update agenttypes.Event) {
+			event := updateToEvent(update)
+			if event == nil {
+				return
+			}
+			streamHub.BroadcastSessionStream(rootID, sessionKey, event)
+			if update.Type == agenttypes.EventTypeMessageDone {
+				streamHub.ClearSessionPending(sessionKey)
+				streamHub.BroadcastSessionDone(rootID, sessionKey, "")
+			}
 		},
 	})
 	if err != nil {

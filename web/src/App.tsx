@@ -192,6 +192,14 @@ function toSessionItem(
     root_id: nextRoot,
     name: typeof session?.name === "string" ? session.name : "",
     type: normalizeMode(session?.type),
+    parent_session_key:
+      typeof session?.parent_session_key === "string"
+        ? session.parent_session_key
+        : undefined,
+    parent_tool_call_id:
+      typeof session?.parent_tool_call_id === "string"
+        ? session.parent_tool_call_id
+        : undefined,
     agent:
       typeof session?.agent === "string" && session.agent.trim()
         ? session.agent
@@ -3270,26 +3278,41 @@ export function App({ onGoHome }: AppProps) {
         return;
       }
 
+      const deletedKeys = new Set<string>();
+      const collectDeletedKeys = (key: string) => {
+        if (!key || deletedKeys.has(key)) return;
+        deletedKeys.add(key);
+        for (const item of sessionsRef.current) {
+          const itemKey = item.key || item.session_key || "";
+          if (String(item.parent_session_key || "").trim() === key) {
+            collectDeletedKeys(itemKey);
+          }
+        }
+      };
+      collectDeletedKeys(sessionKey);
+
       setSessions((prev) =>
-        prev.filter((item) => (item.key || item.session_key) !== sessionKey),
+        prev.filter((item) => !deletedKeys.has(item.key || item.session_key || "")),
       );
 
-      const cacheKey = rootSessionKey(rootID, sessionKey);
-      delete sessionCacheRef.current[cacheKey];
-      delete loadedSessionRef.current[cacheKey];
-      delete loadingSessionRef.current[cacheKey];
-      delete pendingBySessionRef.current[cacheKey];
-      delete cancelRequestedBySessionRef.current[cacheKey];
-      staleSessionKeysRef.current.delete(cacheKey);
-      void deleteCachedSession(rootID, sessionKey);
+      for (const deletedKey of deletedKeys) {
+        const cacheKey = rootSessionKey(rootID, deletedKey);
+        delete sessionCacheRef.current[cacheKey];
+        delete loadedSessionRef.current[cacheKey];
+        delete loadingSessionRef.current[cacheKey];
+        delete pendingBySessionRef.current[cacheKey];
+        delete cancelRequestedBySessionRef.current[cacheKey];
+        staleSessionKeysRef.current.delete(cacheKey);
+        void deleteCachedSession(rootID, deletedKey);
+      }
 
-      if (boundSessionByRootRef.current[rootID] === sessionKey) {
+      if (deletedKeys.has(boundSessionByRootRef.current[rootID] || "")) {
         setBoundSessionForRoot(rootID, null);
       }
-      if (selectedSessionByRootRef.current[rootID] === sessionKey) {
+      if (deletedKeys.has(selectedSessionByRootRef.current[rootID] || "")) {
         selectedSessionByRootRef.current[rootID] = null;
       }
-      if (drawerSessionByRootRef.current[rootID]?.key === sessionKey) {
+      if (deletedKeys.has(drawerSessionByRootRef.current[rootID]?.key || "")) {
         setDrawerSessionForRoot(rootID, null);
         setDrawerOpenForRoot(rootID, false);
       }
@@ -3300,7 +3323,7 @@ export function App({ onGoHome }: AppProps) {
       const selectedRoot =
         (selectedSessionRef.current?.root_id as string | undefined) ||
         currentRootIdRef.current;
-      if (selectedKey === sessionKey && selectedRoot === rootID) {
+      if (deletedKeys.has(selectedKey || "") && selectedRoot === rootID) {
         setSelectedSession(null);
         setSelectedSessionLoading(false);
         replaceURLState({
@@ -5944,6 +5967,32 @@ export function App({ onGoHome }: AppProps) {
       }
       const event = payload.event;
       if (!event?.type) return;
+      const markStreamPending = () => {
+        if (event.type === "message_done" || event.type === "error") return;
+        const now = new Date().toISOString();
+        const latest = sessionCacheRef.current[ck];
+        let cacheChanged = false;
+        if (latest && !(latest as any).pending) {
+          sessionCacheRef.current[ck] = {
+            ...(latest as any),
+            pending: true,
+            updated_at: now,
+          } as Session;
+          cacheChanged = true;
+        }
+        setSelectedPendingByKey(streamKey, true);
+        const drawer = drawerSessionByRootRef.current[activeRoot];
+        if (drawer && (drawer.key || (drawer as any).session_key) === streamKey) {
+          setDrawerSessionForRoot(activeRoot, {
+            ...(drawer as any),
+            pending: true,
+            updated_at: now,
+          } as Session);
+        }
+        if (cacheChanged) {
+          bumpCacheVersion();
+        }
+      };
       const updateDrawerIfShowingStream = () => {
         const drawerKey = drawerSessionByRootRef.current[activeRoot]?.key || "";
         if (
@@ -5960,6 +6009,7 @@ export function App({ onGoHome }: AppProps) {
           } as Session);
         }
       };
+      markStreamPending();
       switch (event.type) {
         case "message_chunk":
           appendAgentChunkForSession(
@@ -6486,6 +6536,14 @@ export function App({ onGoHome }: AppProps) {
                 fast_service:
                   normalizeFastService(payload.session.fast_service) ||
                   normalizeFastService((cached as any).fast_service),
+                parent_session_key:
+                  typeof payload.session.parent_session_key === "string"
+                    ? payload.session.parent_session_key
+                    : (cached as any).parent_session_key,
+                parent_tool_call_id:
+                  typeof payload.session.parent_tool_call_id === "string"
+                    ? payload.session.parent_tool_call_id
+                    : (cached as any).parent_tool_call_id,
                 updated_at: payload.session.updated_at || cached.updated_at,
               } as Session;
               bumpCacheVersion();
@@ -6517,6 +6575,14 @@ export function App({ onGoHome }: AppProps) {
                       fast_service:
                         normalizeFastService(payload.session.fast_service) ||
                         normalizeFastService((prev as any).fast_service),
+                      parent_session_key:
+                        typeof payload.session.parent_session_key === "string"
+                          ? payload.session.parent_session_key
+                          : (prev as any).parent_session_key,
+                      parent_tool_call_id:
+                        typeof payload.session.parent_tool_call_id === "string"
+                          ? payload.session.parent_tool_call_id
+                          : (prev as any).parent_tool_call_id,
                       updated_at: payload.session.updated_at || prev.updated_at,
                     } as SessionItem)
                   : prev,

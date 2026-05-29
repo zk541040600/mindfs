@@ -745,22 +745,24 @@ func (h *HTTPHandler) sessionResponse(
 		auxPayload[strconv.Itoa(seq)] = append([]session.ExchangeAux(nil), items...)
 	}
 	return map[string]any{
-		"key":            s.Key,
-		"type":           s.Type,
-		"agent":          session.InferAgentFromSession(s),
-		"model":          s.Model,
-		"mode":           session.InferModeFromSession(s),
-		"effort":         session.InferEffortFromSession(s),
-		"fast_service":   session.InferFastServiceFromSession(s),
-		"shell":          h.commandShellForResponse(s, exchangeAux),
-		"name":           s.Name,
-		"exchanges":      exchanges,
-		"exchange_aux":   auxPayload,
-		"related_files":  s.RelatedFiles,
-		"context_window": contextWindow,
-		"created_at":     s.CreatedAt,
-		"updated_at":     s.UpdatedAt,
-		"closed_at":      s.ClosedAt,
+		"key":                 s.Key,
+		"type":                s.Type,
+		"parent_session_key":  s.ParentSessionKey,
+		"parent_tool_call_id": s.ParentToolCallID,
+		"agent":               session.InferAgentFromSession(s),
+		"model":               s.Model,
+		"mode":                session.InferModeFromSession(s),
+		"effort":              session.InferEffortFromSession(s),
+		"fast_service":        session.InferFastServiceFromSession(s),
+		"shell":               h.commandShellForResponse(s, exchangeAux),
+		"name":                s.Name,
+		"exchanges":           exchanges,
+		"exchange_aux":        auxPayload,
+		"related_files":       s.RelatedFiles,
+		"context_window":      contextWindow,
+		"created_at":          s.CreatedAt,
+		"updated_at":          s.UpdatedAt,
+		"closed_at":           s.ClosedAt,
 	}
 }
 
@@ -769,18 +771,20 @@ func (h *HTTPHandler) sessionListResponse(s *session.Session) map[string]any {
 		return map[string]any{}
 	}
 	return map[string]any{
-		"key":          s.Key,
-		"type":         s.Type,
-		"agent":        session.InferAgentFromSession(s),
-		"model":        s.Model,
-		"mode":         session.InferModeFromSession(s),
-		"effort":       session.InferEffortFromSession(s),
-		"fast_service": session.InferFastServiceFromSession(s),
-		"shell":        h.commandShellForSession(s),
-		"name":         s.Name,
-		"created_at":   s.CreatedAt,
-		"updated_at":   s.UpdatedAt,
-		"closed_at":    s.ClosedAt,
+		"key":                 s.Key,
+		"type":                s.Type,
+		"parent_session_key":  s.ParentSessionKey,
+		"parent_tool_call_id": s.ParentToolCallID,
+		"agent":               session.InferAgentFromSession(s),
+		"model":               s.Model,
+		"mode":                session.InferModeFromSession(s),
+		"effort":              session.InferEffortFromSession(s),
+		"fast_service":        session.InferFastServiceFromSession(s),
+		"shell":               h.commandShellForSession(s),
+		"name":                s.Name,
+		"created_at":          s.CreatedAt,
+		"updated_at":          s.UpdatedAt,
+		"closed_at":           s.ClosedAt,
 	}
 }
 

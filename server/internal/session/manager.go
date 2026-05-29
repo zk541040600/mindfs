@@ -28,7 +28,7 @@ const (
 	exchangeFileTpl  = "sessions/%s.jsonl"
 	auxFileTpl       = "sessions/%s.aux.jsonl"
 	selectSessionSQL = `
-SELECT key, type, model, shell, name, related_files_json, created_at, updated_at, closed_at
+SELECT key, type, parent_session_key, parent_tool_call_id, model, shell, name, related_files_json, created_at, updated_at, closed_at
 FROM sessions`
 	deleteSessionSQL = `
 DELETE FROM sessions
@@ -38,10 +38,12 @@ DELETE FROM session_agent_bindings
 WHERE session_key = ?`
 	upsertSessionMetaSQL = `
 INSERT INTO sessions (
-	key, type, model, shell, name, related_files_json, created_at, updated_at, closed_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	key, type, parent_session_key, parent_tool_call_id, model, shell, name, related_files_json, created_at, updated_at, closed_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(key) DO UPDATE SET
 	type = excluded.type,
+	parent_session_key = excluded.parent_session_key,
+	parent_tool_call_id = excluded.parent_tool_call_id,
 	model = excluded.model,
 	shell = excluded.shell,
 	name = excluded.name,
@@ -53,6 +55,8 @@ ON CONFLICT(key) DO UPDATE SET
 CREATE TABLE IF NOT EXISTS sessions (
 	key TEXT PRIMARY KEY,
 	type TEXT NOT NULL,
+	parent_session_key TEXT NOT NULL DEFAULT '',
+	parent_tool_call_id TEXT NOT NULL DEFAULT '',
 	model TEXT NOT NULL DEFAULT '',
 	shell TEXT NOT NULL DEFAULT '',
 	name TEXT NOT NULL,
@@ -85,7 +89,7 @@ SELECT session_key, agent, agent_session_id, agent_ctx_seq
 FROM session_agent_bindings
 WHERE session_key = ?`
 	selectBindingByAgentSessionSQL = `
-SELECT 1
+SELECT session_key, agent, agent_session_id, agent_ctx_seq
 FROM session_agent_bindings
 WHERE agent = ? AND agent_session_id = ?
 LIMIT 1`
@@ -105,12 +109,14 @@ type Manager struct {
 }
 
 type CreateInput struct {
-	Key   string
-	Type  string
-	Agent string
-	Model string
-	Shell string
-	Name  string
+	Key              string
+	Type             string
+	ParentSessionKey string
+	ParentToolCallID string
+	Agent            string
+	Model            string
+	Shell            string
+	Name             string
 }
 
 type AgentBinding struct {
@@ -186,16 +192,18 @@ func (m *Manager) Create(_ context.Context, input CreateInput) (*Session, error)
 		agentCtxSeq[initialAgent] = 0
 	}
 	session := &Session{
-		Key:          key,
-		Type:         input.Type,
-		AgentCtxSeq:  agentCtxSeq,
-		Model:        strings.TrimSpace(input.Model),
-		Shell:        strings.TrimSpace(input.Shell),
-		Name:         name,
-		Exchanges:    []Exchange{},
-		RelatedFiles: []RelatedFile{},
-		CreatedAt:    now,
-		UpdatedAt:    now,
+		Key:              key,
+		Type:             input.Type,
+		ParentSessionKey: strings.TrimSpace(input.ParentSessionKey),
+		ParentToolCallID: strings.TrimSpace(input.ParentToolCallID),
+		AgentCtxSeq:      agentCtxSeq,
+		Model:            strings.TrimSpace(input.Model),
+		Shell:            strings.TrimSpace(input.Shell),
+		Name:             name,
+		Exchanges:        []Exchange{},
+		RelatedFiles:     []RelatedFile{},
+		CreatedAt:        now,
+		UpdatedAt:        now,
 	}
 
 	m.mu.Lock()
@@ -223,6 +231,12 @@ func (m *Manager) List(_ context.Context, opts ListOptions) ([]*Session, error) 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.listSessionsUnsafe(opts)
+}
+
+func (m *Manager) ListMetas(_ context.Context) ([]*Session, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.listSessionMetasUnsafe()
 }
 
 func (m *Manager) Search(_ context.Context, opts SearchOptions) ([]SearchHit, error) {
@@ -504,32 +518,40 @@ func (m *Manager) FindAgentBinding(ctx context.Context, sessionKey, agent string
 	return binding, err
 }
 
-func (m *Manager) HasAgentBinding(_ context.Context, agent, agentSessionID string) (bool, error) {
+func (m *Manager) FindAgentBindingByAgentSession(_ context.Context, agent, agentSessionID string) (*AgentBinding, error) {
 	if strings.TrimSpace(agent) == "" {
-		return false, errors.New("agent required")
+		return nil, errors.New("agent required")
 	}
 	if strings.TrimSpace(agentSessionID) == "" {
-		return false, errors.New("agent session id required")
+		return nil, errors.New("agent session id required")
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	db, err := m.ensureSessionMetaDBUnsafe()
 	if err != nil {
-		return false, err
+		return nil, err
 	}
-	var found int
+	var binding AgentBinding
 	err = db.QueryRow(
 		selectBindingByAgentSessionSQL,
 		strings.TrimSpace(agent),
 		strings.TrimSpace(agentSessionID),
-	).Scan(&found)
+	).Scan(&binding.SessionKey, &binding.Agent, &binding.AgentSessionID, &binding.AgentCtxSeq)
 	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
+		return nil, nil
 	}
+	if err != nil {
+		return nil, err
+	}
+	return &binding, nil
+}
+
+func (m *Manager) HasAgentBinding(ctx context.Context, agent, agentSessionID string) (bool, error) {
+	binding, err := m.FindAgentBindingByAgentSession(ctx, agent, agentSessionID)
 	if err != nil {
 		return false, err
 	}
-	return found == 1, nil
+	return binding != nil, nil
 }
 
 func (m *Manager) listAgentBindingsUnsafe(sessionKey string) ([]AgentBinding, error) {
@@ -1165,6 +1187,15 @@ func (m *Manager) ensureSessionMetaDBUnsafe() (*sql.DB, error) {
 		db.Close()
 		return nil, err
 	}
+	for _, stmt := range []string{
+		`ALTER TABLE sessions ADD COLUMN parent_session_key TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sessions ADD COLUMN parent_tool_call_id TEXT NOT NULL DEFAULT ''`,
+	} {
+		if _, err := db.Exec(stmt); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
+			db.Close()
+			return nil, err
+		}
+	}
 	m.db = db
 	return m.db, nil
 }
@@ -1184,6 +1215,8 @@ func sessionMetaUpsertArgs(session *Session) ([]any, error) {
 	return []any{
 		session.Key,
 		session.Type,
+		session.ParentSessionKey,
+		session.ParentToolCallID,
 		session.Model,
 		session.Shell,
 		session.Name,
@@ -1202,6 +1235,8 @@ func scanSessionMetaRow(scanner rowScanner) (*Session, error) {
 	var (
 		key              string
 		typ              string
+		parentSessionKey string
+		parentToolCallID string
 		model            string
 		shell            string
 		name             string
@@ -1213,6 +1248,8 @@ func scanSessionMetaRow(scanner rowScanner) (*Session, error) {
 	if err := scanner.Scan(
 		&key,
 		&typ,
+		&parentSessionKey,
+		&parentToolCallID,
 		&model,
 		&shell,
 		&name,
@@ -1224,13 +1261,15 @@ func scanSessionMetaRow(scanner rowScanner) (*Session, error) {
 		return nil, err
 	}
 	session := &Session{
-		Key:          key,
-		Type:         typ,
-		Model:        model,
-		Shell:        shell,
-		Name:         name,
-		Exchanges:    []Exchange{},
-		RelatedFiles: []RelatedFile{},
+		Key:              key,
+		Type:             typ,
+		ParentSessionKey: parentSessionKey,
+		ParentToolCallID: parentToolCallID,
+		Model:            model,
+		Shell:            shell,
+		Name:             name,
+		Exchanges:        []Exchange{},
+		RelatedFiles:     []RelatedFile{},
 	}
 	if strings.TrimSpace(relatedFilesJSON) != "" {
 		if err := json.Unmarshal([]byte(relatedFilesJSON), &session.RelatedFiles); err != nil {
@@ -1267,6 +1306,8 @@ func normalizeSessionMeta(s *Session) {
 	if s.Exchanges == nil {
 		s.Exchanges = []Exchange{}
 	}
+	s.ParentSessionKey = strings.TrimSpace(s.ParentSessionKey)
+	s.ParentToolCallID = strings.TrimSpace(s.ParentToolCallID)
 }
 
 var errSessionNotFound = errors.New("session not found")
@@ -1302,19 +1343,21 @@ func scoreSessionName(name, qLower string) int {
 
 func buildSearchHit(s *Session, matchType string, score, seq int, snippet string) SearchHit {
 	return SearchHit{
-		Key:        s.Key,
-		Type:       s.Type,
-		Agent:      InferAgentFromSession(s),
-		Model:      s.Model,
-		Shell:      s.Shell,
-		Name:       s.Name,
-		CreatedAt:  s.CreatedAt,
-		UpdatedAt:  s.UpdatedAt,
-		ClosedAt:   s.ClosedAt,
-		MatchType:  matchType,
-		MatchScore: score,
-		Seq:        seq,
-		Snippet:    strings.TrimSpace(snippet),
+		Key:              s.Key,
+		Type:             s.Type,
+		ParentSessionKey: s.ParentSessionKey,
+		ParentToolCallID: s.ParentToolCallID,
+		Agent:            InferAgentFromSession(s),
+		Model:            s.Model,
+		Shell:            s.Shell,
+		Name:             s.Name,
+		CreatedAt:        s.CreatedAt,
+		UpdatedAt:        s.UpdatedAt,
+		ClosedAt:         s.ClosedAt,
+		MatchType:        matchType,
+		MatchScore:       score,
+		Seq:              seq,
+		Snippet:          strings.TrimSpace(snippet),
 	}
 }
 

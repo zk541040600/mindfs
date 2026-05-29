@@ -263,15 +263,84 @@ func (s *Service) DeleteSession(ctx context.Context, in DeleteSessionInput) erro
 	if err != nil {
 		return err
 	}
-	if err := manager.Delete(ctx, in.Key); err != nil {
+	keys, err := deleteSessionCascadeKeys(ctx, manager, in.Key)
+	if err != nil {
 		return err
 	}
-	if err := root.RemoveSessionFileMeta(in.Key); err != nil {
-		return err
+	for _, key := range keys {
+		cancelActiveSessionTurn(in.RootID, key)
 	}
-	commandexec.CloseSession(in.RootID, in.Key)
-	s.Registry.ReleaseFileWatcher(in.RootID, in.Key)
+	for _, key := range keys {
+		if err := manager.Delete(ctx, key); err != nil {
+			return err
+		}
+		if err := root.RemoveSessionFileMeta(key); err != nil {
+			return err
+		}
+		commandexec.CloseSession(in.RootID, key)
+		s.Registry.ReleaseFileWatcher(in.RootID, key)
+	}
 	return nil
+}
+
+func deleteSessionCascadeKeys(ctx context.Context, manager *session.Manager, key string) ([]string, error) {
+	rootKey := strings.TrimSpace(key)
+	if rootKey == "" {
+		return nil, errors.New("session key required")
+	}
+	items, err := manager.ListMetas(ctx)
+	if err != nil {
+		return nil, err
+	}
+	childrenByParent := make(map[string][]string)
+	exists := false
+	for _, item := range items {
+		if item == nil {
+			continue
+		}
+		itemKey := strings.TrimSpace(item.Key)
+		if itemKey == "" {
+			continue
+		}
+		if itemKey == rootKey {
+			exists = true
+		}
+		parentKey := strings.TrimSpace(item.ParentSessionKey)
+		if parentKey != "" {
+			childrenByParent[parentKey] = append(childrenByParent[parentKey], itemKey)
+		}
+	}
+	if !exists {
+		return nil, errors.New("session not found")
+	}
+	keys := make([]string, 0, 1)
+	seen := make(map[string]bool)
+	var visit func(string)
+	visit = func(current string) {
+		if seen[current] {
+			return
+		}
+		seen[current] = true
+		for _, childKey := range childrenByParent[current] {
+			visit(childKey)
+		}
+		keys = append(keys, current)
+	}
+	visit(rootKey)
+	return keys, nil
+}
+
+func cancelActiveSessionTurn(rootID, sessionKey string) {
+	active := getActiveTurn(rootID, sessionKey)
+	if active == nil {
+		return
+	}
+	active.cancel()
+	if active.session != nil {
+		if err := active.session.CancelCurrentTurn(); err != nil {
+			log.Printf("[session] turn.cancel.error root=%s session=%s err=%v", rootID, sessionKey, err)
+		}
+	}
 }
 
 type RenameSessionInput struct {
@@ -335,19 +404,23 @@ func prependSwitchHint(in BuildPromptInput, prompt string) string {
 }
 
 type SendMessageInput struct {
-	RootID      string
-	Key         string
-	Agent       string
-	Model       string
-	Mode        string
-	Effort      string
-	FastService string
-	Shell       string
-	Content     string
-	ClientCtx   ClientContext
-	OnStart     func()
-	OnUpdate    func(agenttypes.Event)
+	RootID              string
+	Key                 string
+	Agent               string
+	Model               string
+	Mode                string
+	Effort              string
+	FastService         string
+	Shell               string
+	Content             string
+	ClientCtx           ClientContext
+	OnStart             func()
+	OnUpdate            func(agenttypes.Event)
+	OnSubSessionCreated func(*session.Session)
+	OnSubSessionUpdate  func(sessionKey string, update agenttypes.Event)
 }
+
+var activeSubagentSubscriptions sync.Map
 
 type AnswerQuestionInput struct {
 	RootID     string
@@ -1195,6 +1268,21 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 					}
 				}
 				if toolCall, ok := update.Data.(agenttypes.ToolCall); ok {
+					s.ensureSubagentSessions(context.Background(), subagentSessionInput{
+						RootID:      in.RootID,
+						Parent:      current,
+						Agent:       in.Agent,
+						Model:       in.Model,
+						Mode:        in.Mode,
+						Effort:      in.Effort,
+						FastService: in.FastService,
+						RootAbs:     rootAbs,
+						Pool:        agentPool,
+						Manager:     manager,
+						ToolCall:    toolCall,
+						OnCreated:   in.OnSubSessionCreated,
+						OnUpdate:    in.OnSubSessionUpdate,
+					})
 					toolCallCopy := toolCall
 					auxBuffer = append(auxBuffer, session.ExchangeAux{
 						Seq:      plannedAssistantSeq,
@@ -1307,6 +1395,203 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 		prober.ReportSuccess(in.Agent)
 	}
 	return nil
+}
+
+type subagentSessionInput struct {
+	RootID      string
+	Parent      *session.Session
+	Agent       string
+	Model       string
+	Mode        string
+	Effort      string
+	FastService string
+	RootAbs     string
+	Pool        *agent.Pool
+	Manager     *session.Manager
+	ToolCall    agenttypes.ToolCall
+	OnCreated   func(*session.Session)
+	OnUpdate    func(sessionKey string, update agenttypes.Event)
+}
+
+func (s *Service) ensureSubagentSessions(ctx context.Context, in subagentSessionInput) {
+	if in.Parent == nil || in.Pool == nil || in.Manager == nil || in.ToolCall.RawType != "collabToolCall" {
+		return
+	}
+	for _, receiverThreadID := range stringSliceMeta(in.ToolCall.Meta, "receiverThreadIds") {
+		receiverThreadID = strings.TrimSpace(receiverThreadID)
+		if receiverThreadID == "" {
+			continue
+		}
+		child, err := s.ensureSubagentSession(ctx, in, receiverThreadID)
+		if err != nil {
+			log.Printf("[subagent] session.ensure.error root=%s parent=%s receiver=%s err=%v", in.RootID, in.Parent.Key, receiverThreadID, err)
+			continue
+		}
+		if child != nil {
+			s.startSubagentSubscription(in, child, receiverThreadID)
+		}
+	}
+}
+
+func (s *Service) ensureSubagentSession(ctx context.Context, in subagentSessionInput, receiverThreadID string) (*session.Session, error) {
+	if existing, err := in.Manager.FindAgentBindingByAgentSession(ctx, in.Agent, receiverThreadID); err != nil {
+		return nil, err
+	} else if existing != nil {
+		return in.Manager.Get(ctx, existing.SessionKey, 0)
+	}
+	child, err := in.Manager.Create(ctx, session.CreateInput{
+		Type:             session.TypeChat,
+		ParentSessionKey: in.Parent.Key,
+		ParentToolCallID: in.ToolCall.CallID,
+		Agent:            in.Agent,
+		Model:            firstNonEmptyString(stringMeta(in.ToolCall.Meta, "model"), in.Model),
+		Name:             subagentSessionName(in.ToolCall, receiverThreadID),
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := in.Manager.UpsertAgentBinding(ctx, session.AgentBinding{
+		SessionKey:     child.Key,
+		Agent:          in.Agent,
+		AgentSessionID: receiverThreadID,
+	}); err != nil {
+		return nil, err
+	}
+	if in.OnCreated != nil {
+		in.OnCreated(child)
+	}
+	return child, nil
+}
+
+func (s *Service) startSubagentSubscription(in subagentSessionInput, child *session.Session, receiverThreadID string) {
+	key := in.RootID + ":" + child.Key + ":" + receiverThreadID
+	if _, loaded := activeSubagentSubscriptions.LoadOrStore(key, struct{}{}); loaded {
+		return
+	}
+	go func() {
+		defer activeSubagentSubscriptions.Delete(key)
+		ctx, cancel := context.WithCancel(in.Pool.Context())
+		registerActiveTurn(in.RootID, child.Key, cancel)
+		defer unregisterActiveTurn(in.RootID, child.Key)
+		runtime, err := in.Pool.GetOrCreate(ctx, agenttypes.OpenSessionInput{
+			SessionKey:     agentPoolSessionKey(child.Key, in.Agent),
+			AgentName:      in.Agent,
+			Model:          firstNonEmptyString(stringMeta(in.ToolCall.Meta, "model"), in.Model),
+			Mode:           in.Mode,
+			Effort:         firstNonEmptyString(stringMeta(in.ToolCall.Meta, "reasoningEffort"), in.Effort),
+			FastService:    in.FastService,
+			RootPath:       in.RootAbs,
+			AgentSessionID: receiverThreadID,
+			AgentCtxSeq:    child.AgentCtxSeq[in.Agent],
+		})
+		if err != nil {
+			log.Printf("[subagent] subscription.open.error root=%s session=%s receiver=%s err=%v", in.RootID, child.Key, receiverThreadID, err)
+			return
+		}
+		setActiveTurnSession(in.RootID, child.Key, runtime)
+		subscriber, ok := runtime.(agenttypes.ThreadEventSubscriber)
+		if !ok {
+			log.Printf("[subagent] subscription.unsupported root=%s session=%s receiver=%s", in.RootID, child.Key, receiverThreadID)
+			return
+		}
+		markDone := attachBackgroundSessionUpdates(ctx, in, child, runtime)
+		if err := subscriber.SubscribeThreadEvents(ctx); err != nil && ctx.Err() == nil {
+			log.Printf("[subagent] subscription.error root=%s session=%s receiver=%s err=%v", in.RootID, child.Key, receiverThreadID, err)
+		}
+		markDone()
+	}()
+}
+
+func attachBackgroundSessionUpdates(ctx context.Context, in subagentSessionInput, child *session.Session, runtime agenttypes.Session) func() {
+	var responseText string
+	plannedAssistantSeq := len(child.Exchanges) + 1
+	auxBuffer := make([]session.ExchangeAux, 0, 8)
+	var thoughtBuffer strings.Builder
+	lastResponseUpdateType := ""
+	var doneMu sync.Mutex
+	doneSent := false
+	flushThought := func() {
+		thought := thoughtBuffer.String()
+		if strings.TrimSpace(thought) == "" {
+			thoughtBuffer.Reset()
+			return
+		}
+		thoughtBuffer.Reset()
+		auxBuffer = append(auxBuffer, session.ExchangeAux{
+			Seq:     plannedAssistantSeq,
+			Line:    currentAssistantLine(responseText),
+			Thought: thought,
+		})
+	}
+	finish := func(emit bool) {
+		doneMu.Lock()
+		if doneSent {
+			doneMu.Unlock()
+			return
+		}
+		doneSent = true
+		doneMu.Unlock()
+		flushThought()
+		if err := in.Manager.AddExchangeForAgent(ctx, child, "agent", responseText, in.Agent, in.Mode, in.Effort, in.FastService); err != nil {
+			log.Printf("[subagent] persist.agent.error root=%s session=%s err=%v", in.RootID, child.Key, err)
+			return
+		}
+		for _, aux := range dedupeExchangeAuxBuffer(auxBuffer) {
+			if err := in.Manager.AddExchangeAux(ctx, child.Key, aux); err != nil {
+				log.Printf("[subagent] persist.aux.error root=%s session=%s err=%v", in.RootID, child.Key, err)
+				return
+			}
+		}
+		if err := in.Manager.UpdateAgentState(ctx, child, in.Agent, contextLineCount(child.Exchanges), runtime.SessionID()); err != nil {
+			log.Printf("[subagent] persist.agent_state.error root=%s session=%s err=%v", in.RootID, child.Key, err)
+		}
+		if emit && in.OnUpdate != nil {
+			in.OnUpdate(child.Key, agenttypes.Event{Type: agenttypes.EventTypeMessageDone, Data: agenttypes.MessageDone{}})
+		}
+	}
+	runtime.OnUpdate(func(update agenttypes.Event) {
+		update = compactAgentUpdate(update)
+		switch update.Type {
+		case agenttypes.EventTypeThoughtChunk:
+			if chunk, ok := update.Data.(agenttypes.ThoughtChunk); ok && chunk.Content != "" {
+				thoughtBuffer.WriteString(chunk.Content)
+			}
+		case agenttypes.EventTypeToolCall, agenttypes.EventTypeToolUpdate, agenttypes.EventTypeTodoUpdate, agenttypes.EventTypeMessageChunk, agenttypes.EventTypeMessageDone:
+			flushThought()
+		}
+		if update.Type == agenttypes.EventTypeToolCall || update.Type == agenttypes.EventTypeToolUpdate {
+			if toolCall, ok := update.Data.(agenttypes.ToolCall); ok {
+				toolCallCopy := toolCall
+				auxBuffer = append(auxBuffer, session.ExchangeAux{
+					Seq:      plannedAssistantSeq,
+					Line:     currentAssistantLine(responseText),
+					ToolCall: &toolCallCopy,
+				})
+			}
+		}
+		if update.Type == agenttypes.EventTypeMessageChunk {
+			if chunk, ok := update.Data.(agenttypes.MessageChunk); ok {
+				responseText = appendResponseChunk(responseText, lastResponseUpdateType, chunk.Content)
+				lastResponseUpdateType = string(update.Type)
+			}
+		} else if update.Type == agenttypes.EventTypeThoughtChunk ||
+			update.Type == agenttypes.EventTypeToolCall ||
+			update.Type == agenttypes.EventTypeToolUpdate ||
+			update.Type == agenttypes.EventTypeTodoUpdate {
+			lastResponseUpdateType = string(update.Type)
+		}
+		if update.Type != agenttypes.EventTypeMessageDone {
+			if in.OnUpdate != nil {
+				in.OnUpdate(child.Key, update)
+			}
+			return
+		}
+		finish(false)
+		if in.OnUpdate != nil {
+			in.OnUpdate(child.Key, update)
+		}
+	})
+	return func() { finish(true) }
 }
 
 func (s *Service) sendCommandMessage(ctx context.Context, in SendMessageInput, manager *session.Manager, current *session.Session) error {
@@ -1717,6 +2002,58 @@ func appendResponseChunk(responseText, lastResponseUpdateType, chunk string) str
 		responseText += "\n\n"
 	}
 	return responseText + chunk
+}
+
+func subagentSessionName(toolCall agenttypes.ToolCall, receiverThreadID string) string {
+	if prompt := stringMeta(toolCall.Meta, "prompt"); prompt != "" {
+		return truncateRunes(prompt, 48)
+	}
+	return truncateRunes(receiverThreadID, 16)
+}
+
+func stringMeta(meta map[string]any, key string) string {
+	if meta == nil {
+		return ""
+	}
+	value, _ := meta[key].(string)
+	return strings.TrimSpace(value)
+}
+
+func stringSliceMeta(meta map[string]any, key string) []string {
+	if meta == nil {
+		return nil
+	}
+	switch value := meta[key].(type) {
+	case []string:
+		return append([]string(nil), value...)
+	case []any:
+		out := make([]string, 0, len(value))
+		for _, item := range value {
+			if text, ok := item.(string); ok && strings.TrimSpace(text) != "" {
+				out = append(out, strings.TrimSpace(text))
+			}
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func truncateRunes(value string, limit int) string {
+	runes := []rune(strings.TrimSpace(value))
+	if limit <= 0 || len(runes) <= limit {
+		return string(runes)
+	}
+	return string(runes[:limit]) + "..."
 }
 
 type pathNormalizer interface {

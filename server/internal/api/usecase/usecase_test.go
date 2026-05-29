@@ -199,6 +199,87 @@ func TestSendCommandMessagePersistsCancelledSuggestion(t *testing.T) {
 	}
 }
 
+func TestDeleteSessionDeletesSubSessionTree(t *testing.T) {
+	ctx := context.Background()
+	rootDir := t.TempDir()
+	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
+	manager := session.NewManager(root)
+	registry := &commandTestRegistry{root: root, manager: manager}
+	service := Service{Registry: registry}
+
+	parent, err := manager.Create(ctx, session.CreateInput{Type: session.TypeChat, Name: "parent"})
+	if err != nil {
+		t.Fatalf("create parent: %v", err)
+	}
+	child, err := manager.Create(ctx, session.CreateInput{Type: session.TypeChat, ParentSessionKey: parent.Key, Name: "child"})
+	if err != nil {
+		t.Fatalf("create child: %v", err)
+	}
+	grandchild, err := manager.Create(ctx, session.CreateInput{Type: session.TypeChat, ParentSessionKey: child.Key, Name: "grandchild"})
+	if err != nil {
+		t.Fatalf("create grandchild: %v", err)
+	}
+	sibling, err := manager.Create(ctx, session.CreateInput{Type: session.TypeChat, Name: "sibling"})
+	if err != nil {
+		t.Fatalf("create sibling: %v", err)
+	}
+
+	if err := service.DeleteSession(ctx, DeleteSessionInput{RootID: root.ID, Key: parent.Key}); err != nil {
+		t.Fatalf("delete parent: %v", err)
+	}
+	for _, deleted := range []*session.Session{parent, child, grandchild} {
+		if _, err := manager.Get(ctx, deleted.Key, 0); err == nil {
+			t.Fatalf("session %s still exists", deleted.Key)
+		}
+	}
+	if _, err := manager.Get(ctx, sibling.Key, 0); err != nil {
+		t.Fatalf("sibling should remain: %v", err)
+	}
+}
+
+func TestSubSessionSyntheticDonePersistsPartialResponse(t *testing.T) {
+	ctx := context.Background()
+	rootDir := t.TempDir()
+	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
+	manager := session.NewManager(root)
+	child, err := manager.Create(ctx, session.CreateInput{Type: session.TypeChat, Agent: "codex", Name: "child"})
+	if err != nil {
+		t.Fatalf("create child: %v", err)
+	}
+	runtime := &fakeUsecaseAgentSession{id: "sub-thread"}
+	var sawDone bool
+	markDone := attachBackgroundSessionUpdates(ctx, subagentSessionInput{
+		RootID:      root.ID,
+		Agent:       "codex",
+		Mode:        "default",
+		Effort:      "medium",
+		FastService: "off",
+		Manager:     manager,
+		OnUpdate: func(sessionKey string, update agenttypes.Event) {
+			if sessionKey == child.Key && update.Type == agenttypes.EventTypeMessageDone {
+				sawDone = true
+			}
+		},
+	}, child, runtime)
+
+	runtime.emit(agenttypes.Event{Type: agenttypes.EventTypeMessageChunk, Data: agenttypes.MessageChunk{Content: "partial response"}})
+	markDone()
+
+	loaded, err := manager.Get(ctx, child.Key, 0)
+	if err != nil {
+		t.Fatalf("get child: %v", err)
+	}
+	if len(loaded.Exchanges) != 1 {
+		t.Fatalf("exchanges = %d, want 1", len(loaded.Exchanges))
+	}
+	if loaded.Exchanges[0].Content != "partial response" {
+		t.Fatalf("content = %q", loaded.Exchanges[0].Content)
+	}
+	if !sawDone {
+		t.Fatalf("synthetic done was not emitted")
+	}
+}
+
 func TestSendCommandMessageUsesLongShellPerSession(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("windows long-shell behavior is covered by cross-compile checks")
@@ -917,6 +998,55 @@ func (uploadTestRegistry) GetFileWatcher(string, *session.Manager) (*rootfs.Shar
 }
 
 func (uploadTestRegistry) ReleaseFileWatcher(string, string) {}
+
+type fakeUsecaseAgentSession struct {
+	id       string
+	onUpdate func(agenttypes.Event)
+}
+
+func (s *fakeUsecaseAgentSession) SendMessage(context.Context, string) error { return nil }
+
+func (s *fakeUsecaseAgentSession) AnswerQuestion(context.Context, agenttypes.AskUserAnswer) error {
+	return nil
+}
+
+func (s *fakeUsecaseAgentSession) CurrentModel() string { return "" }
+
+func (s *fakeUsecaseAgentSession) SetModel(context.Context, string) error { return nil }
+
+func (s *fakeUsecaseAgentSession) ListModels(context.Context) (agenttypes.ModelList, error) {
+	return agenttypes.ModelList{}, nil
+}
+
+func (s *fakeUsecaseAgentSession) SetMode(context.Context, string) error { return nil }
+
+func (s *fakeUsecaseAgentSession) ListModes(context.Context) (agenttypes.ModeList, error) {
+	return agenttypes.ModeList{}, nil
+}
+
+func (s *fakeUsecaseAgentSession) ListCommands(context.Context) (agenttypes.CommandList, error) {
+	return agenttypes.CommandList{}, nil
+}
+
+func (s *fakeUsecaseAgentSession) CancelCurrentTurn() error { return nil }
+
+func (s *fakeUsecaseAgentSession) OnUpdate(onUpdate func(agenttypes.Event)) {
+	s.onUpdate = onUpdate
+}
+
+func (s *fakeUsecaseAgentSession) SessionID() string { return s.id }
+
+func (s *fakeUsecaseAgentSession) ContextWindow(context.Context) (agenttypes.ContextWindow, error) {
+	return agenttypes.ContextWindow{}, nil
+}
+
+func (s *fakeUsecaseAgentSession) Close() error { return nil }
+
+func (s *fakeUsecaseAgentSession) emit(event agenttypes.Event) {
+	if s.onUpdate != nil {
+		s.onUpdate(event)
+	}
+}
 
 type commandTestRegistry struct {
 	root    rootfs.RootInfo

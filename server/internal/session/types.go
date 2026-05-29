@@ -14,17 +14,19 @@ const (
 )
 
 type Session struct {
-	Key          string         `json:"key"`
-	Type         string         `json:"type"`
-	AgentCtxSeq  map[string]int `json:"agent_ctx_seq,omitempty"`
-	Model        string         `json:"model,omitempty"`
-	Shell        string         `json:"shell,omitempty"`
-	Name         string         `json:"name"`
-	Exchanges    []Exchange     `json:"exchanges"`
-	RelatedFiles []RelatedFile  `json:"related_files"`
-	CreatedAt    time.Time      `json:"created_at"`
-	UpdatedAt    time.Time      `json:"updated_at"`
-	ClosedAt     *time.Time     `json:"closed_at,omitempty"`
+	Key              string         `json:"key"`
+	Type             string         `json:"type"`
+	ParentSessionKey string         `json:"parent_session_key,omitempty"`
+	ParentToolCallID string         `json:"parent_tool_call_id,omitempty"`
+	AgentCtxSeq      map[string]int `json:"agent_ctx_seq,omitempty"`
+	Model            string         `json:"model,omitempty"`
+	Shell            string         `json:"shell,omitempty"`
+	Name             string         `json:"name"`
+	Exchanges        []Exchange     `json:"exchanges"`
+	RelatedFiles     []RelatedFile  `json:"related_files"`
+	CreatedAt        time.Time      `json:"created_at"`
+	UpdatedAt        time.Time      `json:"updated_at"`
+	ClosedAt         *time.Time     `json:"closed_at,omitempty"`
 }
 
 type Exchange struct {
@@ -188,19 +190,21 @@ type SearchOptions struct {
 }
 
 type SearchHit struct {
-	Key        string     `json:"key"`
-	Type       string     `json:"type"`
-	Agent      string     `json:"agent,omitempty"`
-	Model      string     `json:"model,omitempty"`
-	Shell      string     `json:"shell,omitempty"`
-	Name       string     `json:"name"`
-	CreatedAt  time.Time  `json:"created_at"`
-	UpdatedAt  time.Time  `json:"updated_at"`
-	ClosedAt   *time.Time `json:"closed_at,omitempty"`
-	MatchType  string     `json:"match_type"`
-	MatchScore int        `json:"match_score"`
-	Seq        int        `json:"seq"`
-	Snippet    string     `json:"snippet,omitempty"`
+	Key              string     `json:"key"`
+	Type             string     `json:"type"`
+	ParentSessionKey string     `json:"parent_session_key,omitempty"`
+	ParentToolCallID string     `json:"parent_tool_call_id,omitempty"`
+	Agent            string     `json:"agent,omitempty"`
+	Model            string     `json:"model,omitempty"`
+	Shell            string     `json:"shell,omitempty"`
+	Name             string     `json:"name"`
+	CreatedAt        time.Time  `json:"created_at"`
+	UpdatedAt        time.Time  `json:"updated_at"`
+	ClosedAt         *time.Time `json:"closed_at,omitempty"`
+	MatchType        string     `json:"match_type"`
+	MatchScore       int        `json:"match_score"`
+	Seq              int        `json:"seq"`
+	Snippet          string     `json:"snippet,omitempty"`
 }
 
 // InferAgentFromSession derives the display agent from session data.

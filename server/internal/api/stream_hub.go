@@ -308,6 +308,21 @@ func (h *StreamHub) SetPendingUser(rootID, sessionKey, sessionTitle, agent, mode
 	}
 }
 
+func (h *StreamHub) SetPendingReply(rootID, sessionKey, sessionTitle string) {
+	if blank(sessionKey) {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	state := h.ensurePendingSessionLocked(sessionKey)
+	delete(h.completed, sessionKey)
+	state.RootID = rootID
+	state.SessionTitle = strings.TrimSpace(sessionTitle)
+	if state.UpdatedAt.IsZero() {
+		state.UpdatedAt = time.Now().UTC()
+	}
+}
+
 func (h *StreamHub) GetPendingUserExchange(sessionKey string) *session.Exchange {
 	h.mu.Lock()
 	defer h.mu.Unlock()

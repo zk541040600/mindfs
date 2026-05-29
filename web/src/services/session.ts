@@ -22,6 +22,8 @@ export type ExchangeAux = {
 export type Session = {
   key: string;
   type: SessionType;
+  parent_session_key?: string;
+  parent_tool_call_id?: string;
   agent?: string;
   model?: string;
   shell?: string;
@@ -61,6 +63,8 @@ export type Session = {
 export type SessionSearchHit = {
   key: string;
   type: SessionType;
+  parent_session_key?: string;
+  parent_tool_call_id?: string;
   agent?: string;
   model?: string;
   shell?: string;
