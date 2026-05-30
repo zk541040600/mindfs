@@ -32,6 +32,7 @@ Access your personal AI agents and workstation data anywhere, anytime through Mi
 - **Rich media input**: Attach files and images directly in your messages.
 - **Multi-device sync**: Access the same instance from multiple devices simultaneously with live session sync.
 - **Configuration backup and switching**: Agent configurations can be backed up and switched with one click, making it easier to move between multiple accounts or API keys.
+- **Subagents**: Codex subagents are automatically discovered and displayed.
 
 ### File Access
 
@@ -60,6 +61,14 @@ Access your personal AI agents and workstation data anywhere, anytime through Mi
 - **Custom views**: A plugin is a custom view for a file, following the pattern: receive file content → parse → render UI.
 - **Agent-generated plugins**: Tell the agent "implement a txt novel reader" and it generates the plugin — all txt files are then displayed as a reading experience.
 - **Interaction loop**: Plugins can register action buttons that send structured commands to the agent, completing the loop: customize plugin → browse file → agent interaction.
+
+### Command Execution
+
+- **Card output**: Command results are displayed as cards for clearer reading.
+- **History suggestions**: Matching previous commands automatically appear as suggestions for quick input.
+- **Screen-width adaptation**: Command output adapts to the screen width for a friendlier result view.
+- **Selectable shell type**: Choose the shell used for command execution, so Windows users do not need to worry about shell type mismatches.
+- **Session persistence**: Each session gets a long-lived shell, making tmux-like command continuity easier.
 
 ### Installation
 
