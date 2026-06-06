@@ -220,8 +220,10 @@ class SessionService {
   private pendingMessages = new Map<string, PendingMessage>();
   private listeners = new Set<(event: SessionServiceEvent) => void>();
   private reconnectTimer: number | null = null;
+  private connectTimeoutTimer: number | null = null;
   private probeTimeoutTimer: number | null = null;
   private activeProbeId: string | null = null;
+  private connectingStartedAt = 0;
   private reconnectDelayMs = 1000;
   private fastReconnectUntil = 0;
   private rootId: string | null = null;
@@ -230,7 +232,9 @@ class SessionService {
   private readonly maxReconnectDelayMs = 30000;
   private readonly fastReconnectDelayMs = 1000;
   private readonly fastReconnectWindowMs = 10000;
+  private readonly connectTimeoutMs = 5000;
   private readonly probeTimeoutMs = 2000;
+  private readonly reconnectWatchdogMs = 3000;
   private contextCache = new Map<string, { selectionKey: string }>();
 
   constructor() {
@@ -239,6 +243,7 @@ class SessionService {
       window.addEventListener("online", () => this.ensureConnection());
       window.addEventListener("pageshow", () => this.ensureConnection());
       window.addEventListener("focus", () => this.ensureConnection());
+      window.setInterval(() => this.ensureReconnectLoop(), this.reconnectWatchdogMs);
     }
     if (typeof document !== "undefined") {
       document.addEventListener("visibilitychange", () => {
@@ -266,21 +271,39 @@ class SessionService {
 
   connect(rootId: string) {
     this.rootId = rootId;
-    if (
-      this.ws?.readyState === WebSocket.OPEN ||
-      this.ws?.readyState === WebSocket.CONNECTING
-    ) {
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.emit({ type: this.hasConnected ? "ws.reconnected" : "ws.connected" });
+      this.hasConnected = true;
+      return;
+    }
+    if (this.ws?.readyState === WebSocket.CONNECTING) {
+      if (
+        this.connectingStartedAt > 0 &&
+        Date.now() - this.connectingStartedAt > this.connectTimeoutMs
+      ) {
+        this.reconnectNow();
+        return;
+      }
+      this.emit({ type: this.hasConnected ? "ws.reconnecting" : "ws.connecting" });
       return;
     }
 
     this.clearReconnectTimer();
     this.closeSocket();
+    this.emit({ type: this.hasConnected ? "ws.reconnecting" : "ws.connecting" });
 
     const ws = new WebSocket(this.buildWSUrl());
     this.ws = ws;
+    this.connectingStartedAt = Date.now();
+    this.connectTimeoutTimer = window.setTimeout(() => {
+      if (this.ws !== ws || ws.readyState !== WebSocket.CONNECTING) return;
+      console.warn("[Session] WebSocket connect timed out, reconnecting");
+      this.reconnectNow();
+    }, this.connectTimeoutMs);
 
     ws.onopen = () => {
       if (this.ws !== ws) return;
+      this.clearConnectTimeout();
       this.clearProbe();
       this.reconnectDelayMs = 1000;
       if (this.hasConnected) {
@@ -315,6 +338,7 @@ class SessionService {
 
     ws.onclose = (event) => {
       if (this.ws !== ws) return;
+      this.clearConnectTimeout();
       this.ws = null;
       this.emit({
         type: "ws.closed",
@@ -336,6 +360,7 @@ class SessionService {
 
   disconnect() {
     this.clearReconnectTimer();
+    this.clearConnectTimeout();
     this.clearProbe();
     this.closeSocket();
     this.contextCache.clear();
@@ -348,6 +373,14 @@ class SessionService {
     }
   }
 
+  private clearConnectTimeout() {
+    if (this.connectTimeoutTimer) {
+      clearTimeout(this.connectTimeoutTimer);
+      this.connectTimeoutTimer = null;
+    }
+    this.connectingStartedAt = 0;
+  }
+
   private clearProbe() {
     if (this.probeTimeoutTimer) {
       clearTimeout(this.probeTimeoutTimer);
@@ -357,6 +390,7 @@ class SessionService {
   }
 
   private closeSocket() {
+    this.clearConnectTimeout();
     this.clearProbe();
     if (this.ws) {
       const ws = this.ws;
@@ -375,17 +409,42 @@ class SessionService {
       this.reconnectNow();
       return;
     }
-    if (this.ws.readyState === WebSocket.CONNECTING) return;
+    if (this.ws.readyState === WebSocket.CONNECTING) {
+      if (
+        this.connectingStartedAt > 0 &&
+        Date.now() - this.connectingStartedAt > this.connectTimeoutMs
+      ) {
+        this.reconnectNow();
+      }
+      return;
+    }
     this.probeConnection();
+  }
+
+  private ensureReconnectLoop() {
+    if (!this.rootId) return;
+    if (!this.ws || this.ws.readyState >= WebSocket.CLOSING) {
+      this.reconnectNow();
+      return;
+    }
+    if (
+      this.ws.readyState === WebSocket.CONNECTING &&
+      this.connectingStartedAt > 0 &&
+      Date.now() - this.connectingStartedAt > this.connectTimeoutMs
+    ) {
+      this.reconnectNow();
+    }
   }
 
   private reconnectNow() {
     if (!this.rootId) return;
+    const rootId = this.rootId;
     this.clearReconnectTimer();
     this.clearProbe();
+    this.closeSocket();
     this.reconnectDelayMs = 1000;
     this.fastReconnectUntil = Date.now() + this.fastReconnectWindowMs;
-    this.connect(this.rootId);
+    this.connect(rootId);
   }
 
   private probeConnection() {

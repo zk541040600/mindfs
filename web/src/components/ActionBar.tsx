@@ -44,6 +44,8 @@ type AttachedFileContext = {
   text?: string;
 };
 
+type WSStatus = "connecting" | "connected" | "reconnecting" | "disconnected";
+
 function getSelectionPreview(text?: string): string {
   const trimmed = String(text || "").trim();
   if (!trimmed) {
@@ -53,7 +55,7 @@ function getSelectionPreview(text?: string): string {
 }
 
 type ActionBarProps = {
-  status?: string;
+  status?: WSStatus;
   agentsVersion?: number;
   currentRootId?: string | null;
   currentSession?: SessionInfo | null;
@@ -84,6 +86,40 @@ type ActionBarProps = {
   onToggleLeftSidebar?: () => void;
   onToggleRightSidebar?: () => void;
 };
+
+function wsStatusMeta(status: WSStatus): {
+  color: string;
+  shadow: string;
+  label: string;
+} {
+  switch (status) {
+    case "connected":
+      return {
+        color: "#22c55e",
+        shadow: "none",
+        label: "WebSocket 连接正常",
+      };
+    case "connecting":
+      return {
+        color: "#f59e0b",
+        shadow: "none",
+        label: "WebSocket 正在连接",
+      };
+    case "reconnecting":
+      return {
+        color: "#ef4444",
+        shadow: "none",
+        label: "WebSocket 已断开，正在重连",
+      };
+    case "disconnected":
+    default:
+      return {
+        color: "#94a3b8",
+        shadow: "none",
+        label: "WebSocket 未连接",
+      };
+  }
+}
 
 const modePlaceholders: Record<SessionMode, string> = {
   chat: "给 agent 发消息...",
@@ -308,7 +344,7 @@ function replaceActiveTokenText(input: string, activeToken: { type: "file" | "sl
 }
 
 export function ActionBar({
-  status = "Disconnected",
+  status = "disconnected",
   agentsVersion = 0,
   currentRootId,
   currentSession,
@@ -361,7 +397,8 @@ export function ActionBar({
   const isComposingRef = useRef(false);
   const compositionGuardUntilRef = useRef(0);
   const { isMobile } = useResponsive();
-  const isConnected = status === "Connected";
+  const isConnected = status === "connected";
+  const connectionMeta = wsStatusMeta(status);
   const DRAG_THRESHOLD = -40;
   const boundRingColor = detachedBoundSession ? "#f59e0b" : "#2563eb";
   const boundRingShadow = detachedBoundSession
@@ -1057,6 +1094,23 @@ export function ActionBar({
                 )}
               </div>
             ) : null}
+
+            <span
+              aria-label={connectionMeta.label}
+              title={connectionMeta.label}
+              style={{
+                position: "absolute",
+                left: "5px",
+                bottom: "4px",
+                width: "6px",
+                height: "6px",
+                borderRadius: "50%",
+                background: connectionMeta.color,
+                boxShadow: connectionMeta.shadow,
+                pointerEvents: "auto",
+                zIndex: 6,
+              }}
+            />
 
             <div style={{ position: "absolute", right: isMobile ? "4px" : "8px", bottom: isMultiLine ? "6px" : "50%", transform: isMultiLine ? "none" : "translateY(50%)", display: "flex", alignItems: "center", gap: isMobile ? "0px" : "2px", zIndex: 5, transition: "all 0.2s cubic-bezier(0.4, 0, 0.2, 1)" }}>
               <div

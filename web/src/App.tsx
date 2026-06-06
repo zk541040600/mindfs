@@ -104,6 +104,7 @@ import { fetchAgents, type AgentStatus } from "./services/agents";
 
 // 类型定义
 type SessionMode = "chat" | "plugin" | "command";
+type WSStatus = "connecting" | "connected" | "reconnecting" | "disconnected";
 
 function normalizeFastService(
   value: unknown,
@@ -1208,7 +1209,7 @@ export function App({ onGoHome }: AppProps) {
       return {};
     }
   });
-  const [status, setStatus] = useState("Disconnected");
+  const [status, setStatus] = useState<WSStatus>("disconnected");
   const [file, setFile] = useState<FilePayload | null>(null);
   const [viewerSelection, setViewerSelection] =
     useState<ViewerSelection | null>(null);
@@ -1821,6 +1822,46 @@ export function App({ onGoHome }: AppProps) {
     [rootSessionKey],
   );
 
+  const clearLocalPendingForSession = useCallback(
+    (rootID: string | null | undefined, sessionKey: string | null | undefined) => {
+      const resolvedRoot = String(rootID || "");
+      const resolvedKey = String(sessionKey || "");
+      if (!resolvedRoot || !resolvedKey) {
+        return;
+      }
+      const cacheKey = rootSessionKey(resolvedRoot, resolvedKey);
+      delete pendingBySessionRef.current[cacheKey];
+      const cached = sessionCacheRef.current[cacheKey];
+      if (cached && (cached.key || (cached as any).session_key) === resolvedKey) {
+        sessionCacheRef.current[cacheKey] = {
+          ...(cached as any),
+          pending: false,
+        } as Session;
+      }
+      setSelectedSession((prev) => {
+        const prevKey = prev?.key || prev?.session_key;
+        const prevRoot =
+          (prev?.root_id as string | undefined) || currentRootIdRef.current;
+        if (!prev || prevKey !== resolvedKey || prevRoot !== resolvedRoot) {
+          return prev;
+        }
+        return {
+          ...(prev as any),
+          pending: false,
+        } as SessionItem;
+      });
+      const drawer = drawerSessionByRootRef.current[resolvedRoot];
+      if (drawer && (drawer.key || (drawer as any).session_key) === resolvedKey) {
+        setDrawerSessionForRoot(resolvedRoot, {
+          ...(drawer as any),
+          pending: false,
+        } as Session);
+      }
+      bumpCacheVersion();
+    },
+    [bumpCacheVersion, rootSessionKey, setDrawerSessionForRoot],
+  );
+
   const markSessionStale = useCallback(
     (rootID: string | null | undefined, sessionKey: string | null | undefined) => {
       const resolvedRoot = String(rootID || "");
@@ -1882,11 +1923,17 @@ export function App({ onGoHome }: AppProps) {
       if (!fullSession) {
         return null;
       }
-      const pending = resolvePendingForSession(
-        resolvedRoot,
-        resolvedKey,
-        !!(fullSession as any)?.pending,
-      );
+      const serverPending =
+        typeof (fullSession as any)?.pending === "boolean"
+          ? !!(fullSession as any).pending
+          : undefined;
+      if (serverPending === false) {
+        clearLocalPendingForSession(resolvedRoot, resolvedKey);
+      }
+      const pending =
+        serverPending === false
+          ? false
+          : resolvePendingForSession(resolvedRoot, resolvedKey, !!serverPending);
       sessionCacheRef.current[cacheKey] = {
         ...(fullSession as any),
         key: resolvedKey,
@@ -1900,7 +1947,7 @@ export function App({ onGoHome }: AppProps) {
         pending,
       } as Session;
     },
-    [bumpCacheVersion, resolvePendingForSession, rootSessionKey],
+    [bumpCacheVersion, clearLocalPendingForSession, resolvePendingForSession, rootSessionKey],
   );
 
   const updateSessionRelatedFilesForKey = useCallback(
@@ -5710,9 +5757,12 @@ export function App({ onGoHome }: AppProps) {
   }, [currentRootId, gitStatus, selectedDir]);
 
   useEffect(() => {
-    if (!currentRootId) return;
+    if (!currentRootId) {
+      setStatus("disconnected");
+      return;
+    }
+    setStatus("connecting");
     sessionService.connect(currentRootId);
-    setStatus("Connected");
   }, [currentRootId]);
 
   useEffect(() => {
@@ -5731,7 +5781,7 @@ export function App({ onGoHome }: AppProps) {
   useEffect(
     () => () => {
       sessionService.disconnect();
-      setStatus("Disconnected");
+      setStatus("disconnected");
     },
     [],
   );
@@ -6249,7 +6299,11 @@ export function App({ onGoHome }: AppProps) {
     const unsubscribeEvents = sessionService.subscribeEvents((event) => {
       const payload = (event.payload || {}) as any;
       switch (event.type) {
+        case "ws.connecting":
+          setStatus("connecting");
+          break;
         case "ws.connected":
+          setStatus("connected");
           void refreshManagedRoots();
           if (currentRootIdRef.current) {
             const newest = sessionsRef.current[0]?.updated_at || "";
@@ -6260,7 +6314,11 @@ export function App({ onGoHome }: AppProps) {
           }
           replayTargetsForAllRoots();
           break;
+        case "ws.reconnecting":
+          setStatus("reconnecting");
+          break;
         case "ws.reconnected":
+          setStatus("connected");
           void refreshManagedRoots();
           if (currentRootIdRef.current) {
             const newest = sessionsRef.current[0]?.updated_at || "";
@@ -6272,6 +6330,7 @@ export function App({ onGoHome }: AppProps) {
           replayTargetsForAllRoots();
           break;
         case "ws.closed":
+          setStatus(currentRootIdRef.current ? "reconnecting" : "disconnected");
           void handleRelayWebSocketClosed();
           break;
         case "root.changed":
