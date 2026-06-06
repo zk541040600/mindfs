@@ -329,7 +329,7 @@ func (s *session) ListModels(ctx context.Context) (types.ModelList, error) {
 	}
 	supported := s.client.SupportedModelsFromInit()
 	models := make([]types.ModelInfo, 0, len(supported))
-	for _, model := range supported {
+	for index, model := range supported {
 		name := strings.TrimSpace(model.DisplayName)
 		if name == "" {
 			name = strings.TrimSpace(model.Value)
@@ -338,7 +338,7 @@ func (s *session) ListModels(ctx context.Context) (types.ModelList, error) {
 			ID:            model.Value,
 			Name:          name,
 			Description:   model.Description,
-			SupportEffort: claudeModelSupportsEffort(model.Value, name),
+			SupportEffort: claudeModelSupportsEffortAt(supported, index),
 		})
 	}
 	log.Printf("[agent/claude] models.cached session=%s count=%d", s.sessionKey, len(models))
@@ -357,8 +357,28 @@ func (s *session) ListModels(ctx context.Context) (types.ModelList, error) {
 	}, nil
 }
 
-func claudeModelSupportsEffort(id, name string) bool {
-	joined := strings.ToLower(strings.TrimSpace(id) + " " + strings.TrimSpace(name))
+func claudeModelSupportsEffortAt(models []claudeagent.ModelInfo, index int) bool {
+	if index < 0 || index >= len(models) {
+		return false
+	}
+	model := models[index]
+	if claudeModelSupportsEffort(model.Value, model.DisplayName, model.Description) {
+		return true
+	}
+	if !strings.EqualFold(strings.TrimSpace(model.Value), "default") {
+		return false
+	}
+	for _, candidate := range models {
+		if strings.EqualFold(strings.TrimSpace(candidate.Value), "default") {
+			continue
+		}
+		return claudeModelSupportsEffort(candidate.Value, candidate.DisplayName, candidate.Description)
+	}
+	return false
+}
+
+func claudeModelSupportsEffort(id, name, description string) bool {
+	joined := strings.ToLower(strings.TrimSpace(id) + " " + strings.TrimSpace(name) + " " + strings.TrimSpace(description))
 	return strings.Contains(joined, "sonnet") || strings.Contains(joined, "opus")
 }
 
