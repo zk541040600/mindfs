@@ -148,6 +148,23 @@ func (s *Service) GetSessionExchangeAux(ctx context.Context, in GetSessionExchan
 	return manager.GetExchangeAux(ctx, in.Key, in.Seq)
 }
 
+type GetSessionToolCallInput struct {
+	RootID string
+	Key    string
+	CallID string
+}
+
+func (s *Service) GetSessionToolCall(ctx context.Context, in GetSessionToolCallInput) (*agenttypes.ToolCall, error) {
+	if err := s.ensureRegistry(); err != nil {
+		return nil, err
+	}
+	manager, err := s.Registry.GetSessionManager(in.RootID)
+	if err != nil {
+		return nil, err
+	}
+	return manager.GetFullToolCall(ctx, in.Key, in.CallID)
+}
+
 type GetSessionContextWindowInput struct {
 	RootID string
 	Key    string
@@ -1227,6 +1244,7 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 	sawAssistantChunk := false
 	plannedAssistantSeq := len(current.Exchanges) + 2
 	auxBuffer := make([]session.ExchangeAux, 0, 8)
+	defer manager.ClearPendingExchangeAux(context.Background(), current.Key)
 	var thoughtBuffer strings.Builder
 	flushThought := func() {
 		thought := thoughtBuffer.String()
@@ -1245,7 +1263,7 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 	attachSessionUpdates := func(runtime agenttypes.Session) {
 		runtime.OnUpdate(func(update agenttypes.Event) {
 			update = normalizeAgentUpdatePaths(root, update)
-			update = compactAgentUpdate(update)
+			clientUpdate := compactAgentUpdate(update)
 			switch update.Type {
 			case agenttypes.EventTypeThoughtChunk:
 				if chunk, ok := update.Data.(agenttypes.ThoughtChunk); ok && chunk.Content != "" {
@@ -1290,6 +1308,7 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 						Line:     currentAssistantLine(responseText),
 						ToolCall: &toolCallCopy,
 					})
+					_ = manager.UpsertPendingExchangeAux(context.Background(), current.Key, session.ExchangeAux{ToolCall: &toolCallCopy})
 				}
 			}
 			if update.Type == agenttypes.EventTypeMessageChunk {
@@ -1308,7 +1327,7 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 				watcher.MarkSessionActive(current.Key)
 			}
 			if in.OnUpdate != nil {
-				in.OnUpdate(update)
+				in.OnUpdate(clientUpdate)
 			}
 		})
 	}
@@ -1532,6 +1551,7 @@ func attachBackgroundSessionUpdates(ctx context.Context, in subagentSessionInput
 		}
 		doneSent = true
 		doneMu.Unlock()
+		defer in.Manager.ClearPendingExchangeAux(context.Background(), child.Key)
 		flushThought()
 		if err := in.Manager.AddExchangeForAgent(ctx, child, "agent", responseText, in.Agent, in.Mode, in.Effort, in.FastService); err != nil {
 			log.Printf("[subagent] persist.agent.error root=%s session=%s err=%v", in.RootID, child.Key, err)
@@ -1551,7 +1571,7 @@ func attachBackgroundSessionUpdates(ctx context.Context, in subagentSessionInput
 		}
 	}
 	runtime.OnUpdate(func(update agenttypes.Event) {
-		update = compactAgentUpdate(update)
+		clientUpdate := compactAgentUpdate(update)
 		switch update.Type {
 		case agenttypes.EventTypeThoughtChunk:
 			if chunk, ok := update.Data.(agenttypes.ThoughtChunk); ok && chunk.Content != "" {
@@ -1568,6 +1588,7 @@ func attachBackgroundSessionUpdates(ctx context.Context, in subagentSessionInput
 					Line:     currentAssistantLine(responseText),
 					ToolCall: &toolCallCopy,
 				})
+				_ = in.Manager.UpsertPendingExchangeAux(context.Background(), child.Key, session.ExchangeAux{ToolCall: &toolCallCopy})
 			}
 		}
 		if update.Type == agenttypes.EventTypeMessageChunk {
@@ -1583,13 +1604,13 @@ func attachBackgroundSessionUpdates(ctx context.Context, in subagentSessionInput
 		}
 		if update.Type != agenttypes.EventTypeMessageDone {
 			if in.OnUpdate != nil {
-				in.OnUpdate(child.Key, update)
+				in.OnUpdate(child.Key, clientUpdate)
 			}
 			return
 		}
 		finish(false)
 		if in.OnUpdate != nil {
-			in.OnUpdate(child.Key, update)
+			in.OnUpdate(child.Key, clientUpdate)
 		}
 	})
 	return func() { finish(true) }
@@ -2076,17 +2097,11 @@ func normalizeAgentUpdatePaths(root pathNormalizer, update agenttypes.Event) age
 	for i := range toolCall.Locations {
 		toolCall.Locations[i].Path = normalizeToolPath(root, toolCall.Locations[i].Path)
 	}
-	if session.PreserveToolCallContent(toolCall.Kind) {
-		for i := range toolCall.Content {
-			toolCall.Content[i].Path = normalizeToolPath(root, toolCall.Content[i].Path)
-			if toolCall.Content[i].Type == "text" {
-				toolCall.Content[i].Text = normalizeDiffTextPaths(root, toolCall.Content[i].Text)
-			}
+	for i := range toolCall.Content {
+		toolCall.Content[i].Path = normalizeToolPath(root, toolCall.Content[i].Path)
+		if toolCall.Content[i].Type == "text" {
+			toolCall.Content[i].Text = normalizeDiffTextPaths(root, toolCall.Content[i].Text)
 		}
-	} else if session.PreserveCommandExecutionContent(toolCall) {
-		toolCall = session.CompactToolCall(toolCall)
-	} else {
-		toolCall.Content = nil
 	}
 	if toolCall.Meta != nil {
 		if filePath, ok := toolCall.Meta["filePath"].(string); ok {

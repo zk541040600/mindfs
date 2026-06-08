@@ -1177,6 +1177,8 @@ if (useInnerScrollContainer && !container) {
               locations={tc.locations}
               meta={tc.meta}
               rootPath={rootPath || undefined}
+              rootId={rootId}
+              sessionKey={sessionKey}
               defaultExpanded={isUserShell}
             />
           )}

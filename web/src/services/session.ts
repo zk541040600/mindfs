@@ -886,6 +886,31 @@ class SessionService {
     }
   }
 
+  async getToolCall(
+    rootId: string,
+    sessionKey: string,
+    callId: string,
+  ): Promise<ToolCall | null> {
+    try {
+      if (!rootId || !sessionKey || !callId) return null;
+      const params = new URLSearchParams({ root: rootId });
+      const data = await protectedJSON<{ toolcall?: ToolCall; toolCall?: ToolCall } | ToolCall>(
+        appURL(
+          `/api/sessions/${encodeURIComponent(sessionKey)}/toolcalls/${encodeURIComponent(callId)}`,
+          params,
+        ),
+      );
+      const wrapped = data as { toolcall?: ToolCall; toolCall?: ToolCall };
+      if (wrapped?.toolcall) return wrapped.toolcall;
+      if (wrapped?.toolCall) return wrapped.toolCall;
+      const direct = data as ToolCall;
+      return direct?.callId ? direct : null;
+    } catch (err) {
+      console.error("[Session] Failed to get toolcall:", err);
+      return null;
+    }
+  }
+
   async getSessionRelatedFiles(
     rootId: string,
     sessionKey: string,

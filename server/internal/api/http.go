@@ -284,6 +284,7 @@ func (h *HTTPHandler) Routes() http.Handler {
 	r.Get("/api/sessions/external", h.protectedEndpoint(h.handleExternalSessionsList))
 	r.Post("/api/sessions/import", h.protectedEndpoint(h.handleExternalSessionImport))
 	r.Post("/api/sessions/import/batch", h.protectedEndpoint(h.handleExternalSessionImportBatch))
+	r.Get("/api/sessions/{key}/toolcalls/{callID}", h.protectedEndpoint(h.handleSessionToolCallGet))
 	r.Get("/api/sessions/{key}", h.protectedEndpoint(h.handleSessionGet))
 	r.Get("/api/sessions/{key}/related-files", h.protectedEndpoint(h.handleSessionRelatedFilesGet))
 	r.Post("/api/sessions/{key}/rename", h.protectedEndpoint(h.handleSessionRename))
@@ -629,6 +630,30 @@ func (h *HTTPHandler) handleSessionGet(w http.ResponseWriter, r *http.Request) {
 		Seq:    afterSeq,
 	})
 	respondJSON(w, http.StatusOK, h.sessionResponse(out, pendingUser, contextWindow, exchangeAux))
+}
+
+func (h *HTTPHandler) handleSessionToolCallGet(w http.ResponseWriter, r *http.Request) {
+	rootID := r.URL.Query().Get("root")
+	key := chi.URLParam(r, "key")
+	callID := chi.URLParam(r, "callID")
+	if strings.TrimSpace(key) == "" || strings.TrimSpace(callID) == "" {
+		respondError(w, http.StatusBadRequest, errInvalidRequest("session key and tool call id required"))
+		return
+	}
+	toolCall, err := h.service().GetSessionToolCall(r.Context(), usecase.GetSessionToolCallInput{
+		RootID: rootID,
+		Key:    key,
+		CallID: callID,
+	})
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			respondError(w, http.StatusNotFound, err)
+			return
+		}
+		respondError(w, http.StatusBadRequest, err)
+		return
+	}
+	respondJSON(w, http.StatusOK, map[string]any{"toolcall": toolCall})
 }
 
 func (h *HTTPHandler) handleSessionRelatedFilesGet(w http.ResponseWriter, r *http.Request) {
