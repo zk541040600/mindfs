@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -125,6 +126,16 @@ func Start(ctx context.Context, addr string, opts StartOptions) error {
 		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	defer listener.Close()
+	localCLIToken, err := EnsureLocalCLIToken(addr)
+	if err != nil {
+		return err
+	}
+	httpHandler.LocalCLIToken = localCLIToken
 
 	relayMgr, err := relay.NewManager(addr, opts.NoRelayer, relayBaseURL, opts.UseTLS)
 	if err != nil {
@@ -149,9 +160,9 @@ func Start(ctx context.Context, addr string, opts StartOptions) error {
 	}
 
 	if opts.UseTLS {
-		return server.ListenAndServeTLS(opts.CertFile, opts.KeyFile)
+		return server.ServeTLS(listener, opts.CertFile, opts.KeyFile)
 	}
-	return server.ListenAndServe()
+	return server.Serve(listener)
 }
 
 func autoAddExternalProjectRoots(registry *fs.Registry) {

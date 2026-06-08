@@ -224,6 +224,7 @@ class SessionService {
   private probeTimeoutTimer: number | null = null;
   private activeProbeId: string | null = null;
   private connectingStartedAt = 0;
+  private openingSocket = false;
   private reconnectDelayMs = 1000;
   private fastReconnectUntil = 0;
   private rootId: string | null = null;
@@ -265,8 +266,16 @@ class SessionService {
     return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
   }
 
-  private buildWSUrl(): string {
-    return wsURL("/ws", new URLSearchParams({ client_id: this.clientId }));
+  private async buildWSUrl(): Promise<string> {
+    const params = new URLSearchParams({ client_id: this.clientId });
+    const proofTarget = wsURL("/ws", params);
+    if (e2eeService.isRequired()) {
+      const proofParams = await e2eeService.wsProofParams("GET", proofTarget);
+      for (const [key, value] of proofParams) {
+        params.set(key, value);
+      }
+    }
+    return wsURL("/ws", params);
   }
 
   connect(rootId: string) {
@@ -276,7 +285,7 @@ class SessionService {
       this.hasConnected = true;
       return;
     }
-    if (this.ws?.readyState === WebSocket.CONNECTING) {
+    if (this.openingSocket || this.ws?.readyState === WebSocket.CONNECTING) {
       if (
         this.connectingStartedAt > 0 &&
         Date.now() - this.connectingStartedAt > this.connectTimeoutMs
@@ -292,7 +301,30 @@ class SessionService {
     this.closeSocket();
     this.emit({ type: this.hasConnected ? "ws.reconnecting" : "ws.connecting" });
 
-    const ws = new WebSocket(this.buildWSUrl());
+    void this.openSocket();
+  }
+
+  private async openSocket() {
+    if (this.openingSocket) {
+      return;
+    }
+    this.openingSocket = true;
+    let target = "";
+    try {
+      target = await this.buildWSUrl();
+    } catch (err) {
+      this.openingSocket = false;
+      console.error("[Session] Failed to prepare WebSocket proof:", err);
+      this.emit({ type: "ws.closed", payload: { code: 0, reason: "e2ee_proof_failed", was_clean: false } });
+      this.scheduleReconnect();
+      return;
+    }
+    if (!this.rootId || this.ws) {
+      this.openingSocket = false;
+      return;
+    }
+    const ws = new WebSocket(target);
+    this.openingSocket = false;
     this.ws = ws;
     this.connectingStartedAt = Date.now();
     this.connectTimeoutTimer = window.setTimeout(() => {
@@ -392,6 +424,7 @@ class SessionService {
   private closeSocket() {
     this.clearConnectTimeout();
     this.clearProbe();
+    this.openingSocket = false;
     if (this.ws) {
       const ws = this.ws;
       this.ws = null;

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -24,9 +25,11 @@ import (
 const (
 	wsPingInterval = 30 * time.Second
 	wsPongWait     = 2 * time.Minute
+	wsProofQuery   = "e2ee_proof"
+	wsTSQuery      = "e2ee_ts"
 )
 
-var upgrader = websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+var upgrader = websocket.Upgrader{}
 
 // WSHandler manages JSON-RPC over WebSocket.
 type WSHandler struct {
@@ -76,6 +79,10 @@ func (h *WSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	clientID := strings.TrimSpace(r.URL.Query().Get("client_id"))
 	if clientID == "" {
 		http.Error(w, "client_id required", http.StatusBadRequest)
+		return
+	}
+	if err := h.requireWSProof(r, clientID); err != nil {
+		respondError(w, http.StatusUnauthorized, err)
 		return
 	}
 	conn, err := upgrader.Upgrade(w, r, nil)
@@ -155,6 +162,61 @@ func (h *WSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		h.handleWSRequest(r.Context(), conn, clientID, req)
 	}
+}
+
+func (h *WSHandler) requireWSProof(r *http.Request, clientID string) error {
+	if h == nil || h.AppContext == nil {
+		return nil
+	}
+	manager := h.AppContext.GetE2EEManager()
+	if manager == nil || !manager.Enabled() {
+		return nil
+	}
+	ts := strings.TrimSpace(r.URL.Query().Get(wsTSQuery))
+	proof := strings.TrimSpace(r.URL.Query().Get(wsProofQuery))
+	if clientID == "" || ts == "" || proof == "" {
+		return errInvalidRequest("e2ee_proof_required")
+	}
+	sess, err := manager.SessionForClient(clientID)
+	if err != nil {
+		return errInvalidRequest(err.Error())
+	}
+	timestamp, err := time.Parse(time.RFC3339, ts)
+	if err != nil {
+		return errInvalidRequest("invalid_e2ee_ts")
+	}
+	now := time.Now().UTC()
+	if timestamp.Before(now.Add(-requestProofMaxSkew)) || timestamp.After(now.Add(requestProofMaxSkew)) {
+		return errInvalidRequest("e2ee_proof_expired")
+	}
+	expected := e2ee.BuildRequestProof(sess.Key, r.Method, wsProofPath(r), ts, clientID)
+	if !e2ee.VerifyProof(expected, proof) {
+		return errInvalidRequest("e2ee_proof_invalid")
+	}
+	return nil
+}
+
+func wsProofPath(r *http.Request) string {
+	if r == nil || r.URL == nil {
+		return ""
+	}
+	next := *r.URL
+	query := cloneQuery(next.Query())
+	query.Del(wsTSQuery)
+	query.Del(wsProofQuery)
+	next.RawQuery = query.Encode()
+	if next.RawQuery == "" {
+		return next.Path
+	}
+	return next.Path + "?" + next.RawQuery
+}
+
+func cloneQuery(values url.Values) url.Values {
+	next := make(url.Values, len(values))
+	for key, value := range values {
+		next[key] = append([]string(nil), value...)
+	}
+	return next
 }
 
 func (h *WSHandler) broadcastFileChange(change fs.FileChangeEvent) {
