@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -407,13 +409,17 @@ func convertEvent(update SessionUpdate) types.Event {
 				status = string(raw.ToolCall.Status)
 			}
 			kind := types.ToolKind(raw.ToolCall.Kind)
+			content := convertToolCallContent(raw.ToolCall.Content)
+			meta := convertToolCallMeta(raw.ToolCall.Meta, raw.ToolCall.RawInput, raw.ToolCall.RawOutput)
 			ev.Data = types.ToolCall{
 				CallID:    string(raw.ToolCall.ToolCallId),
 				Title:     raw.ToolCall.Title,
 				Status:    status,
 				Kind:      kind,
-				Content:   convertToolCallContent(raw.ToolCall.Content),
+				Content:   withRawOutputContent(content, raw.ToolCall.RawOutput),
 				Locations: locations,
+				RawType:   "acp",
+				Meta:      meta,
 			}
 		} else {
 			logUnhandledConvertEvent(update, "tool_call")
@@ -436,13 +442,17 @@ func convertEvent(update SessionUpdate) types.Event {
 			for _, loc := range raw.ToolCallUpdate.Locations {
 				locations = append(locations, types.ToolCallLocation{Path: loc.Path, Line: loc.Line})
 			}
+			content := convertToolCallContent(raw.ToolCallUpdate.Content)
+			meta := convertToolCallMeta(raw.ToolCallUpdate.Meta, raw.ToolCallUpdate.RawInput, raw.ToolCallUpdate.RawOutput)
 			ev.Data = types.ToolCall{
 				CallID:    string(raw.ToolCallUpdate.ToolCallId),
 				Title:     name,
 				Status:    status,
 				Kind:      kind,
-				Content:   convertToolCallContent(raw.ToolCallUpdate.Content),
+				Content:   withRawOutputContent(content, raw.ToolCallUpdate.RawOutput),
 				Locations: locations,
+				RawType:   "acp",
+				Meta:      meta,
 			}
 		} else {
 			logUnhandledConvertEvent(update, "tool_call_update")
@@ -499,4 +509,78 @@ func convertToolCallContent(items []acpsdk.ToolCallContent) []types.ToolCallCont
 		}
 	}
 	return out
+}
+
+func convertToolCallMeta(acpMeta map[string]any, rawInput any, rawOutput any) map[string]any {
+	meta := make(map[string]any, len(acpMeta)+2)
+	for key, value := range acpMeta {
+		meta[key] = value
+	}
+	if !isEmptyRawValue(rawInput) {
+		meta["input"] = rawValueString(rawInput)
+		meta["rawInput"] = rawInput
+	}
+	if !isEmptyRawValue(rawOutput) {
+		meta["output"] = rawValueString(rawOutput)
+		meta["rawOutput"] = rawOutput
+	}
+	if len(meta) == 0 {
+		return nil
+	}
+	return meta
+}
+
+func withRawOutputContent(items []types.ToolCallContentItem, rawOutput any) []types.ToolCallContentItem {
+	if len(items) > 0 || isEmptyRawValue(rawOutput) {
+		return items
+	}
+	text := rawOutputText(rawOutput)
+	if strings.TrimSpace(text) == "" {
+		return items
+	}
+	return []types.ToolCallContentItem{{Type: "text", Text: text}}
+}
+
+func rawOutputText(value any) string {
+	if isEmptyRawValue(value) {
+		return ""
+	}
+	if mapped, ok := value.(map[string]any); ok {
+		for _, key := range []string{"content", "output", "result", "message", "stdout", "stderr", "text"} {
+			if text := strings.TrimSpace(rawValueString(mapped[key])); text != "" {
+				return text
+			}
+		}
+	}
+	return rawValueString(value)
+}
+
+func rawValueString(value any) string {
+	if isEmptyRawValue(value) {
+		return ""
+	}
+	if text, ok := value.(string); ok {
+		return text
+	}
+	raw, err := json.Marshal(value)
+	if err == nil {
+		return string(raw)
+	}
+	return fmt.Sprint(value)
+}
+
+func isEmptyRawValue(value any) bool {
+	if value == nil {
+		return true
+	}
+	if text, ok := value.(string); ok {
+		return strings.TrimSpace(text) == ""
+	}
+	rv := reflect.ValueOf(value)
+	switch rv.Kind() {
+	case reflect.Map, reflect.Slice, reflect.Array:
+		return rv.Len() == 0
+	default:
+		return false
+	}
 }

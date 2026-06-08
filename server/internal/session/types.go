@@ -50,7 +50,10 @@ type ExchangeAux struct {
 
 func CompactExchangeAux(aux ExchangeAux) (ExchangeAux, bool) {
 	if aux.ToolCall == nil {
-		return ExchangeAux{}, false
+		if strings.TrimSpace(aux.Thought) == "" {
+			return ExchangeAux{}, false
+		}
+		return aux, true
 	}
 
 	toolCall := CompactToolCall(*aux.ToolCall)
@@ -63,6 +66,8 @@ func CompactToolCall(toolCall agenttypes.ToolCall) agenttypes.ToolCall {
 	switch {
 	case PreserveToolCallContent(toolCall.Kind):
 	case PreserveCommandExecutionContent(toolCall):
+		toolCall.Content = truncateToolCallContent(toolCall.Content, maxExecToolCallContentBytes)
+	case PreserveACPToolCallContent(toolCall):
 		toolCall.Content = truncateToolCallContent(toolCall.Content, maxExecToolCallContentBytes)
 	default:
 		toolCall.Content = nil
@@ -96,6 +101,10 @@ func PreserveCommandExecutionContent(toolCall agenttypes.ToolCall) bool {
 	}
 	source, _ := toolCall.Meta["source"].(string)
 	return strings.EqualFold(strings.TrimSpace(source), "userShell")
+}
+
+func PreserveACPToolCallContent(toolCall agenttypes.ToolCall) bool {
+	return strings.EqualFold(strings.TrimSpace(toolCall.RawType), "acp") && len(toolCall.Content) > 0
 }
 
 func InferCommandShellFromAux(aux map[int][]ExchangeAux) string {

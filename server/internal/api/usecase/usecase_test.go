@@ -280,6 +280,66 @@ func TestSubSessionSyntheticDonePersistsPartialResponse(t *testing.T) {
 	}
 }
 
+func TestStaleAgentSessionErrorDetection(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "unknown session id", err: errors.New("Invalid params: Unknown sessionId: 019ea739"), want: true},
+		{name: "session not found", err: errors.New("session not found"), want: true},
+		{name: "invalid unrelated params", err: errors.New("Invalid params: model required"), want: false},
+		{name: "ordinary upstream failure", err: errors.New("rate limit exceeded"), want: false},
+		{name: "nil", err: nil, want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isStaleAgentSessionError(tc.err); got != tc.want {
+				t.Fatalf("isStaleAgentSessionError(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestBuildPromptReadsHistoryWhenAgentContextReset(t *testing.T) {
+	ctx := context.Background()
+	rootDir := t.TempDir()
+	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
+	manager := session.NewManager(root)
+	created, err := manager.Create(ctx, session.CreateInput{Type: session.TypeChat, Agent: "pi", Name: "chat"})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if err := manager.AddExchangeForAgent(ctx, created, "user", "first", "pi", "", "", ""); err != nil {
+		t.Fatalf("add user: %v", err)
+	}
+	if err := manager.AddExchangeForAgent(ctx, created, "agent", "second", "pi", "", "", ""); err != nil {
+		t.Fatalf("add agent: %v", err)
+	}
+	loaded, err := manager.Get(ctx, created.Key, 0)
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+
+	zero := 0
+	prompt := (&Service{}).BuildPrompt(BuildPromptInput{
+		Session:     loaded,
+		Manager:     manager,
+		Agent:       "pi",
+		Message:     "continue",
+		AgentCtxSeq: &zero,
+	})
+	if !strings.Contains(prompt, "This session was migrated from elsewhere") {
+		t.Fatalf("prompt = %q, want switch read hint", prompt)
+	}
+	if !strings.Contains(prompt, ".mindfs/sessions/"+created.Key+".jsonl") {
+		t.Fatalf("prompt = %q, want exchange log path", prompt)
+	}
+	if !strings.HasSuffix(prompt, "continue") {
+		t.Fatalf("prompt = %q, want original message suffix", prompt)
+	}
+}
+
 func TestSendCommandMessageUsesLongShellPerSession(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("windows long-shell behavior is covered by cross-compile checks")

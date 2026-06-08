@@ -739,6 +739,18 @@ func isCanceledTurnError(err error) bool {
 		strings.Contains(value, "cancelled")
 }
 
+func isStaleAgentSessionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	value := strings.ToLower(strings.TrimSpace(err.Error()))
+	compact := strings.ReplaceAll(value, " ", "")
+	return strings.Contains(compact, "unknownsessionid") ||
+		strings.Contains(compact, "unknownsession") ||
+		strings.Contains(compact, "sessionnotfound") ||
+		(strings.Contains(compact, "invalidparams") && strings.Contains(compact, "sessionid"))
+}
+
 func contextLineCount(exchanges []session.Exchange) int {
 	return len(exchanges)
 }
@@ -1317,6 +1329,28 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 		return runtime.SendMessage(turnCtx, content)
 	}
 	sendErr := sendWithAttachedUpdates(sess, prompt)
+	if sendErr != nil && !isCanceledTurnError(sendErr) && !sawAssistantChunk && isStaleAgentSessionError(sendErr) {
+		log.Printf("[session] turn.send.stale_runtime root=%s session=%s agent=%s err=%v action=reopen_runtime_session", in.RootID, current.Key, in.Agent, sendErr)
+		agentPool.Close(agentPoolSessionKey(current.Key, in.Agent))
+		reopenedSess, reopenedAgentCtxSeq, reopenedErr := s.ensureAgentSession(turnCtx, agentPool, manager, current, in.Agent, in.Model, in.Mode, in.Effort, in.FastService, rootAbs)
+		if reopenedErr != nil {
+			log.Printf("[session] turn.send.stale_runtime_reopen.error root=%s session=%s agent=%s err=%v", in.RootID, current.Key, in.Agent, reopenedErr)
+		} else {
+			sess = reopenedSess
+			agentCtxSeq = reopenedAgentCtxSeq
+			setActiveTurnSession(in.RootID, current.Key, sess)
+			prompt = s.BuildPrompt(BuildPromptInput{
+				Session:       current,
+				Manager:       manager,
+				Agent:         in.Agent,
+				Message:       in.Content,
+				ClientContext: in.ClientCtx,
+				AgentCtxSeq:   agentCtxSeq,
+				IsInitial:     isInitial,
+			})
+			sendErr = sendWithAttachedUpdates(sess, prompt)
+		}
+	}
 	if sendErr != nil && !isCanceledTurnError(sendErr) {
 		if !sawAssistantChunk {
 			log.Printf("[session] turn.send.no_response root=%s session=%s agent=%s action=fail_without_recovery", in.RootID, current.Key, in.Agent)
@@ -1474,7 +1508,7 @@ func (s *Service) startSubagentSubscription(in subagentSessionInput, child *sess
 		ctx, cancel := context.WithCancel(in.Pool.Context())
 		registerActiveTurn(in.RootID, child.Key, cancel)
 		defer unregisterActiveTurn(in.RootID, child.Key)
-		runtime, err := in.Pool.GetOrCreate(ctx, agenttypes.OpenSessionInput{
+		openInput := agenttypes.OpenSessionInput{
 			SessionKey:     agentPoolSessionKey(child.Key, in.Agent),
 			AgentName:      in.Agent,
 			Model:          firstNonEmptyString(stringMeta(in.ToolCall.Meta, "model"), in.Model),
@@ -1484,7 +1518,14 @@ func (s *Service) startSubagentSubscription(in subagentSessionInput, child *sess
 			RootPath:       in.RootAbs,
 			AgentSessionID: receiverThreadID,
 			AgentCtxSeq:    child.AgentCtxSeq[in.Agent],
-		})
+		}
+		runtime, err := in.Pool.GetOrCreate(ctx, openInput)
+		if err != nil && isStaleAgentSessionError(err) {
+			log.Printf("[subagent] subscription.resume.error root=%s session=%s receiver=%s err=%v fallback=open_new_runtime_session", in.RootID, child.Key, receiverThreadID, err)
+			openInput.AgentSessionID = ""
+			openInput.AgentCtxSeq = 0
+			runtime, err = in.Pool.GetOrCreate(ctx, openInput)
+		}
 		if err != nil {
 			log.Printf("[subagent] subscription.open.error root=%s session=%s receiver=%s err=%v", in.RootID, child.Key, receiverThreadID, err)
 			return
@@ -1900,6 +1941,21 @@ func (s *Service) recoverAgentTurn(ctx context.Context, in SendRecoveryInput) (a
 			}
 			lastErr = err
 			log.Printf("[session/recovery] send.failed root=%s session=%s agent=%s attempt=%d/%d action=%s err=%v", in.RootID, in.SessionKey, in.AgentName, attempt, sessionRecoveryAttempts, recoveryAction, err)
+			if isStaleAgentSessionError(err) {
+				pool := s.Registry.GetAgentPool()
+				if pool == nil {
+					continue
+				}
+				pool.Close(agentPoolSessionKey(in.SessionKey, in.AgentName))
+				reopened, _, reopenErr := s.ensureAgentSession(ctx, pool, in.Manager, in.Current, in.AgentName, in.Model, in.Mode, in.Effort, in.FastService, in.RootAbs)
+				if reopenErr != nil {
+					lastErr = reopenErr
+					log.Printf("[session/recovery] reopen.failed root=%s session=%s agent=%s attempt=%d/%d err=%v", in.RootID, in.SessionKey, in.AgentName, attempt, sessionRecoveryAttempts, reopenErr)
+					continue
+				}
+				in.CurrentSession = reopened
+				log.Printf("[session/recovery] reopen.done root=%s session=%s agent=%s attempt=%d/%d", in.RootID, in.SessionKey, in.AgentName, attempt, sessionRecoveryAttempts)
+			}
 			continue
 		}
 		log.Printf("[session/recovery] send.done root=%s session=%s agent=%s attempt=%d/%d action=%s", in.RootID, in.SessionKey, in.AgentName, attempt, sessionRecoveryAttempts, recoveryAction)
@@ -2076,7 +2132,7 @@ func normalizeAgentUpdatePaths(root pathNormalizer, update agenttypes.Event) age
 	for i := range toolCall.Locations {
 		toolCall.Locations[i].Path = normalizeToolPath(root, toolCall.Locations[i].Path)
 	}
-	if session.PreserveToolCallContent(toolCall.Kind) {
+	if session.PreserveToolCallContent(toolCall.Kind) || session.PreserveACPToolCallContent(toolCall) {
 		for i := range toolCall.Content {
 			toolCall.Content[i].Path = normalizeToolPath(root, toolCall.Content[i].Path)
 			if toolCall.Content[i].Type == "text" {
