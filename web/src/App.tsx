@@ -95,6 +95,7 @@ import { AgentMenuList } from "./components/AgentMenuList";
 import { ActionBar } from "./components/ActionBar";
 import { ToastContainer } from "./components/Toast";
 import { BottomSheet } from "./components/BottomSheet";
+import { ScheduledAgentTaskDialog } from "./components/ScheduledAgentTaskDialog";
 import {
   type GitHubImportState,
   type LocalDirBrowserState,
@@ -1068,6 +1069,7 @@ export function App({ onGoHome }: AppProps) {
   const worktreeCreatePopoverRef = useRef<HTMLDivElement | null>(null);
   const worktreeSwitchPopoverRef = useRef<HTMLDivElement | null>(null);
   const [availableAgents, setAvailableAgents] = useState<AgentStatus[]>([]);
+  const [scheduledAgentDialogOpen, setScheduledAgentDialogOpen] = useState(false);
   const [selectedSession, setSelectedSession] = useState<SessionItem | null>(
     null,
   );
@@ -8143,6 +8145,7 @@ export function App({ onGoHome }: AppProps) {
         onCreateWorktree={handleOpenWorktreeLocation}
         onSwitchWorktree={handleSwitchWorktreeStart}
         onRemoveWorktree={handleRemoveCurrentWorktree}
+        onOpenScheduledAgentTasks={() => setScheduledAgentDialogOpen(true)}
         menuOverlay={
           projectAddMode === "worktree_location"
             ? projectAddOverlay
@@ -8821,6 +8824,12 @@ export function App({ onGoHome }: AppProps) {
           </div>
         </div>
       ) : null}
+      <ScheduledAgentTaskDialog
+        open={scheduledAgentDialogOpen}
+        rootId={currentRootId}
+        agents={availableAgents}
+        onClose={() => setScheduledAgentDialogOpen(false)}
+      />
       <ToastContainer />
     </>
   );

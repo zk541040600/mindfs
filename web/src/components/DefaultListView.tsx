@@ -52,6 +52,7 @@ type DefaultListViewProps = {
   onCreateWorktree?: () => void;
   onSwitchWorktree?: () => void;
   onRemoveWorktree?: () => void;
+  onOpenScheduledAgentTasks?: () => void;
   menuOverlay?: React.ReactNode;
 };
 
@@ -343,6 +344,7 @@ export function DefaultListView({
   onCreateWorktree,
   onSwitchWorktree,
   onRemoveWorktree,
+  onOpenScheduledAgentTasks,
   menuOverlay = null,
 }: DefaultListViewProps) {
   const inputRef = React.useRef<HTMLInputElement>(null);
@@ -705,6 +707,33 @@ export function DefaultListView({
                     {isGitRepo || isGitWorktree ? (
                       <div style={{ height: "1px", background: "var(--border-color)", margin: "6px 4px" }} />
                     ) : null}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        onOpenScheduledAgentTasks?.();
+                        setIsMenuOpen(false);
+                      }}
+                      style={{
+                        width: "100%",
+                        border: "none",
+                        background: "transparent",
+                        color: "var(--text-primary)",
+                        borderRadius: "8px",
+                        padding: "8px 10px",
+                        display: "flex",
+                        alignItems: "center",
+                        gap: "8px",
+                        textAlign: "left",
+                        cursor: "pointer",
+                        fontSize: "12px",
+                      }}
+                    >
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                        <circle cx="12" cy="12" r="9" />
+                        <path d="M12 7v5l3 2" />
+                      </svg>
+                      <span>定时 Agent</span>
+                    </button>
                     <button
                       type="button"
                       onClick={() => {

@@ -17,6 +17,7 @@ import (
 	"mindfs/server/internal/githubimport"
 	"mindfs/server/internal/preferences"
 	"mindfs/server/internal/relay"
+	"mindfs/server/internal/scheduled"
 	"mindfs/server/internal/tlsutil"
 	"mindfs/server/internal/update"
 )
@@ -104,6 +105,8 @@ func Start(ctx context.Context, addr string, opts StartOptions) error {
 			PairingSecret: opts.E2EEConfig.PairingSecret,
 		}),
 	}
+	services.Scheduled = scheduled.NewService(services, services)
+	services.Scheduled.Start(ctx)
 	githubImportSvc, err := githubimport.NewService(services)
 	if err != nil {
 		return err
