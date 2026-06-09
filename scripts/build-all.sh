@@ -68,15 +68,16 @@ done
 
 # Produce archives
 cd "${ROOT}/${DIST_DIR}"
+export COPYFILE_DISABLE=1
 for DIR in "${built_dirs[@]}"; do
   GOOS="$(echo "$DIR" | cut -d_ -f3)"
   if [[ "$GOOS" == "windows" ]]; then
     rm -f "${DIR}.zip"
-    zip -qr "${DIR}.zip" "$DIR"
+    zip -Xqr "${DIR}.zip" "$DIR"
     echo "  Archived: ${DIST_DIR}/${DIR}.zip"
   else
     rm -f "${DIR}.tar.gz"
-    tar czf "${DIR}.tar.gz" "$DIR"
+    tar --no-xattrs -czf "${DIR}.tar.gz" "$DIR"
     echo "  Archived: ${DIST_DIR}/${DIR}.tar.gz"
   fi
 done
