@@ -20,6 +20,12 @@ type BridgeClient interface {
 	ListSessions(ctx context.Context, cwd string, limit int) (pisdkbridge.ListSessionsData, error)
 }
 
+// BridgeCacher is an optional interface that BridgeClient implementations may
+// satisfy to expose SDK bridge cache/status metadata.
+type BridgeCacher interface {
+	BridgeStatus() pisdkbridge.BridgeStatus
+}
+
 type Importer struct {
 	agentName string
 	bridge    BridgeClient
@@ -28,9 +34,21 @@ type Importer struct {
 func NewImporter(opts ImporterOptions) *Importer {
 	bridge := opts.Bridge
 	if bridge == nil {
-		bridge = pisdkbridge.NewClient(pisdkbridge.ClientOptions{})
+		bridge = pisdkbridge.NewCachedClient(
+			pisdkbridge.NewClient(pisdkbridge.ClientOptions{}),
+			0, // uses default 60s TTL
+		)
 	}
 	return &Importer{agentName: strings.TrimSpace(opts.AgentName), bridge: bridge}
+}
+
+// BridgeStatus returns the current SDK bridge cache status if the underlying
+// bridge client supports it. Returns false otherwise.
+func (i *Importer) BridgeStatus() (pisdkbridge.BridgeStatus, bool) {
+	if cacher, ok := i.bridge.(BridgeCacher); ok {
+		return cacher.BridgeStatus(), true
+	}
+	return pisdkbridge.BridgeStatus{}, false
 }
 
 func (i *Importer) AgentName() string {

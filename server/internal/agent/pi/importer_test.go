@@ -3,6 +3,7 @@ package pi
 import (
 	"context"
 	"errors"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -65,5 +66,47 @@ func TestImporterListExternalSessionsFailsClosedAndImportUnsupported(t *testing.
 	}
 	if imported.Agent != "pi" || imported.AgentSessionID != "sid-1" || len(imported.Exchanges) != 0 {
 		t.Fatalf("unexpected delta import: %+v", imported)
+	}
+}
+
+func TestImporterBridgeStatusWithCacher(t *testing.T) {
+	importer := NewImporter(ImporterOptions{AgentName: "pi", Bridge: fakeBridgeClient{}})
+	// fakeBridgeClient doesn't implement BridgeCacher
+	_, ok := importer.BridgeStatus()
+	if ok {
+		t.Fatal("fakeBridgeClient should not implement BridgeCacher")
+	}
+}
+
+func TestImporterBridgeStatusWithCachedClient(t *testing.T) {
+	dir := t.TempDir()
+	probe := dir + "/probe.mjs"
+	node := dir + "/fake-node"
+	os.WriteFile(probe, []byte("// fake\n"), 0o644)
+	os.WriteFile(node, []byte(`#!/bin/sh
+cat <<'JSON'
+{"type":"response","command":"list-sessions","success":true,"data":{"count":0,"returned":0,"sessions":[]}}
+JSON
+`), 0o755)
+
+	client := pisdkbridge.NewClient(pisdkbridge.ClientOptions{NodeCommand: node, ProbePath: probe, Timeout: time.Second})
+	cached := pisdkbridge.NewCachedClient(client, 30*time.Second)
+	importer := NewImporter(ImporterOptions{AgentName: "pi", Bridge: cached})
+
+	status, ok := importer.BridgeStatus()
+	if !ok {
+		t.Fatal("CachedClient should implement BridgeCacher")
+	}
+	if status.TTL != 30*time.Second {
+		t.Fatalf("unexpected TTL: %v", status.TTL)
+	}
+}
+
+func TestNewImporterDefaultUsesCachedClient(t *testing.T) {
+	importer := NewImporter(ImporterOptions{AgentName: "pi"})
+	// The default bridge should be a CachedClient (implements BridgeCacher)
+	_, ok := importer.BridgeStatus()
+	if !ok {
+		t.Fatal("default importer bridge should implement BridgeCacher (CachedClient)")
 	}
 }

@@ -283,6 +283,7 @@ func (h *HTTPHandler) Routes() http.Handler {
 
 	// Agent status API
 	r.Get("/api/agents", h.protectedEndpoint(h.handleAgentsList))
+	r.Get("/api/agents/{agentName}/sdk-status", h.protectedEndpoint(h.handleAgentSDKStatus))
 	r.Get("/api/agent-config/defaults", h.protectedEndpoint(h.handleAgentConfigDefaults))
 	r.Get("/api/agent-config/backups", h.protectedEndpoint(h.handleAgentConfigBackupsList))
 	r.Post("/api/agent-config/backups", h.protectedEndpoint(h.handleAgentConfigBackupCreate))
@@ -868,6 +869,21 @@ func (h *HTTPHandler) handleAgentsList(w http.ResponseWriter, r *http.Request) {
 		"agents": statuses,
 		"shells": shells,
 	})
+}
+
+func (h *HTTPHandler) handleAgentSDKStatus(w http.ResponseWriter, r *http.Request) {
+	agentName := strings.TrimSpace(chi.URLParam(r, "agentName"))
+	if agentName == "" {
+		respondError(w, http.StatusBadRequest, errInvalidRequest("agent name required"))
+		return
+	}
+	uc := h.service()
+	out, err := uc.AgentSDKStatus(usecase.AgentSDKStatusInput{AgentName: agentName})
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err)
+		return
+	}
+	respondJSON(w, http.StatusOK, out)
 }
 
 func (h *HTTPHandler) handleAppUpdateGet(w http.ResponseWriter, r *http.Request) {
