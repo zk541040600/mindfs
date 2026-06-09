@@ -1006,6 +1006,7 @@ class SessionService {
           root_id: rootId,
           agent,
           agent_session_id: agentSessionId,
+          mode: agent === "pi" ? "safe_transcript" : undefined,
         }),
       });
     } catch (err) {
@@ -1037,6 +1038,7 @@ class SessionService {
           root_id: rootId,
           agent,
           agent_session_ids: agentSessionIds,
+          mode: agent === "pi" ? "safe_transcript" : undefined,
         }),
       });
     } catch (err) {

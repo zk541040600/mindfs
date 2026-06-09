@@ -24,6 +24,12 @@ type BridgeRefresher interface {
 	RefreshSessions(ctx context.Context, cwd string, limit int) (pisdkbridge.ListSessionsData, error)
 }
 
+type BridgeImporter interface {
+	ImportSession(ctx context.Context, opts pisdkbridge.ImportSessionOptions) (pisdkbridge.ImportSessionData, error)
+}
+
+const safeTranscriptMode = "safe_transcript"
+
 // BridgeCacher is an optional interface that BridgeClient implementations may
 // satisfy to expose SDK bridge cache/status metadata.
 type BridgeCacher interface {
@@ -138,18 +144,56 @@ func (i *Importer) ScanExternalSessions(ctx context.Context, in agenttypes.ListE
 	return nil
 }
 
-func (i *Importer) ImportExternalSession(_ context.Context, in agenttypes.ImportExternalSessionInput) (agenttypes.ImportedExternalSession, error) {
+func (i *Importer) ImportExternalSession(ctx context.Context, in agenttypes.ImportExternalSessionInput) (agenttypes.ImportedExternalSession, error) {
 	agentName := strings.TrimSpace(in.Agent)
 	if agentName == "" {
 		agentName = i.AgentName()
 	}
 	sessionID := strings.TrimSpace(in.AgentSessionID)
 	if !in.AfterTimestamp.IsZero() {
-		// Delta sync remains non-fatal. The SDK bridge currently exposes metadata
-		// only; it deliberately does not import raw transcripts.
+		// Delta sync remains non-fatal. Full transcript import is only available
+		// through explicit safe_transcript mode, not background sync.
 		return agenttypes.ImportedExternalSession{Agent: agentName, AgentSessionID: sessionID}, nil
 	}
-	return agenttypes.ImportedExternalSession{}, errors.New("pi external session transcript import is not supported")
+	if strings.TrimSpace(in.Mode) != safeTranscriptMode {
+		return agenttypes.ImportedExternalSession{}, errors.New("pi external session transcript import requires mode=safe_transcript")
+	}
+	if strings.TrimSpace(in.RootPath) == "" || sessionID == "" {
+		return agenttypes.ImportedExternalSession{}, errors.New("root path and session id are required")
+	}
+	importer, ok := i.bridge.(BridgeImporter)
+	if !ok {
+		return agenttypes.ImportedExternalSession{}, errors.New("pi sdk bridge transcript import is not available")
+	}
+	data, err := importer.ImportSession(ctx, pisdkbridge.ImportSessionOptions{
+		Cwd:         in.RootPath,
+		SessionID:   sessionID,
+		MaxMessages: 200,
+		MaxBytes:    256 * 1024,
+	})
+	if err != nil {
+		return agenttypes.ImportedExternalSession{}, err
+	}
+	exchanges := make([]agenttypes.ImportedExchange, 0, len(data.Exchanges))
+	for _, exchange := range data.Exchanges {
+		role := strings.TrimSpace(exchange.Role)
+		if role != "user" && role != "agent" {
+			continue
+		}
+		content := strings.TrimSpace(exchange.Content)
+		if content == "" {
+			continue
+		}
+		exchanges = append(exchanges, agenttypes.ImportedExchange{
+			Role:      role,
+			Content:   content,
+			Timestamp: parseSDKBridgeTime(exchange.Timestamp),
+		})
+	}
+	if len(exchanges) == 0 {
+		return agenttypes.ImportedExternalSession{}, errors.New("pi sdk bridge returned no safe transcript content")
+	}
+	return agenttypes.ImportedExternalSession{Agent: agentName, AgentSessionID: sessionID, Exchanges: exchanges}, nil
 }
 
 func parseSDKBridgeTime(value string) time.Time {

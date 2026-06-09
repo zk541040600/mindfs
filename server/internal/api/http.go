@@ -487,6 +487,7 @@ func (h *HTTPHandler) handleExternalSessionImport(w http.ResponseWriter, r *http
 		RootID         string `json:"root_id"`
 		Agent          string `json:"agent"`
 		AgentSessionID string `json:"agent_session_id"`
+		Mode           string `json:"mode"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		respondError(w, http.StatusBadRequest, errInvalidRequest("invalid json body"))
@@ -504,6 +505,7 @@ func (h *HTTPHandler) handleExternalSessionImport(w http.ResponseWriter, r *http
 		RootID:         req.RootID,
 		Agent:          req.Agent,
 		AgentSessionID: req.AgentSessionID,
+		Mode:           strings.TrimSpace(req.Mode),
 	})
 	if err != nil {
 		respondError(w, http.StatusBadRequest, err)
@@ -529,6 +531,7 @@ func (h *HTTPHandler) handleExternalSessionImportBatch(w http.ResponseWriter, r 
 		RootID          string   `json:"root_id"`
 		Agent           string   `json:"agent"`
 		AgentSessionIDs []string `json:"agent_session_ids"`
+		Mode            string   `json:"mode"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		respondError(w, http.StatusBadRequest, errInvalidRequest("invalid json body"))
@@ -545,6 +548,7 @@ func (h *HTTPHandler) handleExternalSessionImportBatch(w http.ResponseWriter, r 
 		RootID:          req.RootID,
 		Agent:           req.Agent,
 		AgentSessionIDs: req.AgentSessionIDs,
+		Mode:            strings.TrimSpace(req.Mode),
 	})
 	if err != nil {
 		respondError(w, http.StatusBadRequest, err)

@@ -31,6 +31,7 @@ type ImportExternalSessionInput struct {
 	RootID         string
 	Agent          string
 	AgentSessionID string
+	Mode           string
 }
 
 type ImportExternalSessionOutput struct {
@@ -44,6 +45,7 @@ type ImportExternalSessionsBatchInput struct {
 	RootID          string
 	Agent           string
 	AgentSessionIDs []string
+	Mode            string
 }
 
 type ImportExternalSessionsBatchItem struct {
@@ -177,6 +179,7 @@ func (s *Service) ImportExternalSession(ctx context.Context, in ImportExternalSe
 		RootPath:       root.RootPath,
 		Agent:          in.Agent,
 		AgentSessionID: in.AgentSessionID,
+		Mode:           in.Mode,
 	})
 	if err != nil {
 		return ImportExternalSessionOutput{}, err
@@ -240,6 +243,7 @@ func (s *Service) ImportExternalSessionsBatch(ctx context.Context, in ImportExte
 			RootID:         in.RootID,
 			Agent:          in.Agent,
 			AgentSessionID: id,
+			Mode:           in.Mode,
 		})
 		item := ImportExternalSessionsBatchItem{AgentSessionID: id}
 		if err != nil {

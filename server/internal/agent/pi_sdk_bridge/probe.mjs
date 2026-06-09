@@ -27,6 +27,8 @@ const DEFAULT_CWD = "/root/mindfs";
 const DEFAULT_AGENT_DIR = "/root/.pi/agent";
 const MAX_RESOURCE_ITEMS = 50;
 const MAX_SESSION_ITEMS = 50;
+const DEFAULT_IMPORT_MAX_MESSAGES = 200;
+const DEFAULT_IMPORT_MAX_BYTES = 256 * 1024;
 
 for (const method of ["log", "info", "warn", "error", "debug"]) {
   console[method] = (...args) => process.stderr.write(`${args.map(String).join(" ")}\n`);
@@ -54,6 +56,9 @@ async function main() {
         break;
       case "list-sessions":
         data = await listSessionsProbe(options);
+        break;
+      case "import-session":
+        data = await importSessionProbe(options);
         break;
       case "session-smoke":
         data = await sessionSmokeProbe(options);
@@ -103,6 +108,18 @@ function parseArgs(argv) {
       options.limit = Number(readValue(argv, ++i, arg));
       if (!Number.isInteger(options.limit) || options.limit <= 0) {
         throw new ProbeError("E_PARAM", "--limit must be a positive integer");
+      }
+    } else if (arg === "--session-id") {
+      options.sessionId = readValue(argv, ++i, arg);
+    } else if (arg === "--max-messages") {
+      options.maxMessages = Number(readValue(argv, ++i, arg));
+      if (!Number.isInteger(options.maxMessages) || options.maxMessages <= 0) {
+        throw new ProbeError("E_PARAM", "--max-messages must be a positive integer");
+      }
+    } else if (arg === "--max-bytes") {
+      options.maxBytes = Number(readValue(argv, ++i, arg));
+      if (!Number.isInteger(options.maxBytes) || options.maxBytes <= 0) {
+        throw new ProbeError("E_PARAM", "--max-bytes must be a positive integer");
       }
     } else {
       throw new ProbeError("E_PARAM", `unknown argument: ${arg}`);
@@ -168,6 +185,7 @@ function buildHelp() {
     commands: [
       "capabilities --cwd /root/mindfs --agent-dir /root/.pi/agent --json",
       "list-sessions --cwd /root/mindfs --agent-dir /root/.pi/agent --json",
+      "import-session --cwd /root/mindfs --session-id <id> --json",
       "session-smoke --cwd /root/mindfs --json",
       "extension-ui-smoke --json",
       "runtime-replacement-smoke --cwd /root/mindfs --json",
@@ -379,6 +397,171 @@ async function listSessionsProbe(options) {
   const sessions = await SessionManager.list(options.cwd, sessionDir);
   const summary = await summarizeSessions(sessions, options.limit ?? MAX_SESSION_ITEMS);
   return { ...summary, sessionDir };
+}
+
+async function importSessionProbe(options) {
+  const sessionId = String(options.sessionId || "").trim();
+  if (!sessionId) {
+    throw new ProbeError("E_PARAM", "--session-id is required");
+  }
+  const sessionDir = options.sessionDir ?? defaultSessionDirPath(options.cwd, options.agentDir);
+  const sessions = await SessionManager.list(options.cwd, sessionDir);
+  const info = sessions.find((entry) => entry.id === sessionId || entry.path === sessionId);
+  if (!info) {
+    throw new ProbeError("E_NOT_FOUND", `session not found: ${sessionId}`);
+  }
+  const manager = SessionManager.open(info.path);
+  const entries = manager.getBranch?.() ?? manager.getEntries();
+  return buildSafeTranscriptImport({
+    sessionId: info.id,
+    title: safeTitle(info.name || ""),
+    entries,
+    maxMessages: options.maxMessages ?? DEFAULT_IMPORT_MAX_MESSAGES,
+    maxBytes: options.maxBytes ?? DEFAULT_IMPORT_MAX_BYTES,
+  });
+}
+
+function buildSafeTranscriptImport({ sessionId, title, entries, maxMessages, maxBytes }) {
+  const exchanges = [];
+  const warnings = new Set();
+  let messageCount = 0;
+  let skippedCount = 0;
+  let redactedCount = 0;
+  let totalBytes = 0;
+  let truncated = false;
+
+  for (const entry of entries || []) {
+    if (exchanges.length >= maxMessages) {
+      truncated = true;
+      warnings.add("max_messages_reached");
+      break;
+    }
+    if (entry?.type !== "message") {
+      if (entry?.type) {
+        warnings.add(`${entry.type}_skipped`);
+      }
+      skippedCount++;
+      continue;
+    }
+    messageCount++;
+    const sourceRole = entry.message?.role;
+    const role = sourceRole === "user" ? "user" : sourceRole === "assistant" ? "agent" : "";
+    if (!role) {
+      skippedCount++;
+      warnings.add("unsupported_role_skipped");
+      continue;
+    }
+    const extracted = extractSafeMessageText(entry.message, warnings);
+    if (!extracted.text) {
+      skippedCount++;
+      warnings.add("empty_text_skipped");
+      continue;
+    }
+    const sanitized = sanitizeTranscriptText(extracted.text);
+    if (sanitized.binaryLike) {
+      skippedCount++;
+      warnings.add("binary_content_skipped");
+      continue;
+    }
+    if (!sanitized.text) {
+      skippedCount++;
+      warnings.add("empty_text_skipped");
+      continue;
+    }
+    redactedCount += sanitized.redactions;
+    const bytes = Buffer.byteLength(sanitized.text, "utf8");
+    if (totalBytes + bytes > maxBytes) {
+      truncated = true;
+      warnings.add("max_bytes_reached");
+      break;
+    }
+    totalBytes += bytes;
+    exchanges.push({
+      role,
+      content: sanitized.text,
+      timestamp: normalizeTimestamp(entry.timestamp),
+    });
+  }
+
+  if (!exchanges.length) {
+    throw new ProbeError("E_NO_SAFE_CONTENT", "session contains no safe transcript text");
+  }
+
+  return {
+    sessionId,
+    title,
+    messageCount,
+    importedCount: exchanges.length,
+    skippedCount,
+    redactedCount,
+    truncated,
+    totalBytes,
+    exchanges,
+    warnings: [...warnings].sort(),
+  };
+}
+
+function extractSafeMessageText(message, warnings) {
+  const content = message?.content;
+  if (typeof content === "string") {
+    return { text: content };
+  }
+  if (!Array.isArray(content)) {
+    return { text: "" };
+  }
+  const textParts = [];
+  for (const part of content) {
+    if (part?.type === "text" && typeof part.text === "string") {
+      textParts.push(part.text);
+    } else {
+      warnings.add("non_text_part_skipped");
+    }
+  }
+  return { text: textParts.join("\n") };
+}
+
+function sanitizeTranscriptText(text) {
+  let value = String(text || "").replace(/\u0000/g, "").replace(/\r\n/g, "\n").trim();
+  if (!value) {
+    return { text: "", redactions: 0, binaryLike: false };
+  }
+  const controlCount = [...value].filter((ch) => {
+    const code = ch.charCodeAt(0);
+    return code < 32 && ch !== "\n" && ch !== "\t";
+  }).length;
+  if (controlCount > Math.max(8, value.length * 0.05)) {
+    return { text: "", redactions: 0, binaryLike: true };
+  }
+
+  let redactions = 0;
+  const replace = (pattern, replacement) => {
+    value = value.replace(pattern, (...args) => {
+      redactions++;
+      return typeof replacement === "function" ? replacement(...args) : replacement;
+    });
+  };
+
+  replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, "[REDACTED:private-key]");
+  replace(/\bAuthorization\s*:\s*Bearer\s+[A-Za-z0-9._~+\/-]+=*/gi, "Authorization: Bearer [REDACTED:token]");
+  replace(/\b(api[_-]?key|token|secret|password|passwd|pwd)\b\s*[:=]\s*["']?[^"'\s]{8,}["']?/gi, (match, key) => `${key}=[REDACTED:secret]`);
+  replace(/\b[A-Za-z0-9_\-]{32,}\.[A-Za-z0-9_\-]{16,}\.[A-Za-z0-9_\-]{16,}\b/g, "[REDACTED:jwt]");
+  replace(/\b[A-Za-z0-9+\/_-]{48,}={0,2}\b/g, "[REDACTED:token]");
+
+  return { text: value.trim(), redactions, binaryLike: false };
+}
+
+function normalizeTimestamp(timestamp) {
+  if (timestamp instanceof Date) {
+    return timestamp.toISOString();
+  }
+  if (typeof timestamp === "number" && Number.isFinite(timestamp)) {
+    return new Date(timestamp).toISOString();
+  }
+  if (typeof timestamp === "string" && timestamp.trim()) {
+    const parsed = new Date(timestamp);
+    return Number.isNaN(parsed.getTime()) ? undefined : parsed.toISOString();
+  }
+  return undefined;
 }
 
 async function summarizeSessions(sessions, limit) {

@@ -37,6 +37,27 @@ JSON
 	}
 }
 
+func TestClientImportSessionDecodesSafeTranscript(t *testing.T) {
+	dir := t.TempDir()
+	probe := filepath.Join(dir, "probe.mjs")
+	writeFile(t, probe, "// fake probe\n", 0o644)
+	node := filepath.Join(dir, "fake-node")
+	writeFile(t, node, `#!/bin/sh
+cat <<'JSON'
+{"type":"response","command":"import-session","success":true,"data":{"sessionId":"sid-1","title":"safe title","messageCount":2,"importedCount":2,"skippedCount":1,"redactedCount":1,"truncated":false,"totalBytes":11,"exchanges":[{"role":"user","content":"hello","timestamp":"2026-06-09T01:02:03Z"},{"role":"agent","content":"world","timestamp":"2026-06-09T01:02:04Z"}],"warnings":["tool_result_skipped"]}}
+JSON
+`, 0o755)
+
+	client := NewClient(ClientOptions{NodeCommand: node, ProbePath: probe, Timeout: time.Second})
+	got, err := client.ImportSession(context.Background(), ImportSessionOptions{Cwd: "/root/mindfs", SessionID: "sid-1", MaxMessages: 10, MaxBytes: 1024})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.SessionID != "sid-1" || got.ImportedCount != 2 || got.RedactedCount != 1 || len(got.Exchanges) != 2 || got.Exchanges[0].Content != "hello" {
+		t.Fatalf("unexpected import data: %+v", got)
+	}
+}
+
 func TestClientFailsClosedOnBridgeErrorInvalidJSONAndTimeout(t *testing.T) {
 	dir := t.TempDir()
 	probe := filepath.Join(dir, "probe.mjs")

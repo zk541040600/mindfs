@@ -69,6 +69,32 @@ type ListSessionsData struct {
 	Sessions   []SessionSummary `json:"sessions"`
 }
 
+type ImportSessionOptions struct {
+	Cwd         string
+	SessionID   string
+	MaxMessages int
+	MaxBytes    int
+}
+
+type ImportSessionData struct {
+	SessionID     string           `json:"sessionId"`
+	Title         string           `json:"title"`
+	MessageCount  int              `json:"messageCount"`
+	ImportedCount int              `json:"importedCount"`
+	SkippedCount  int              `json:"skippedCount"`
+	RedactedCount int              `json:"redactedCount"`
+	Truncated     bool             `json:"truncated"`
+	TotalBytes    int              `json:"totalBytes"`
+	Exchanges     []ImportExchange `json:"exchanges"`
+	Warnings      []string         `json:"warnings"`
+}
+
+type ImportExchange struct {
+	Role      string `json:"role"`
+	Content   string `json:"content"`
+	Timestamp string `json:"timestamp"`
+}
+
 type SessionSummary struct {
 	Path                  string         `json:"path"`
 	ID                    string         `json:"id"`
@@ -116,6 +142,21 @@ func (c *Client) ListSessions(ctx context.Context, cwd string, limit int) (ListS
 	var data ListSessionsData
 	if err := c.run(ctx, "list-sessions", args, &data); err != nil {
 		return ListSessionsData{}, err
+	}
+	return data, nil
+}
+
+func (c *Client) ImportSession(ctx context.Context, opts ImportSessionOptions) (ImportSessionData, error) {
+	args := []string{"--cwd", opts.Cwd, "--agent-dir", c.agentDir, "--session-id", opts.SessionID, "--json"}
+	if opts.MaxMessages > 0 {
+		args = append(args, "--max-messages", fmt.Sprintf("%d", opts.MaxMessages))
+	}
+	if opts.MaxBytes > 0 {
+		args = append(args, "--max-bytes", fmt.Sprintf("%d", opts.MaxBytes))
+	}
+	var data ImportSessionData
+	if err := c.run(ctx, "import-session", args, &data); err != nil {
+		return ImportSessionData{}, err
 	}
 	return data, nil
 }

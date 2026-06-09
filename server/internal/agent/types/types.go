@@ -114,6 +114,7 @@ type ImportExternalSessionInput struct {
 	Agent          string
 	AgentSessionID string
 	AfterTimestamp time.Time
+	Mode           string
 }
 
 type ImportedExchange struct {

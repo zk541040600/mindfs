@@ -60,6 +60,12 @@ func (cc *CachedClient) RefreshSessions(ctx context.Context, cwd string, limit i
 	return ListSessionsData{}, nil
 }
 
+// ImportSession delegates explicit transcript import to the underlying client.
+// Import content is never cached.
+func (cc *CachedClient) ImportSession(ctx context.Context, opts ImportSessionOptions) (ImportSessionData, error) {
+	return cc.client.ImportSession(ctx, opts)
+}
+
 // Cache returns the underlying SessionCache for status inspection.
 func (cc *CachedClient) Cache() *SessionCache {
 	return cc.cache

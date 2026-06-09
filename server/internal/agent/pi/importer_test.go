@@ -28,6 +28,16 @@ type fakeRefreshBridge struct {
 	refreshData  pisdkbridge.ListSessionsData
 }
 
+type fakeImportBridge struct {
+	fakeBridgeClient
+	importData pisdkbridge.ImportSessionData
+	importErr  error
+}
+
+func (f fakeImportBridge) ImportSession(context.Context, pisdkbridge.ImportSessionOptions) (pisdkbridge.ImportSessionData, error) {
+	return f.importData, f.importErr
+}
+
 func (f *fakeRefreshBridge) ListSessions(context.Context, string, int) (pisdkbridge.ListSessionsData, error) {
 	f.listCalls++
 	return f.listData, nil
@@ -92,8 +102,8 @@ func TestImporterListExternalSessionsFailsClosedAndImportUnsupported(t *testing.
 	}
 
 	_, err = importer.ImportExternalSession(context.Background(), agenttypes.ImportExternalSessionInput{RootPath: "/root/mindfs", Agent: "pi", AgentSessionID: "sid-1"})
-	if err == nil || !strings.Contains(err.Error(), "not supported") {
-		t.Fatalf("expected unsupported import error, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "mode=safe_transcript") {
+		t.Fatalf("expected explicit mode error, got %v", err)
 	}
 	imported, err := importer.ImportExternalSession(context.Background(), agenttypes.ImportExternalSessionInput{RootPath: "/root/mindfs", Agent: "pi", AgentSessionID: "sid-1", AfterTimestamp: time.Now()})
 	if err != nil {
@@ -101,6 +111,34 @@ func TestImporterListExternalSessionsFailsClosedAndImportUnsupported(t *testing.
 	}
 	if imported.Agent != "pi" || imported.AgentSessionID != "sid-1" || len(imported.Exchanges) != 0 {
 		t.Fatalf("unexpected delta import: %+v", imported)
+	}
+}
+
+func TestImporterSafeTranscriptImport(t *testing.T) {
+	bridge := fakeImportBridge{importData: pisdkbridge.ImportSessionData{Exchanges: []pisdkbridge.ImportExchange{
+		{Role: "user", Content: "hello", Timestamp: "2026-06-09T04:05:06Z"},
+		{Role: "agent", Content: "world", Timestamp: "2026-06-09T04:05:07Z"},
+		{Role: "tool", Content: "ignored"},
+	}}}
+	importer := NewImporter(ImporterOptions{AgentName: "pi", Bridge: bridge})
+	imported, err := importer.ImportExternalSession(context.Background(), agenttypes.ImportExternalSessionInput{RootPath: "/root/mindfs", Agent: "pi", AgentSessionID: "sid-1", Mode: safeTranscriptMode})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if imported.Agent != "pi" || imported.AgentSessionID != "sid-1" || len(imported.Exchanges) != 2 {
+		t.Fatalf("unexpected import result: %+v", imported)
+	}
+	if imported.Exchanges[0].Role != "user" || imported.Exchanges[0].Content != "hello" || imported.Exchanges[0].Timestamp.Format(time.RFC3339) != "2026-06-09T04:05:06Z" {
+		t.Fatalf("unexpected first exchange: %+v", imported.Exchanges[0])
+	}
+}
+
+func TestImporterSafeTranscriptImportRejectsNoSafeContent(t *testing.T) {
+	bridge := fakeImportBridge{importData: pisdkbridge.ImportSessionData{Exchanges: []pisdkbridge.ImportExchange{{Role: "tool", Content: "ignored"}}}}
+	importer := NewImporter(ImporterOptions{AgentName: "pi", Bridge: bridge})
+	_, err := importer.ImportExternalSession(context.Background(), agenttypes.ImportExternalSessionInput{RootPath: "/root/mindfs", Agent: "pi", AgentSessionID: "sid-1", Mode: safeTranscriptMode})
+	if err == nil || !strings.Contains(err.Error(), "no safe transcript") {
+		t.Fatalf("expected no safe transcript error, got %v", err)
 	}
 }
 
