@@ -16,6 +16,8 @@ import {
   type SyncSessionResult,
   type RelatedFile,
   type Session,
+  type ExtensionUIRequest,
+  type ExtensionUIResponse,
 } from "./services/session";
 import { buildClientContext } from "./services/context";
 import { e2eeService, type E2EEState } from "./services/e2ee";
@@ -964,6 +966,42 @@ type AppProps = {
 
 const MOBILE_ENTER_KEY_SEND_STORAGE_KEY = "mindfs-mobile-enter-key-sends";
 
+type PendingExtensionUIRequest = ExtensionUIRequest & {
+  rootId: string;
+  sessionKey: string;
+  agent?: string;
+};
+
+type ExtensionUIChromeState = {
+  statuses: Record<string, string>;
+  widgets: Record<string, { lines: string[]; placement?: string }>;
+  title: string;
+};
+
+function extensionUIPayloadString(payload: Record<string, unknown> | undefined, key: string): string {
+  const value = payload?.[key];
+  return typeof value === "string" ? value : "";
+}
+
+function extensionUIPayloadStringArray(payload: Record<string, unknown> | undefined, key: string): string[] {
+  const value = payload?.[key];
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is string => typeof item === "string");
+}
+
+function isExtensionUIDialogMethod(method: string): boolean {
+  return ["select", "confirm", "input", "editor"].includes(method);
+}
+
+function extensionUITitle(request: PendingExtensionUIRequest): string {
+  const payload = request.payload || {};
+  return (
+    extensionUIPayloadString(payload, "title") ||
+    extensionUIPayloadString(payload, "message") ||
+    `Pi extension UI: ${request.method}`
+  );
+}
+
 function loadMobileEnterKeySends(): boolean {
   if (typeof window === "undefined") {
     return false;
@@ -1154,6 +1192,24 @@ export function App({ onGoHome }: AppProps) {
     id: number;
     content: string;
   } | null>(null);
+  const [pendingExtensionUI, setPendingExtensionUI] =
+    useState<PendingExtensionUIRequest | null>(null);
+  const [extensionUIChrome, setExtensionUIChrome] = useState<ExtensionUIChromeState>({
+    statuses: {},
+    widgets: {},
+    title: "",
+  });
+  const [extensionUIInputValue, setExtensionUIInputValue] = useState("");
+  const [extensionUISubmitting, setExtensionUISubmitting] = useState(false);
+  useEffect(() => {
+    const payload = pendingExtensionUI?.payload || {};
+    setExtensionUIInputValue(
+      extensionUIPayloadString(payload, "prefill") ||
+      extensionUIPayloadString(payload, "value") ||
+      "",
+    );
+    setExtensionUISubmitting(false);
+  }, [pendingExtensionUI?.id]);
   const [entriesByPath, setEntriesByPath] = useState<
     Record<string, FileEntry[]>
   >({});
@@ -3991,6 +4047,40 @@ export function App({ onGoHome }: AppProps) {
     [rootSessionKey],
   );
 
+  const submitExtensionUIResponse = useCallback(
+    async (request: PendingExtensionUIRequest, response: ExtensionUIResponse) => {
+      if (!request.rootId || !request.sessionKey || !request.id) return;
+      setExtensionUISubmitting(true);
+      const sent = await sessionService.answerExtensionUI(
+        request.rootId,
+        request.sessionKey,
+        request.agent,
+        request.id,
+        request.method,
+        response,
+      );
+      setExtensionUISubmitting(false);
+      if (!sent) {
+        reportError("network.disconnected", "扩展 UI 响应发送失败：连接未就绪，请稍后重试", {
+          details: {
+            rootId: request.rootId,
+            sessionKey: request.sessionKey,
+            requestId: request.id,
+            method: request.method,
+          },
+        });
+        return;
+      }
+      setPendingExtensionUI((current) => (current?.id === request.id ? null : current));
+    },
+    [],
+  );
+
+  const cancelExtensionUI = useCallback(() => {
+    if (!pendingExtensionUI) return;
+    void submitExtensionUIResponse(pendingExtensionUI, { cancelled: true });
+  }, [pendingExtensionUI, submitExtensionUIResponse]);
+
   const handleNewSession = useCallback(() => {
     const rootID = currentRootIdRef.current;
     const previousBoundKey = rootID ? boundSessionByRootRef.current[rootID] : "";
@@ -6082,6 +6172,71 @@ export function App({ onGoHome }: AppProps) {
           );
           updateDrawerIfShowingStream();
           break;
+        case "extension_ui": {
+          const request = (event.data || {}) as ExtensionUIRequest;
+          const method = `${request.method || ""}`;
+          const payloadData = request.payload || {};
+          if (!request.id || !method) {
+            break;
+          }
+          if (isExtensionUIDialogMethod(method)) {
+            setPendingExtensionUI({
+              ...request,
+              method,
+              payload: payloadData,
+              rootId: activeRoot,
+              sessionKey: streamKey,
+              agent: pending?.agent,
+            });
+            break;
+          }
+          if (method === "notify") {
+            const message =
+              extensionUIPayloadString(payloadData, "message") ||
+              extensionUIPayloadString(payloadData, "title") ||
+              "Pi extension notification";
+            const notifyType = extensionUIPayloadString(payloadData, "notifyType");
+            reportError("session.extension_ui", message, {
+              severity:
+                notifyType === "error"
+                  ? "error"
+                  : notifyType === "warning"
+                    ? "warning"
+                    : "info",
+              recoverable: false,
+              details: { rootId: activeRoot, sessionKey: streamKey, method },
+            });
+          } else if (method === "setStatus") {
+            const statusKey = extensionUIPayloadString(payloadData, "statusKey") || request.id;
+            const statusText = extensionUIPayloadString(payloadData, "statusText");
+            setExtensionUIChrome((prev) => {
+              const statuses = { ...prev.statuses };
+              if (statusText) statuses[statusKey] = statusText;
+              else delete statuses[statusKey];
+              return { ...prev, statuses };
+            });
+          } else if (method === "setWidget") {
+            const widgetKey = extensionUIPayloadString(payloadData, "widgetKey") || request.id;
+            const lines = extensionUIPayloadStringArray(payloadData, "widgetLines");
+            const placement = extensionUIPayloadString(payloadData, "widgetPlacement");
+            setExtensionUIChrome((prev) => {
+              const widgets = { ...prev.widgets };
+              if (lines.length > 0) widgets[widgetKey] = { lines, placement };
+              else delete widgets[widgetKey];
+              return { ...prev, widgets };
+            });
+          } else if (method === "setTitle") {
+            const title = extensionUIPayloadString(payloadData, "title");
+            if (title) {
+              document.title = title;
+              setExtensionUIChrome((prev) => ({ ...prev, title }));
+            }
+          } else if (method === "set_editor_text") {
+            const text = extensionUIPayloadString(payloadData, "text");
+            setEditDraftRequest({ id: Date.now(), content: text });
+          }
+          break;
+        }
         case "message_done":
           attachContextWindowToLatestAssistant(
             activeRoot,
@@ -8270,6 +8425,17 @@ export function App({ onGoHome }: AppProps) {
       />
     );
 
+  const extensionUIStatusEntries = Object.entries(extensionUIChrome.statuses);
+  const extensionUIWidgetEntries = Object.entries(extensionUIChrome.widgets);
+  const pendingExtensionUIOptions = extensionUIPayloadStringArray(
+    pendingExtensionUI?.payload,
+    "options",
+  );
+  const pendingExtensionUIPlaceholder = extensionUIPayloadString(
+    pendingExtensionUI?.payload,
+    "placeholder",
+  );
+
   return (
     <>
       <AppShell
@@ -8630,6 +8796,210 @@ export function App({ onGoHome }: AppProps) {
                 {e2eePromptBusy ? "验证中..." : "继续"}
               </button>
             </div>
+          </div>
+        </div>
+      ) : null}
+      {extensionUIStatusEntries.length > 0 || extensionUIWidgetEntries.length > 0 ? (
+        <div
+          style={{
+            position: "fixed",
+            right: "18px",
+            bottom: "88px",
+            zIndex: 950,
+            width: "min(360px, calc(100vw - 36px))",
+            display: "flex",
+            flexDirection: "column",
+            gap: "8px",
+            pointerEvents: "none",
+          }}
+        >
+          {extensionUIStatusEntries.map(([key, text]) => (
+            <div
+              key={`status-${key}`}
+              style={{
+                border: "1px solid var(--border-color)",
+                background: "var(--surface-color, #fff)",
+                borderRadius: "10px",
+                padding: "8px 10px",
+                fontSize: "12px",
+                color: "var(--text-secondary)",
+                boxShadow: "0 10px 24px rgba(15, 23, 42, 0.12)",
+              }}
+            >
+              <strong style={{ color: "var(--text-primary)" }}>{key}</strong>：{text}
+            </div>
+          ))}
+          {extensionUIWidgetEntries.map(([key, widget]) => (
+            <div
+              key={`widget-${key}`}
+              style={{
+                border: "1px solid rgba(59, 130, 246, 0.28)",
+                background: "rgba(59, 130, 246, 0.08)",
+                borderRadius: "10px",
+                padding: "10px",
+                fontSize: "12px",
+                color: "var(--text-primary)",
+                boxShadow: "0 10px 24px rgba(15, 23, 42, 0.12)",
+              }}
+            >
+              <div style={{ fontWeight: 700, marginBottom: 4 }}>{key}</div>
+              {widget.lines.map((line, index) => (
+                <div key={`${key}-${index}`}>{line}</div>
+              ))}
+            </div>
+          ))}
+        </div>
+      ) : null}
+      {pendingExtensionUI ? (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(15, 23, 42, 0.42)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            padding: "24px",
+            zIndex: 1800,
+          }}
+        >
+          <div
+            style={{
+              width: "min(520px, 100%)",
+              background: "#fff",
+              borderRadius: "18px",
+              padding: "20px",
+              boxShadow: "0 28px 80px rgba(15, 23, 42, 0.22)",
+              display: "flex",
+              flexDirection: "column",
+              gap: "14px",
+            }}
+          >
+            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+              <div style={{ fontSize: "12px", color: "#64748b", fontWeight: 700 }}>
+                Pi extension UI · {pendingExtensionUI.method}
+              </div>
+              <div style={{ fontSize: "18px", fontWeight: 700, color: "#0f172a" }}>
+                {extensionUITitle(pendingExtensionUI)}
+              </div>
+              {extensionUIPayloadString(pendingExtensionUI.payload, "message") &&
+              extensionUIPayloadString(pendingExtensionUI.payload, "message") !== extensionUITitle(pendingExtensionUI) ? (
+                <div style={{ color: "#475569", fontSize: "13px", lineHeight: 1.5 }}>
+                  {extensionUIPayloadString(pendingExtensionUI.payload, "message")}
+                </div>
+              ) : null}
+            </div>
+            {pendingExtensionUI.method === "select" ? (
+              <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+                {pendingExtensionUIOptions.map((option) => (
+                  <button
+                    key={option}
+                    type="button"
+                    disabled={extensionUISubmitting}
+                    onClick={() => void submitExtensionUIResponse(pendingExtensionUI, { value: option })}
+                    style={{
+                      border: "1px solid rgba(148, 163, 184, 0.5)",
+                      background: "#f8fafc",
+                      borderRadius: "10px",
+                      padding: "10px 12px",
+                      textAlign: "left",
+                      cursor: extensionUISubmitting ? "not-allowed" : "pointer",
+                    }}
+                  >
+                    {option}
+                  </button>
+                ))}
+              </div>
+            ) : pendingExtensionUI.method === "confirm" ? (
+              <div style={{ display: "flex", justifyContent: "flex-end", gap: "10px" }}>
+                <button
+                  type="button"
+                  disabled={extensionUISubmitting}
+                  onClick={cancelExtensionUI}
+                  style={{ border: "1px solid #cbd5e1", background: "#fff", borderRadius: "999px", padding: "8px 14px", cursor: "pointer" }}
+                >
+                  取消
+                </button>
+                <button
+                  type="button"
+                  disabled={extensionUISubmitting}
+                  onClick={() => void submitExtensionUIResponse(pendingExtensionUI, { confirmed: false })}
+                  style={{ border: "1px solid #cbd5e1", background: "#fff", borderRadius: "999px", padding: "8px 14px", cursor: "pointer" }}
+                >
+                  否
+                </button>
+                <button
+                  type="button"
+                  disabled={extensionUISubmitting}
+                  onClick={() => void submitExtensionUIResponse(pendingExtensionUI, { confirmed: true })}
+                  style={{ border: "none", background: "#0f172a", color: "#fff", borderRadius: "999px", padding: "8px 16px", cursor: "pointer" }}
+                >
+                  是
+                </button>
+              </div>
+            ) : pendingExtensionUI.method === "editor" ? (
+              <textarea
+                value={extensionUIInputValue}
+                onChange={(event) => setExtensionUIInputValue(event.target.value)}
+                placeholder={pendingExtensionUIPlaceholder}
+                rows={8}
+                style={{
+                  width: "100%",
+                  borderRadius: "12px",
+                  border: "1px solid rgba(148, 163, 184, 0.5)",
+                  padding: "12px",
+                  resize: "vertical",
+                  fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+                  fontSize: "13px",
+                }}
+              />
+            ) : (
+              <input
+                type="text"
+                value={extensionUIInputValue}
+                onChange={(event) => setExtensionUIInputValue(event.target.value)}
+                placeholder={pendingExtensionUIPlaceholder}
+                autoFocus
+                style={{
+                  width: "100%",
+                  borderRadius: "12px",
+                  border: "1px solid rgba(148, 163, 184, 0.5)",
+                  padding: "12px",
+                  fontSize: "14px",
+                }}
+              />
+            )}
+            {(pendingExtensionUI.method === "input" || pendingExtensionUI.method === "editor") ? (
+              <div style={{ display: "flex", justifyContent: "flex-end", gap: "10px" }}>
+                <button
+                  type="button"
+                  disabled={extensionUISubmitting}
+                  onClick={cancelExtensionUI}
+                  style={{ border: "1px solid #cbd5e1", background: "#fff", borderRadius: "999px", padding: "8px 14px", cursor: "pointer" }}
+                >
+                  取消
+                </button>
+                <button
+                  type="button"
+                  disabled={extensionUISubmitting}
+                  onClick={() => void submitExtensionUIResponse(pendingExtensionUI, { value: extensionUIInputValue })}
+                  style={{ border: "none", background: "#0f172a", color: "#fff", borderRadius: "999px", padding: "8px 16px", cursor: "pointer" }}
+                >
+                  提交
+                </button>
+              </div>
+            ) : pendingExtensionUI.method === "select" ? (
+              <div style={{ display: "flex", justifyContent: "flex-end" }}>
+                <button
+                  type="button"
+                  disabled={extensionUISubmitting}
+                  onClick={cancelExtensionUI}
+                  style={{ border: "1px solid #cbd5e1", background: "#fff", borderRadius: "999px", padding: "8px 14px", cursor: "pointer" }}
+                >
+                  取消
+                </button>
+              </div>
+            ) : null}
           </div>
         </div>
       ) : null}

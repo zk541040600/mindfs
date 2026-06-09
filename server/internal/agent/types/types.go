@@ -15,6 +15,9 @@ type Session interface {
 	// AnswerQuestion sends a response for a pending AskUserQuestion tool call.
 	AnswerQuestion(ctx context.Context, answer AskUserAnswer) error
 
+	// AnswerExtensionUI sends a response for a pending extension UI dialog.
+	AnswerExtensionUI(ctx context.Context, response ExtensionUIResponse) error
+
 	// CurrentModel returns the model currently used by the runtime session.
 	CurrentModel() string
 
@@ -182,6 +185,7 @@ const (
 	EventTypeTodoUpdate   EventType = "todo_update"
 	EventTypeMessageDone  EventType = "message_done"
 	EventTypeRecovery     EventType = "recovery"
+	EventTypeExtensionUI  EventType = "extension_ui"
 )
 
 // Event is a normalized session update emitted by any agent backend.
@@ -205,6 +209,20 @@ type MessageDone struct {
 
 type RecoveryStatus struct {
 	Message string `json:"message"`
+}
+
+type ExtensionUIRequest struct {
+	ID      string         `json:"id"`
+	Method  string         `json:"method"`
+	Payload map[string]any `json:"payload,omitempty"`
+}
+
+type ExtensionUIResponse struct {
+	RequestID string `json:"requestId"`
+	Method    string `json:"method,omitempty"`
+	Value     string `json:"value,omitempty"`
+	Confirmed *bool  `json:"confirmed,omitempty"`
+	Cancelled bool   `json:"cancelled,omitempty"`
 }
 
 type TodoItem struct {

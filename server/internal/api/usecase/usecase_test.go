@@ -1073,6 +1073,10 @@ func (s *fakeUsecaseAgentSession) AnswerQuestion(context.Context, agenttypes.Ask
 	return nil
 }
 
+func (s *fakeUsecaseAgentSession) AnswerExtensionUI(context.Context, agenttypes.ExtensionUIResponse) error {
+	return nil
+}
+
 func (s *fakeUsecaseAgentSession) CurrentModel() string { return "" }
 
 func (s *fakeUsecaseAgentSession) SetModel(context.Context, string) error { return nil }

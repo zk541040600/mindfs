@@ -260,6 +260,10 @@ func (s *session) AnswerQuestion(context.Context, types.AskUserAnswer) error {
 	return errors.New("ask user question is not supported by codex sessions")
 }
 
+func (s *session) AnswerExtensionUI(context.Context, types.ExtensionUIResponse) error {
+	return errors.New("extension UI is not supported by codex sessions")
+}
+
 func (s *session) CurrentModel() string {
 	if s == nil {
 		return ""

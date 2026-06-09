@@ -228,6 +228,10 @@ func (s *session) AnswerQuestion(ctx context.Context, answer types.AskUserAnswer
 	}
 }
 
+func (s *session) AnswerExtensionUI(context.Context, types.ExtensionUIResponse) error {
+	return errors.New("extension UI is not supported by claude sessions")
+}
+
 func (s *session) handleCanUseTool(ctx context.Context, req claudeagent.ToolPermissionRequest) claudeagent.PermissionResult {
 	if req.ToolName != "AskUserQuestion" {
 		return claudeagent.PermissionAllow{}

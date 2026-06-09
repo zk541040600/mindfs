@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"mindfs/server/internal/agent"
+	agenttypes "mindfs/server/internal/agent/types"
 )
 
 func TestParseClientContext(t *testing.T) {
@@ -41,6 +42,24 @@ func TestSessionMessageContextHasNoDeadlineWithoutAppContext(t *testing.T) {
 
 	if _, ok := ctx.Deadline(); ok {
 		t.Fatal("session message context unexpectedly has a deadline")
+	}
+}
+
+func TestUpdateToEventMapsExtensionUI(t *testing.T) {
+	event := updateToEvent(agenttypes.Event{Type: agenttypes.EventTypeExtensionUI, Data: agenttypes.ExtensionUIRequest{
+		ID:     "ui-1",
+		Method: "select",
+		Payload: map[string]any{
+			"title":   "Pick",
+			"options": []string{"Allow", "Block"},
+		},
+	}})
+	if event == nil || event.Type != "extension_ui" {
+		t.Fatalf("unexpected event: %#v", event)
+	}
+	request, ok := event.Data.(agenttypes.ExtensionUIRequest)
+	if !ok || request.ID != "ui-1" || request.Method != "select" {
+		t.Fatalf("unexpected payload: %#v", event.Data)
 	}
 }
 

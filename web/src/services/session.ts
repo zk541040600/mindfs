@@ -161,12 +161,25 @@ export type TodoUpdate = {
   items: TodoItem[];
 };
 
+export type ExtensionUIRequest = {
+  id: string;
+  method: string;
+  payload?: Record<string, unknown>;
+};
+
+export type ExtensionUIResponse = {
+  value?: string;
+  confirmed?: boolean;
+  cancelled?: boolean;
+};
+
 export type StreamEvent =
   | { type: "message_chunk"; data: { content: string } }
   | { type: "thought_chunk"; data: { content: string } }
   | { type: "tool_call"; data: ToolCall }
   | { type: "tool_call_update"; data: ToolCall }
   | { type: "todo_update"; data: TodoUpdate }
+  | { type: "extension_ui"; data: ExtensionUIRequest }
   | { type: "recovery"; data: { message: string } }
   | {
       type: "message_done";
@@ -704,6 +717,40 @@ class SessionService {
         agent,
         tool_use_id: toolUseId,
         answers,
+      },
+    };
+
+    return this.sendWSMessage(msg);
+  }
+
+  async answerExtensionUI(
+    rootId: string,
+    sessionKey: string,
+    agent: string | undefined,
+    requestId: string,
+    method: string | undefined,
+    response: ExtensionUIResponse,
+  ): Promise<boolean> {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      console.error("[Session] WebSocket not connected");
+      return false;
+    }
+    if (!rootId || !sessionKey || !requestId) {
+      return false;
+    }
+
+    const msg = {
+      id: this.createRequestId("extui"),
+      type: "session.extension_ui_response",
+      payload: {
+        root_id: rootId,
+        session_key: sessionKey,
+        agent,
+        request_id: requestId,
+        method,
+        value: response.value,
+        confirmed: response.confirmed,
+        cancelled: response.cancelled === true,
       },
     };
 

@@ -10,6 +10,7 @@ export type ErrorCode =
   | "session.import_failed"
   | "session.rename_failed"
   | "session.sync_failed"
+  | "session.extension_ui"
   | "app.init_failed"
   // Root/project errors
   | "root.create_failed"
@@ -147,6 +148,11 @@ class ErrorService {
         message: "同步会话失败",
         severity: "error",
         recoverable: true,
+      },
+      "session.extension_ui": {
+        message: "Pi 扩展 UI 通知",
+        severity: "info",
+        recoverable: false,
       },
       "app.init_failed": {
         message: "初始化失败",

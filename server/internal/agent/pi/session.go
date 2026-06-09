@@ -107,17 +107,18 @@ func (r *Runtime) openSession(ctx context.Context, opts OpenOptions, attempts in
 	}
 
 	s := &session{
-		runtime:    r,
-		cmd:        cmd,
-		stdin:      stdin,
-		sessionKey: strings.TrimSpace(opts.SessionKey),
-		agentName:  strings.TrimSpace(opts.AgentName),
-		starting:   true,
-		model:      normalizeModelID(strings.TrimSpace(opts.Model)),
-		mode:       strings.TrimSpace(opts.Mode),
-		pending:    make(map[string]chan rpcResponse),
-		turnDone:   make(chan error, 1),
-		closed:     make(chan struct{}),
+		runtime:            r,
+		cmd:                cmd,
+		stdin:              stdin,
+		sessionKey:         strings.TrimSpace(opts.SessionKey),
+		agentName:          strings.TrimSpace(opts.AgentName),
+		starting:           true,
+		model:              normalizeModelID(strings.TrimSpace(opts.Model)),
+		mode:               strings.TrimSpace(opts.Mode),
+		pending:            make(map[string]chan rpcResponse),
+		pendingExtensionUI: make(map[string]string),
+		turnDone:           make(chan error, 1),
+		closed:             make(chan struct{}),
 	}
 	r.register(s)
 	go s.readLoop(stdout)
@@ -214,9 +215,10 @@ type session struct {
 
 	seq uint64
 
-	writeMu sync.Mutex
-	mu      sync.RWMutex
-	pending map[string]chan rpcResponse
+	writeMu            sync.Mutex
+	mu                 sync.RWMutex
+	pending            map[string]chan rpcResponse
+	pendingExtensionUI map[string]string
 
 	onUpdate           func(agenttypes.Event)
 	sessionID          string
@@ -535,16 +537,48 @@ func (s *session) handleLine(line string) {
 
 func (s *session) handleExtensionUIRequest(raw []byte, id, method string) {
 	method = strings.TrimSpace(method)
+	if method == "" || strings.TrimSpace(id) == "" {
+		return
+	}
 	if method == "notify" {
 		s.handleNotifyRequest(raw)
 	}
-	switch method {
-	case "select", "input", "editor":
-		_ = s.writeJSON(map[string]any{"type": "extension_ui_response", "id": id, "cancelled": true})
-	case "confirm":
-		_ = s.writeJSON(map[string]any{"type": "extension_ui_response", "id": id, "confirmed": false})
+	payload := extensionUIPayload(raw)
+	if isExtensionUIDialogMethod(method) {
+		s.mu.Lock()
+		if s.pendingExtensionUI == nil {
+			s.pendingExtensionUI = make(map[string]string)
+		}
+		s.pendingExtensionUI[id] = method
+		s.mu.Unlock()
+	}
+	s.emit(agenttypes.Event{Type: agenttypes.EventTypeExtensionUI, SessionID: s.SessionID(), Data: agenttypes.ExtensionUIRequest{
+		ID:      id,
+		Method:  method,
+		Payload: payload,
+	}})
+}
+
+func extensionUIPayload(raw []byte) map[string]any {
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil
+	}
+	delete(payload, "type")
+	delete(payload, "id")
+	delete(payload, "method")
+	if len(payload) == 0 {
+		return nil
+	}
+	return payload
+}
+
+func isExtensionUIDialogMethod(method string) bool {
+	switch strings.TrimSpace(method) {
+	case "select", "confirm", "input", "editor":
+		return true
 	default:
-		// Fire-and-forget UI requests (notify/status/widget/title) are intentionally ignored.
+		return false
 	}
 }
 
@@ -673,6 +707,16 @@ func (s *session) finishExtensionOnlyPromptIfIdle(ctx context.Context, content s
 	}
 	s.emit(agenttypes.Event{Type: agenttypes.EventTypeMessageDone, SessionID: s.SessionID(), Data: agenttypes.MessageDone{ContextWindow: s.cachedContextWindow()}})
 	s.signalTurnDone(nil)
+	go s.abortLingeringExtensionOnlyPrompt()
+}
+
+func (s *session) abortLingeringExtensionOnlyPrompt() {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := s.request(ctx, "abort", map[string]any{"type": "abort"})
+	if err != nil && !strings.Contains(err.Error(), "closed") {
+		log.Printf("[agent/pi-rpc] extension_only.abort.warn session=%s err=%v", s.sessionKey, err)
+	}
 }
 
 func (s *session) markTextDeltaSeen() {
@@ -923,6 +967,47 @@ func (s *session) SendMessage(ctx context.Context, content string) error {
 
 func (s *session) AnswerQuestion(context.Context, agenttypes.AskUserAnswer) error {
 	return errors.New("ask user question is not supported by pi-rpc sessions")
+}
+
+func (s *session) AnswerExtensionUI(ctx context.Context, response agenttypes.ExtensionUIResponse) error {
+	requestID := strings.TrimSpace(response.RequestID)
+	if requestID == "" {
+		return errors.New("extension UI requestId required")
+	}
+	s.mu.RLock()
+	method, ok := s.pendingExtensionUI[requestID]
+	s.mu.RUnlock()
+	if !ok {
+		return errors.New("extension UI request is not pending: " + requestID)
+	}
+	if requested := strings.TrimSpace(response.Method); requested != "" && requested != method {
+		return fmt.Errorf("extension UI method mismatch for %s: got %s want %s", requestID, requested, method)
+	}
+	payload := map[string]any{"type": "extension_ui_response", "id": requestID}
+	if response.Cancelled {
+		payload["cancelled"] = true
+	} else if method == "confirm" {
+		if response.Confirmed == nil {
+			return errors.New("confirmed required for confirm extension UI response")
+		}
+		payload["confirmed"] = *response.Confirmed
+	} else {
+		payload["value"] = response.Value
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-s.closed:
+		return errors.New("pi rpc session closed")
+	default:
+	}
+	if err := s.writeJSON(payload); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	delete(s.pendingExtensionUI, requestID)
+	s.mu.Unlock()
+	return nil
 }
 
 func (s *session) CurrentModel() string {

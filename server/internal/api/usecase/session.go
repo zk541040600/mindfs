@@ -431,6 +431,13 @@ type AnswerQuestionInput struct {
 	Answers    map[string]string
 }
 
+type AnswerExtensionUIInput struct {
+	RootID     string
+	SessionKey string
+	Agent      string
+	Response   agenttypes.ExtensionUIResponse
+}
+
 type CancelSessionTurnInput struct {
 	RootID string
 	Key    string
@@ -1985,37 +1992,56 @@ func (s *Service) AnswerQuestion(ctx context.Context, in AnswerQuestionInput) er
 	if err := s.ensureRegistry(); err != nil {
 		return err
 	}
-	sessionKey := strings.TrimSpace(in.SessionKey)
-	if sessionKey == "" {
-		return errors.New("session key required")
-	}
-	agentName := strings.TrimSpace(in.Agent)
-	if agentName == "" {
-		manager, err := s.Registry.GetSessionManager(in.RootID)
-		if err != nil {
-			return err
-		}
-		current, err := manager.Get(ctx, sessionKey, 0)
-		if err != nil {
-			return err
-		}
-		agentName = strings.TrimSpace(session.InferAgentFromSession(current))
-	}
-	if agentName == "" {
-		return errors.New("agent required")
-	}
-	pool := s.Registry.GetAgentPool()
-	if pool == nil {
-		return errors.New("agent pool unavailable")
-	}
-	sess, ok := pool.Get(agentPoolSessionKey(sessionKey, agentName))
-	if !ok {
-		return errors.New("agent session not found")
+	sess, err := s.agentSessionForResponse(ctx, in.RootID, in.SessionKey, in.Agent)
+	if err != nil {
+		return err
 	}
 	return sess.AnswerQuestion(ctx, agenttypes.AskUserAnswer{
 		ToolUseID: strings.TrimSpace(in.ToolUseID),
 		Answers:   in.Answers,
 	})
+}
+
+func (s *Service) AnswerExtensionUI(ctx context.Context, in AnswerExtensionUIInput) error {
+	if err := s.ensureRegistry(); err != nil {
+		return err
+	}
+	sess, err := s.agentSessionForResponse(ctx, in.RootID, in.SessionKey, in.Agent)
+	if err != nil {
+		return err
+	}
+	return sess.AnswerExtensionUI(ctx, in.Response)
+}
+
+func (s *Service) agentSessionForResponse(ctx context.Context, rootID, sessionKey, agentName string) (agenttypes.Session, error) {
+	sessionKey = strings.TrimSpace(sessionKey)
+	if sessionKey == "" {
+		return nil, errors.New("session key required")
+	}
+	agentName = strings.TrimSpace(agentName)
+	if agentName == "" {
+		manager, err := s.Registry.GetSessionManager(rootID)
+		if err != nil {
+			return nil, err
+		}
+		current, err := manager.Get(ctx, sessionKey, 0)
+		if err != nil {
+			return nil, err
+		}
+		agentName = strings.TrimSpace(session.InferAgentFromSession(current))
+	}
+	if agentName == "" {
+		return nil, errors.New("agent required")
+	}
+	pool := s.Registry.GetAgentPool()
+	if pool == nil {
+		return nil, errors.New("agent pool unavailable")
+	}
+	sess, ok := pool.Get(agentPoolSessionKey(sessionKey, agentName))
+	if !ok {
+		return nil, errors.New("agent session not found")
+	}
+	return sess, nil
 }
 
 func currentAssistantLine(responseText string) int {

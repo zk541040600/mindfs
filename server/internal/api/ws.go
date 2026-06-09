@@ -310,6 +310,8 @@ func (h *WSHandler) handleWSRequest(ctx context.Context, conn *websocket.Conn, c
 		go h.handleSessionMessage(ctx, conn, clientID, req)
 	case "session.answer_question":
 		go h.handleSessionAnswerQuestion(ctx, conn, clientID, req)
+	case "session.extension_ui_response":
+		go h.handleSessionExtensionUIResponse(ctx, conn, clientID, req)
 	case "session.ready":
 		go h.handleSessionReady(clientID, req)
 	case "session.cancel":
@@ -348,6 +350,42 @@ func (h *WSHandler) handleSessionAnswerQuestion(ctx context.Context, conn *webso
 		ID:      req.ID,
 		Type:    "session.answer_question.accepted",
 		Payload: map[string]any{"root_id": rootID, "session_key": key, "tool_use_id": toolUseID},
+	})
+}
+
+func (h *WSHandler) handleSessionExtensionUIResponse(ctx context.Context, conn *websocket.Conn, clientID string, req WSRequest) {
+	rootID := getString(req.Payload, "root_id")
+	key := getString(req.Payload, "session_key")
+	agentName := getString(req.Payload, "agent")
+	requestID := getString(req.Payload, "request_id")
+	method := getString(req.Payload, "method")
+	if key == "" || requestID == "" {
+		h.sendWSError(conn, clientID, req.ID, "invalid_request", "session_key and request_id required")
+		return
+	}
+	response := agenttypes.ExtensionUIResponse{
+		RequestID: requestID,
+		Method:    method,
+		Value:     getString(req.Payload, "value"),
+		Cancelled: getBool(req.Payload, "cancelled"),
+	}
+	if confirmed, ok := getOptionalBool(req.Payload, "confirmed"); ok {
+		response.Confirmed = &confirmed
+	}
+	uc := &usecase.Service{Registry: h.AppContext}
+	if err := uc.AnswerExtensionUI(ctx, usecase.AnswerExtensionUIInput{
+		RootID:     rootID,
+		SessionKey: key,
+		Agent:      agentName,
+		Response:   response,
+	}); err != nil {
+		h.sendWSError(conn, clientID, req.ID, "session.extension_ui_response_failed", err.Error())
+		return
+	}
+	_ = h.writeWSJSON(clientID, conn, WSResponse{
+		ID:      req.ID,
+		Type:    "session.extension_ui_response.accepted",
+		Payload: map[string]any{"root_id": rootID, "session_key": key, "request_id": requestID},
 	})
 }
 
@@ -638,6 +676,11 @@ func updateToEvent(update agenttypes.Event) *StreamEvent {
 			return &StreamEvent{Type: "recovery", Data: recovery}
 		}
 		return &StreamEvent{Type: "recovery", Data: agenttypes.RecoveryStatus{}}
+	case agenttypes.EventTypeExtensionUI:
+		if request, ok := update.Data.(agenttypes.ExtensionUIRequest); ok {
+			return &StreamEvent{Type: "extension_ui", Data: request}
+		}
+		return &StreamEvent{Type: "extension_ui", Data: agenttypes.ExtensionUIRequest{}}
 	}
 	return nil
 }
@@ -710,25 +753,32 @@ func normalizeFastServiceValue(value string) string {
 }
 
 func getBool(payload map[string]any, key string) bool {
+	value, _ := getOptionalBool(payload, key)
+	return value
+}
+
+func getOptionalBool(payload map[string]any, key string) (bool, bool) {
 	if payload == nil {
-		return false
+		return false, false
 	}
 	value, ok := payload[key]
 	if !ok {
-		return false
+		return false, false
 	}
 	switch typed := value.(type) {
 	case bool:
-		return typed
+		return typed, true
 	case string:
 		switch strings.ToLower(strings.TrimSpace(typed)) {
 		case "1", "true", "yes", "on", "fast":
-			return true
+			return true, true
+		case "0", "false", "no", "off", "":
+			return false, true
 		default:
-			return false
+			return false, false
 		}
 	default:
-		return false
+		return false, false
 	}
 }
 

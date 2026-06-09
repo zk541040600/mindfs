@@ -30,10 +30,20 @@ if fail_once_file and not os.path.exists(fail_once_file):
     sys.exit(141)
 
 out_lock = threading.Lock()
+pending_prompt_id = None
+pending_ui_method = None
 
 def send(obj):
     with out_lock:
         print(json.dumps(obj, ensure_ascii=False), flush=True)
+
+def finish_dialog_prompt(req_id, message):
+    send({"id": req_id, "type": "response", "command": "prompt", "success": True})
+    send({"type": "agent_start"})
+    send({"type": "message_start"})
+    send({"type": "message_update", "assistantMessageEvent": {"type": "text_delta", "delta": message}})
+    send({"type": "message_end", "message": {"role": "assistant", "content": [{"type": "text", "text": message}]}})
+    send({"type": "agent_end", "willRetry": False})
 
 def finish_prompt(req_id, message):
     send({"id": req_id, "type": "response", "command": "prompt", "success": True})
@@ -86,7 +96,39 @@ for line in sys.stdin:
             # no prompt response, no notify and no agent turn ever reaches RPC.
             # MindFS must not hang forever.
             continue
+        if "select-dialog" in message:
+            pending_prompt_id = req_id
+            pending_ui_method = "select"
+            send({"type": "extension_ui_request", "id": "select-1", "method": "select", "title": "Pick one", "options": ["Allow", "Block"], "timeout": 10000})
+            continue
+        if "confirm-dialog" in message:
+            pending_prompt_id = req_id
+            pending_ui_method = "confirm"
+            send({"type": "extension_ui_request", "id": "confirm-1", "method": "confirm", "title": "Confirm?", "message": "Proceed?"})
+            continue
+        if "fire-ui" in message:
+            send({"type": "extension_ui_request", "id": "notify-2", "method": "notify", "message": "Fire info", "notifyType": "info"})
+            send({"type": "extension_ui_request", "id": "status-1", "method": "setStatus", "statusKey": "fake", "statusText": "running"})
+            send({"type": "extension_ui_request", "id": "widget-1", "method": "setWidget", "widgetKey": "fake", "widgetLines": ["one", "two"], "widgetPlacement": "aboveEditor"})
+            send({"type": "extension_ui_request", "id": "title-1", "method": "setTitle", "title": "fake title"})
+            send({"type": "extension_ui_request", "id": "editor-text-1", "method": "set_editor_text", "text": "prefill"})
+            finish_dialog_prompt(req_id, "fire done")
+            continue
         finish_prompt(req_id, message)
+    elif typ == "extension_ui_response":
+        if pending_prompt_id:
+            if req.get("cancelled"):
+                message = "cancelled: " + str(pending_ui_method)
+            elif pending_ui_method == "confirm":
+                message = "confirmed: " + str(req.get("confirmed"))
+            else:
+                message = "selected: " + str(req.get("value", ""))
+            prompt_id = pending_prompt_id
+            pending_prompt_id = None
+            pending_ui_method = None
+            finish_dialog_prompt(prompt_id, message)
+        else:
+            send({"type": "response", "success": False, "error": "no pending extension ui"})
     elif typ == "abort":
         send({"id": req_id, "type": "response", "command": "abort", "success": True})
         send({"type": "agent_end", "willRetry": False})
@@ -156,6 +198,32 @@ func joinedMessageChunks(events []agenttypes.Event) string {
 		}
 	}
 	return b.String()
+}
+
+func waitForEvent(t *testing.T, events *[]agenttypes.Event, mu *sync.Mutex, typ agenttypes.EventType) agenttypes.Event {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		for _, ev := range *events {
+			if ev.Type == typ {
+				mu.Unlock()
+				return ev
+			}
+		}
+		mu.Unlock()
+		time.Sleep(20 * time.Millisecond)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	t.Fatalf("event %s not observed; got %+v", typ, *events)
+	return agenttypes.Event{}
+}
+
+func copyEvents(events *[]agenttypes.Event, mu *sync.Mutex) []agenttypes.Event {
+	mu.Lock()
+	defer mu.Unlock()
+	return append([]agenttypes.Event(nil), (*events)...)
 }
 
 func TestListCommandsModelsAndModes(t *testing.T) {
@@ -237,6 +305,114 @@ func TestExtensionOnlySlashCommandFinishes(t *testing.T) {
 	}
 	if !hasEvent(got, agenttypes.EventTypeMessageDone) {
 		t.Fatalf("missing done event: %+v", got)
+	}
+}
+
+func TestExtensionUIDialogRoundTrip(t *testing.T) {
+	cmd := writeFakePiRPC(t)
+	r := NewRuntime()
+	s := openFakeSession(t, r, cmd, "extension-ui-dialog")
+	events, mu := collectEvents(s)
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- s.SendMessage(ctx, "select-dialog") }()
+
+	ev := waitForEvent(t, events, mu, agenttypes.EventTypeExtensionUI)
+	request, ok := ev.Data.(agenttypes.ExtensionUIRequest)
+	if !ok {
+		t.Fatalf("unexpected extension UI payload: %#v", ev.Data)
+	}
+	if request.ID != "select-1" || request.Method != "select" {
+		t.Fatalf("unexpected extension UI request: %+v", request)
+	}
+	options, ok := request.Payload["options"].([]any)
+	if !ok || len(options) != 2 || options[0] != "Allow" {
+		t.Fatalf("unexpected options: %#v", request.Payload["options"])
+	}
+	if err := s.AnswerExtensionUI(ctx, agenttypes.ExtensionUIResponse{RequestID: request.ID, Method: request.Method, Value: "Allow"}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("SendMessage did not finish after extension UI response")
+	}
+	got := copyEvents(events, mu)
+	if !strings.Contains(joinedMessageChunks(got), "selected: Allow") {
+		t.Fatalf("missing selected result: %+v", got)
+	}
+	if !hasEvent(got, agenttypes.EventTypeMessageDone) {
+		t.Fatalf("missing done event: %+v", got)
+	}
+}
+
+func TestExtensionUIConfirmRoundTrip(t *testing.T) {
+	cmd := writeFakePiRPC(t)
+	r := NewRuntime()
+	s := openFakeSession(t, r, cmd, "extension-ui-confirm")
+	events, mu := collectEvents(s)
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- s.SendMessage(ctx, "confirm-dialog") }()
+	ev := waitForEvent(t, events, mu, agenttypes.EventTypeExtensionUI)
+	request, ok := ev.Data.(agenttypes.ExtensionUIRequest)
+	if !ok || request.ID != "confirm-1" || request.Method != "confirm" {
+		t.Fatalf("unexpected extension UI request: %#v", ev.Data)
+	}
+	confirmed := true
+	if err := s.AnswerExtensionUI(ctx, agenttypes.ExtensionUIResponse{RequestID: request.ID, Method: request.Method, Confirmed: &confirmed}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("SendMessage did not finish after confirm response")
+	}
+	if got := joinedMessageChunks(copyEvents(events, mu)); !strings.Contains(got, "confirmed: True") {
+		t.Fatalf("missing confirm result: %q", got)
+	}
+}
+
+func TestExtensionUIFireAndForgetRequests(t *testing.T) {
+	cmd := writeFakePiRPC(t)
+	r := NewRuntime()
+	s := openFakeSession(t, r, cmd, "extension-ui-fire")
+	events, mu := collectEvents(s)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := s.SendMessage(ctx, "fire-ui"); err != nil {
+		t.Fatal(err)
+	}
+	got := copyEvents(events, mu)
+	methods := make(map[string]bool)
+	for _, ev := range got {
+		if ev.Type != agenttypes.EventTypeExtensionUI {
+			continue
+		}
+		request, ok := ev.Data.(agenttypes.ExtensionUIRequest)
+		if !ok {
+			t.Fatalf("unexpected extension UI payload: %#v", ev.Data)
+		}
+		methods[request.Method] = true
+	}
+	for _, method := range []string{"notify", "setStatus", "setWidget", "setTitle", "set_editor_text"} {
+		if !methods[method] {
+			t.Fatalf("missing fire-and-forget method %s in %+v", method, got)
+		}
+	}
+	if !strings.Contains(joinedMessageChunks(got), "fire done") {
+		t.Fatalf("missing final text: %+v", got)
 	}
 }
 
