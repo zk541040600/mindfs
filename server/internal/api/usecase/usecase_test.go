@@ -340,6 +340,99 @@ func TestBuildPromptReadsHistoryWhenAgentContextReset(t *testing.T) {
 	}
 }
 
+func TestEnsureAgentSessionResetsPiContextOnRuntimeOpen(t *testing.T) {
+	ctx := context.Background()
+	rootDir := t.TempDir()
+	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
+	manager := session.NewManager(root)
+	created, err := manager.Create(ctx, session.CreateInput{Type: session.TypeChat, Agent: "pi", Name: "chat"})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	for _, item := range []struct {
+		role    string
+		content string
+	}{
+		{"user", "first"},
+		{"agent", "second"},
+		{"user", "third"},
+		{"agent", "fourth"},
+	} {
+		if err := manager.AddExchangeForAgent(ctx, created, item.role, item.content, "pi", "", "", ""); err != nil {
+			t.Fatalf("add %s exchange: %v", item.role, err)
+		}
+	}
+	if err := manager.UpsertAgentBinding(ctx, session.AgentBinding{
+		SessionKey:     created.Key,
+		Agent:          "pi",
+		AgentSessionID: "previous-pi-runtime",
+		AgentCtxSeq:    4,
+	}); err != nil {
+		t.Fatalf("upsert binding: %v", err)
+	}
+	loaded, err := manager.Get(ctx, created.Key, 0)
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	pool := agent.NewPool(agent.Config{Agents: []agent.Definition{{
+		Name:     "pi",
+		Protocol: agent.ProtocolPiRPC,
+		Command:  writeFakePiRPCForUsecase(t),
+	}}})
+	defer pool.CloseAll()
+
+	_, agentCtxSeq, err := (&Service{}).ensureAgentSession(ctx, pool, manager, loaded, "pi", "", "", "", "", rootDir)
+	if err != nil {
+		t.Fatalf("ensureAgentSession: %v", err)
+	}
+	if agentCtxSeq == nil {
+		t.Fatal("agentCtxSeq is nil, want reset marker")
+	}
+	if *agentCtxSeq != 0 {
+		t.Fatalf("agentCtxSeq = %d, want 0 for stateless pi runtime", *agentCtxSeq)
+	}
+
+	prompt := (&Service{}).BuildPrompt(BuildPromptInput{
+		Session:     loaded,
+		Manager:     manager,
+		Agent:       "pi",
+		Message:     "continue",
+		AgentCtxSeq: agentCtxSeq,
+	})
+	if !strings.Contains(prompt, "read the last 4 lines") {
+		t.Fatalf("prompt = %q, want full history read hint", prompt)
+	}
+}
+
+func TestUsesStatelessRuntimeContextOnlyForPiRPC(t *testing.T) {
+	piPool := agent.NewPool(agent.Config{Agents: []agent.Definition{{
+		Name:     "pi",
+		Protocol: agent.ProtocolPiRPC,
+	}}})
+	defer piPool.CloseAll()
+	if !usesStatelessRuntimeContext(piPool, "pi") {
+		t.Fatal("pi-rpc should be treated as stateless runtime context")
+	}
+
+	codexPool := agent.NewPool(agent.Config{Agents: []agent.Definition{{
+		Name:     "codex",
+		Protocol: agent.ProtocolCodexSDK,
+	}}})
+	defer codexPool.CloseAll()
+	if usesStatelessRuntimeContext(codexPool, "codex") {
+		t.Fatal("codex-sdk should keep durable runtime context")
+	}
+
+	claudePool := agent.NewPool(agent.Config{Agents: []agent.Definition{{
+		Name:     "claude",
+		Protocol: agent.ProtocolClaudeSDK,
+	}}})
+	defer claudePool.CloseAll()
+	if usesStatelessRuntimeContext(claudePool, "claude") {
+		t.Fatal("claude-sdk should keep durable runtime context")
+	}
+}
+
 func TestSendCommandMessageUsesLongShellPerSession(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("windows long-shell behavior is covered by cross-compile checks")
@@ -977,6 +1070,40 @@ func mustWriteFile(t *testing.T, path string, content string) {
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatalf("WriteFile(%q): %v", path, err)
 	}
+}
+
+func writeFakePiRPCForUsecase(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "fake-pi")
+	script := `#!/usr/bin/env python3
+import json
+import sys
+
+def send(obj):
+    print(json.dumps(obj, ensure_ascii=False), flush=True)
+
+for line in sys.stdin:
+    req = json.loads(line)
+    req_id = req.get("id")
+    if req.get("type") == "get_state":
+        send({
+            "id": req_id,
+            "type": "response",
+            "command": "get_state",
+            "success": True,
+            "data": {
+                "sessionId": "fresh-pi-runtime",
+                "thinkingLevel": "off",
+                "model": {"provider": "fake", "id": "model"},
+            },
+        })
+    else:
+        send({"id": req_id, "type": "response", "command": req.get("type"), "success": True, "data": {}})
+`
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake pi rpc: %v", err)
+	}
+	return path
 }
 
 func selectRunnableAgent(cfg agent.Config) (string, bool) {

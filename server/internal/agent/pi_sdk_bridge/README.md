@@ -2,11 +2,11 @@
 
 This directory is a reversible Phase B prototype for evaluating whether a Node-based Pi SDK bridge adds useful MindFS capabilities beyond the current production `pi-rpc` path.
 
-It is **not production wiring**:
+Production wiring is intentionally narrow:
 
 - `agents.json` is unchanged.
-- The existing `protocol: "pi-rpc"` default remains the production path.
-- No Go runtime code imports this directory yet.
+- The existing `protocol: "pi-rpc"` default remains the production chat/runtime path.
+- Go imports this directory only for bounded, read-only SDK-backed metadata such as safe session summaries.
 - Probes avoid real model calls and real external side effects.
 
 ## Probe script

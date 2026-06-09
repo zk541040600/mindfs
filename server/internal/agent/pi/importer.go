@@ -3,21 +3,34 @@ package pi
 import (
 	"context"
 	"errors"
+	"log"
 	"strings"
+	"time"
 
+	pisdkbridge "mindfs/server/internal/agent/pi_sdk_bridge"
 	agenttypes "mindfs/server/internal/agent/types"
 )
 
 type ImporterOptions struct {
 	AgentName string
+	Bridge    BridgeClient
+}
+
+type BridgeClient interface {
+	ListSessions(ctx context.Context, cwd string, limit int) (pisdkbridge.ListSessionsData, error)
 }
 
 type Importer struct {
 	agentName string
+	bridge    BridgeClient
 }
 
 func NewImporter(opts ImporterOptions) *Importer {
-	return &Importer{agentName: strings.TrimSpace(opts.AgentName)}
+	bridge := opts.Bridge
+	if bridge == nil {
+		bridge = pisdkbridge.NewClient(pisdkbridge.ClientOptions{})
+	}
+	return &Importer{agentName: strings.TrimSpace(opts.AgentName), bridge: bridge}
 }
 
 func (i *Importer) AgentName() string {
@@ -27,11 +40,70 @@ func (i *Importer) AgentName() string {
 	return "pi"
 }
 
-func (i *Importer) ListExternalSessions(context.Context, agenttypes.ListExternalSessionsInput) (agenttypes.ListExternalSessionsResult, error) {
-	// MindFS runs pi-rpc with --no-session, so there are no durable Pi sessions
-	// to import. Returning an empty list keeps external-session discovery and
-	// best-effort sync quiet while the live MindFS session remains authoritative.
-	return agenttypes.ListExternalSessionsResult{}, nil
+func (i *Importer) ListExternalSessions(ctx context.Context, in agenttypes.ListExternalSessionsInput) (agenttypes.ListExternalSessionsResult, error) {
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 20
+	}
+	if strings.TrimSpace(in.RootPath) == "" || i.bridge == nil {
+		return agenttypes.ListExternalSessionsResult{}, nil
+	}
+	data, err := i.bridge.ListSessions(ctx, in.RootPath, limit)
+	if err != nil {
+		// External Pi SDK metadata is auxiliary. Discovery must fail closed and
+		// never make the production pi-rpc runtime unavailable.
+		log.Printf("[agent/pi/importer] sdk bridge list-sessions failed: %v", err)
+		return agenttypes.ListExternalSessionsResult{}, nil
+	}
+	items := make([]agenttypes.ExternalSessionSummary, 0, len(data.Sessions))
+	for _, session := range data.Sessions {
+		id := strings.TrimSpace(session.ID)
+		if id == "" {
+			continue
+		}
+		cwd := strings.TrimSpace(session.Cwd)
+		if cwd == "" {
+			cwd = strings.TrimSpace(in.RootPath)
+		}
+		updatedAt := parseSDKBridgeTime(session.Modified)
+		if updatedAt.IsZero() {
+			updatedAt = parseSDKBridgeTime(session.Created)
+		}
+		if !in.BeforeTime.IsZero() && !updatedAt.Before(in.BeforeTime) {
+			continue
+		}
+		if !in.AfterTime.IsZero() && !updatedAt.After(in.AfterTime) {
+			continue
+		}
+		items = append(items, agenttypes.ExternalSessionSummary{
+			Agent:          i.AgentName(),
+			AgentSessionID: id,
+			Cwd:            cwd,
+			Title:          safeSessionTitle(session.Name),
+			UpdatedAt:      updatedAt,
+		})
+		if len(items) >= limit {
+			break
+		}
+	}
+	return agenttypes.ListExternalSessionsResult{Items: items}, nil
+}
+
+func (i *Importer) ScanExternalSessions(ctx context.Context, in agenttypes.ListExternalSessionsInput, visit agenttypes.ExternalSessionVisitFunc) error {
+	result, err := i.ListExternalSessions(ctx, in)
+	if err != nil {
+		return err
+	}
+	for _, item := range result.Items {
+		shouldContinue, err := visit(item)
+		if err != nil {
+			return err
+		}
+		if !shouldContinue {
+			return nil
+		}
+	}
+	return nil
 }
 
 func (i *Importer) ImportExternalSession(_ context.Context, in agenttypes.ImportExternalSessionInput) (agenttypes.ImportedExternalSession, error) {
@@ -39,11 +111,35 @@ func (i *Importer) ImportExternalSession(_ context.Context, in agenttypes.Import
 	if agentName == "" {
 		agentName = i.AgentName()
 	}
+	sessionID := strings.TrimSpace(in.AgentSessionID)
 	if !in.AfterTimestamp.IsZero() {
-		// Delta sync asks for records after a timestamp. pi-rpc sessions are
-		// already recorded through MindFS streaming, and --no-session leaves no
-		// external transcript to tail, so there is simply nothing extra to import.
-		return agenttypes.ImportedExternalSession{Agent: agentName, AgentSessionID: strings.TrimSpace(in.AgentSessionID)}, nil
+		// Delta sync remains non-fatal. The SDK bridge currently exposes metadata
+		// only; it deliberately does not import raw transcripts.
+		return agenttypes.ImportedExternalSession{Agent: agentName, AgentSessionID: sessionID}, nil
 	}
-	return agenttypes.ImportedExternalSession{}, errors.New("pi-rpc external session import is not supported")
+	return agenttypes.ImportedExternalSession{}, errors.New("pi external session transcript import is not supported")
+}
+
+func parseSDKBridgeTime(value string) time.Time {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return time.Time{}
+	}
+	for _, layout := range []string{time.RFC3339Nano, time.RFC3339} {
+		if t, err := time.Parse(layout, trimmed); err == nil {
+			return t
+		}
+	}
+	return time.Time{}
+}
+
+func safeSessionTitle(name string) string {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		return ""
+	}
+	if len(trimmed) > 120 {
+		trimmed = trimmed[:120]
+	}
+	return strings.Join(strings.Fields(trimmed), " ")
 }

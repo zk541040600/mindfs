@@ -395,7 +395,7 @@ function sanitizeSessionInfo(info) {
     path: info.path,
     id: info.id,
     cwd: info.cwd,
-    name: info.name,
+    name: safeTitle(info.name),
     parentSessionPath: info.parentSessionPath,
     created: info.created instanceof Date ? info.created.toISOString() : info.created,
     modified: info.modified instanceof Date ? info.modified.toISOString() : info.modified,
@@ -1008,6 +1008,10 @@ function makeIdGenerator(prefix) {
 
 function limited(items, limit) {
   return items.slice(0, limit);
+}
+
+function safeTitle(text) {
+  return preview(text, 120);
 }
 
 function preview(text, max = 160) {

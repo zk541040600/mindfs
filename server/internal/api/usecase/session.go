@@ -1042,18 +1042,11 @@ func (s *Service) ensureAgentSession(
 		Effort:      nextEffort,
 		FastService: nextFastService,
 		RootPath:    rootAbs,
-		AgentSessionID: strings.TrimSpace(func() string {
-			if binding == nil {
-				return ""
-			}
-			return binding.AgentSessionID
-		}()),
-		AgentCtxSeq: func() int {
-			if binding == nil {
-				return 0
-			}
-			return binding.AgentCtxSeq
-		}(),
+	}
+	statelessRuntimeCtx := usesStatelessRuntimeContext(pool, agentName)
+	if binding != nil && !statelessRuntimeCtx {
+		openInput.AgentSessionID = strings.TrimSpace(binding.AgentSessionID)
+		openInput.AgentCtxSeq = binding.AgentCtxSeq
 	}
 	if openInput.AgentSessionID != "" {
 		log.Printf("[session/model] open session=%s agent=%s model=%q mode=%q effort=%q fast_service=%q pool_session=%s action=resume_runtime_session agent_session_id=%s agent_ctx_seq=%d", current.Key, agentName, nextModel, nextMode, nextEffort, nextFastService, poolSessionKey, openInput.AgentSessionID, openInput.AgentCtxSeq)
@@ -1081,12 +1074,33 @@ func (s *Service) ensureAgentSession(
 		log.Printf("[session/model] open.error session=%s agent=%s model=%q mode=%q effort=%q fast_service=%q pool_session=%s err=%v", current.Key, agentName, nextModel, nextMode, nextEffort, nextFastService, poolSessionKey, err)
 		return nil, nil, err
 	}
-	if ctxSeqOverride == nil && binding != nil && openInput.AgentSessionID != "" {
+	if ctxSeqOverride == nil && statelessRuntimeCtx {
+		zero := 0
+		ctxSeqOverride = &zero
+	} else if ctxSeqOverride == nil && binding != nil && openInput.AgentSessionID != "" {
 		last := binding.AgentCtxSeq
 		ctxSeqOverride = &last
 	}
 	log.Printf("[session/model] open.done session=%s agent=%s model=%q mode=%q effort=%q fast_service=%q pool_session=%s", current.Key, agentName, nextModel, nextMode, nextEffort, nextFastService, poolSessionKey)
 	return sess, ctxSeqOverride, nil
+}
+
+func usesStatelessRuntimeContext(pool *agent.Pool, agentName string) bool {
+	return runtimeProtocol(pool, agentName) == agent.ProtocolPiRPC
+}
+
+func runtimeProtocol(pool *agent.Pool, agentName string) agent.Protocol {
+	if pool == nil {
+		return agent.DefaultProtocol(agentName)
+	}
+	def, ok := pool.Config().GetAgent(agentName)
+	if !ok {
+		return agent.DefaultProtocol(agentName)
+	}
+	if def.Protocol != "" {
+		return def.Protocol
+	}
+	return agent.DefaultProtocol(agentName)
 }
 
 func shouldReopenSessionForSetting(pool *agent.Pool, agentName, currentValue, nextValue string) bool {
