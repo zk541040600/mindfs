@@ -9,6 +9,7 @@ import (
 	"mindfs/server/internal/agent/acp"
 	"mindfs/server/internal/agent/claude"
 	"mindfs/server/internal/agent/codex"
+	"mindfs/server/internal/agent/pi"
 	agenttypes "mindfs/server/internal/agent/types"
 )
 
@@ -28,6 +29,10 @@ func NewExternalSessionImporter(def Definition) (agenttypes.ExternalSessionImpor
 		}), nil
 	case ProtocolCodexSDK:
 		return codex.NewImporter(codex.ImporterOptions{
+			AgentName: agentName,
+		}), nil
+	case ProtocolPiRPC:
+		return pi.NewImporter(pi.ImporterOptions{
 			AgentName: agentName,
 		}), nil
 	case ProtocolACP:
