@@ -21,6 +21,23 @@ func (f fakeBridgeClient) ListSessions(context.Context, string, int) (pisdkbridg
 	return f.data, f.err
 }
 
+type fakeRefreshBridge struct {
+	listCalls    int
+	refreshCalls int
+	listData     pisdkbridge.ListSessionsData
+	refreshData  pisdkbridge.ListSessionsData
+}
+
+func (f *fakeRefreshBridge) ListSessions(context.Context, string, int) (pisdkbridge.ListSessionsData, error) {
+	f.listCalls++
+	return f.listData, nil
+}
+
+func (f *fakeRefreshBridge) RefreshSessions(context.Context, string, int) (pisdkbridge.ListSessionsData, error) {
+	f.refreshCalls++
+	return f.refreshData, nil
+}
+
 func TestImporterListExternalSessionsUsesSafeSDKMetadata(t *testing.T) {
 	bridge := fakeBridgeClient{data: pisdkbridge.ListSessionsData{Sessions: []pisdkbridge.SessionSummary{
 		{ID: "sid-1", Cwd: "/root/mindfs", Name: "  Safe\nTitle  ", Modified: "2026-06-09T04:05:06Z", Created: "2026-06-09T01:02:03Z", HasFirstMessage: true, EntryCount: 4},
@@ -43,6 +60,24 @@ func TestImporterListExternalSessionsUsesSafeSDKMetadata(t *testing.T) {
 	}
 	if item.UpdatedAt.Format(time.RFC3339) != "2026-06-09T04:05:06Z" {
 		t.Fatalf("unexpected updated time: %s", item.UpdatedAt.Format(time.RFC3339))
+	}
+}
+
+func TestImporterListExternalSessionsRefreshUsesBridgeRefresher(t *testing.T) {
+	bridge := &fakeRefreshBridge{
+		listData:    pisdkbridge.ListSessionsData{Sessions: []pisdkbridge.SessionSummary{{ID: "cached", Cwd: "/root/mindfs", Name: "cached", Modified: "2026-06-09T04:05:06Z"}}},
+		refreshData: pisdkbridge.ListSessionsData{Sessions: []pisdkbridge.SessionSummary{{ID: "fresh", Cwd: "/root/mindfs", Name: "fresh", Modified: "2026-06-09T04:05:07Z"}}},
+	}
+	importer := NewImporter(ImporterOptions{AgentName: "pi", Bridge: bridge})
+	result, err := importer.ListExternalSessions(context.Background(), agenttypes.ListExternalSessionsInput{RootPath: "/root/mindfs", Limit: 10, Refresh: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bridge.refreshCalls != 1 || bridge.listCalls != 0 {
+		t.Fatalf("expected refresh call only, list=%d refresh=%d", bridge.listCalls, bridge.refreshCalls)
+	}
+	if len(result.Items) != 1 || result.Items[0].AgentSessionID != "fresh" {
+		t.Fatalf("expected refreshed item, got %+v", result.Items)
 	}
 }
 

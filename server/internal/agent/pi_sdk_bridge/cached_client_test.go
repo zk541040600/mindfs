@@ -48,6 +48,47 @@ JSON
 	}
 }
 
+func TestCachedClientRefreshBypassesFreshCache(t *testing.T) {
+	dir := t.TempDir()
+	probe := filepath.Join(dir, "probe.mjs")
+	writeFile(t, probe, "// fake\n", 0o644)
+	countFile := filepath.Join(dir, "count")
+
+	node := filepath.Join(dir, "fake-node")
+	writeFile(t, node, `#!/bin/sh
+count_file="`+countFile+`"
+if [ -f "$count_file" ]; then
+  count=$(cat "$count_file")
+else
+  count=0
+fi
+count=$((count + 1))
+echo "$count" > "$count_file"
+cat <<JSON
+{"type":"response","command":"list-sessions","success":true,"data":{"count":1,"returned":1,"sessions":[{"id":"sid-$count","cwd":"/root/mindfs","name":"call $count"}]}}
+JSON
+`, 0o755)
+
+	client := NewClient(ClientOptions{NodeCommand: node, ProbePath: probe, Timeout: time.Second})
+	cached := NewCachedClient(client, 60*time.Second)
+
+	first, err := cached.ListSessions(context.Background(), "/root/mindfs", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cachedHit, err := cached.ListSessions(context.Background(), "/root/mindfs", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	refreshed, err := cached.RefreshSessions(context.Background(), "/root/mindfs", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Sessions[0].ID != "sid-1" || cachedHit.Sessions[0].ID != "sid-1" || refreshed.Sessions[0].ID != "sid-2" {
+		t.Fatalf("expected refresh to bypass fresh cache, first=%+v cached=%+v refreshed=%+v", first, cachedHit, refreshed)
+	}
+}
+
 func TestCachedClientBridgeFailsClosedNoCache(t *testing.T) {
 	dir := t.TempDir()
 	probe := filepath.Join(dir, "probe.mjs")

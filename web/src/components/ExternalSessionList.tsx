@@ -1,6 +1,18 @@
 import React from "react";
 import type { SessionItem } from "./SessionList";
 
+type SDKStatus = {
+  enabled: boolean;
+  agent: string;
+  available: boolean;
+  last_latency_ms?: number;
+  last_error?: string;
+  last_checked_at?: string;
+  cache_entries?: number;
+  ttl_ms?: number;
+  capabilities?: string[];
+};
+
 type ExternalSessionListProps = {
   sessions: SessionItem[];
   selectedKey?: string;
@@ -10,13 +22,17 @@ type ExternalSessionListProps = {
   selectedImportKeys?: Set<string>;
   filterBound?: boolean;
   headerAction?: React.ReactNode;
+  sdkStatus?: SDKStatus | null;
+  sdkStatusLoading?: boolean;
   onBack?: () => void;
   onSelect?: (session: SessionItem) => void;
   onToggleImport?: (session: SessionItem) => void;
   onConfirmImport?: () => void;
   onLoadOlder?: () => void;
+  onRefresh?: () => void;
   loading?: boolean;
   loadingOlder?: boolean;
+  sdkRefreshing?: boolean;
   confirmingImport?: boolean;
   hasMore?: boolean;
 };
@@ -30,13 +46,17 @@ export function ExternalSessionList({
   selectedImportKeys,
   filterBound = true,
   headerAction,
+  sdkStatus,
+  sdkStatusLoading = false,
   onBack,
   onSelect,
   onToggleImport,
   onConfirmImport,
   onLoadOlder,
+  onRefresh,
   loading = false,
   loadingOlder = false,
+  sdkRefreshing = false,
   confirmingImport = false,
   hasMore = false,
 }: ExternalSessionListProps) {
@@ -79,6 +99,16 @@ export function ExternalSessionList({
           </div>
         ) : null}
       </div>
+
+      {selectedAgent === "pi" ? (
+        <SDKStatusBar
+          status={sdkStatus}
+          loading={sdkStatusLoading}
+          refreshing={sdkRefreshing}
+          disabled={busy || loading}
+          onRefresh={onRefresh}
+        />
+      ) : null}
 
       <div style={{ flex: 1, minHeight: 0, overflow: "auto", padding: "8px" }}>
         {loading ? (
@@ -164,6 +194,122 @@ export function ExternalSessionList({
             {busy ? "导入中..." : `确认导入 ${selectedCount} 项`}
           </button>
         </div>
+      ) : null}
+    </div>
+  );
+}
+
+function SDKStatusBar({
+  status,
+  loading,
+  refreshing,
+  disabled,
+  onRefresh,
+}: {
+  status?: SDKStatus | null;
+  loading: boolean;
+  refreshing: boolean;
+  disabled: boolean;
+  onRefresh?: () => void;
+}) {
+  const enabled = Boolean(status?.enabled);
+  const checked = status?.last_checked_at && !status.last_checked_at.startsWith("0001-");
+  const label = loading
+    ? "SDK 状态加载中"
+    : !enabled
+      ? "SDK 未启用"
+      : status?.available
+        ? "SDK 可用"
+        : checked
+          ? "SDK 不可用"
+          : "SDK 未检查";
+  const meta: string[] = [];
+  if (typeof status?.last_latency_ms === "number" && status.last_latency_ms > 0) {
+    meta.push(`${status.last_latency_ms}ms`);
+  }
+  if (typeof status?.cache_entries === "number") {
+    meta.push(`缓存 ${status.cache_entries}`);
+  }
+  if (typeof status?.ttl_ms === "number" && status.ttl_ms > 0) {
+    meta.push(`TTL ${Math.round(status.ttl_ms / 1000)}s`);
+  }
+  const dotColor = status?.available
+    ? "#10b981"
+    : checked
+      ? "#f59e0b"
+      : "var(--text-muted)";
+  return (
+    <div
+      style={{
+        flexShrink: 0,
+        display: "flex",
+        alignItems: "center",
+        gap: "8px",
+        padding: "7px 10px",
+        borderBottom: "1px solid var(--border-color)",
+        background: "var(--mindfs-topbar-bg, transparent)",
+      }}
+    >
+      <span
+        aria-hidden="true"
+        style={{
+          width: "7px",
+          height: "7px",
+          borderRadius: "50%",
+          background: dotColor,
+          flexShrink: 0,
+        }}
+      />
+      <div style={{ minWidth: 0, flex: 1 }}>
+        <div
+          style={{
+            color: "var(--text-primary)",
+            fontSize: "11px",
+            fontWeight: 700,
+            whiteSpace: "nowrap",
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+          }}
+          title={status?.last_error || label}
+        >
+          {label}
+          {meta.length ? ` · ${meta.join(" · ")}` : ""}
+        </div>
+        {status?.last_error ? (
+          <div
+            style={{
+              color: "var(--text-secondary)",
+              fontSize: "10px",
+              whiteSpace: "nowrap",
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              marginTop: "2px",
+            }}
+            title={status.last_error}
+          >
+            {status.last_error}
+          </div>
+        ) : null}
+      </div>
+      {onRefresh ? (
+        <button
+          type="button"
+          disabled={disabled || refreshing}
+          onClick={onRefresh}
+          style={{
+            border: "1px solid var(--border-color)",
+            background: "transparent",
+            color: "var(--text-secondary)",
+            borderRadius: "8px",
+            padding: "5px 8px",
+            fontSize: "11px",
+            cursor: disabled || refreshing ? "not-allowed" : "pointer",
+            opacity: disabled || refreshing ? 0.65 : 1,
+            whiteSpace: "nowrap",
+          }}
+        >
+          {refreshing ? "刷新中" : "刷新"}
+        </button>
       ) : null}
     </div>
   );

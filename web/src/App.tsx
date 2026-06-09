@@ -18,6 +18,7 @@ import {
   type Session,
   type ExtensionUIRequest,
   type ExtensionUIResponse,
+  type AgentSDKStatus,
 } from "./services/session";
 import { buildClientContext } from "./services/context";
 import { e2eeService, type E2EEState } from "./services/e2ee";
@@ -1086,6 +1087,10 @@ export function App({ onGoHome }: AppProps) {
   const [externalSelectedKey, setExternalSelectedKey] = useState("");
   const [externalImportAgent, setExternalImportAgent] = useState("");
   const [externalFilterBound, setExternalFilterBound] = useState(true);
+  const [externalSDKStatus, setExternalSDKStatus] =
+    useState<AgentSDKStatus | null>(null);
+  const [externalSDKStatusLoading, setExternalSDKStatusLoading] =
+    useState(false);
   const [selectedExternalImportKeys, setSelectedExternalImportKeys] = useState<
     Set<string>
   >(() => new Set());
@@ -3546,11 +3551,31 @@ export function App({ onGoHome }: AppProps) {
     handleSelectSessionRef.current = handleSelectSession;
   }, [handleSelectSession]);
 
+  const loadExternalSDKStatus = useCallback(async (agent: string) => {
+    const trimmedAgent = String(agent || "").trim();
+    if (trimmedAgent !== "pi") {
+      setExternalSDKStatus(null);
+      setExternalSDKStatusLoading(false);
+      return;
+    }
+    setExternalSDKStatusLoading(true);
+    try {
+      setExternalSDKStatus(await sessionService.fetchAgentSDKStatus(trimmedAgent));
+    } finally {
+      setExternalSDKStatusLoading(false);
+    }
+  }, []);
+
   const loadExternalSessions = useCallback(
     async (
       rootID: string,
       agent: string,
-      options?: { beforeTime?: string; afterTime?: string; replace?: boolean },
+      options?: {
+        beforeTime?: string;
+        afterTime?: string;
+        replace?: boolean;
+        refresh?: boolean;
+      },
     ) => {
       if (!rootID || !agent) {
         setExternalSessions([]);
@@ -3569,6 +3594,7 @@ export function App({ onGoHome }: AppProps) {
             afterTime: options?.afterTime,
             filterBound: externalFilterBound,
             limit: 50,
+            refresh: options?.refresh,
           },
         )) as SessionItem[];
         setHasMoreExternalSessions(next.length >= 50);
@@ -3589,6 +3615,8 @@ export function App({ onGoHome }: AppProps) {
     setExternalSelectedKey("");
     setSelectedExternalImportKeys(new Set());
     setImportingExternalSessionKeys(new Set());
+    setExternalSDKStatus(null);
+    setExternalSDKStatusLoading(false);
     setImportMenuOpen(false);
   }, []);
 
@@ -3605,9 +3633,27 @@ export function App({ onGoHome }: AppProps) {
       setImportingExternalSessionKeys(new Set());
       setSessionListMode("import");
       await loadExternalSessions(rootID, trimmedAgent, { replace: true });
+      await loadExternalSDKStatus(trimmedAgent);
     },
-    [loadExternalSessions],
+    [loadExternalSDKStatus, loadExternalSessions],
   );
+
+  const handleRefreshExternalSessions = useCallback(async () => {
+    const rootID = currentRootIdRef.current || "";
+    if (!rootID || !externalImportAgent || loadingExternalSessions) {
+      return;
+    }
+    await loadExternalSessions(rootID, externalImportAgent, {
+      replace: true,
+      refresh: true,
+    });
+    await loadExternalSDKStatus(externalImportAgent);
+  }, [
+    externalImportAgent,
+    loadExternalSDKStatus,
+    loadExternalSessions,
+    loadingExternalSessions,
+  ]);
 
   const handleLoadOlderExternalSessions = useCallback(async () => {
     const rootID = currentRootIdRef.current || "";
@@ -5792,10 +5838,12 @@ export function App({ onGoHome }: AppProps) {
     if (!rootID || !externalImportAgent) return;
     setSelectedExternalImportKeys(new Set());
     void loadExternalSessions(rootID, externalImportAgent, { replace: true });
+    void loadExternalSDKStatus(externalImportAgent);
   }, [
     sessionListMode,
     externalImportAgent,
     externalFilterBound,
+    loadExternalSDKStatus,
     loadExternalSessions,
   ]);
 
@@ -8317,8 +8365,11 @@ export function App({ onGoHome }: AppProps) {
         selectedImportKeys={selectedExternalImportKeys}
         filterBound={externalFilterBound}
         headerAction={sessionImportMenu}
+        sdkStatus={externalSDKStatus}
+        sdkStatusLoading={externalSDKStatusLoading}
         loading={loadingExternalSessions}
         loadingOlder={loadingOlderExternalSessions}
+        sdkRefreshing={loadingExternalSessions}
         confirmingImport={confirmingExternalImport}
         hasMore={hasMoreExternalSessions}
         onBack={exitImportMode}
@@ -8333,6 +8384,9 @@ export function App({ onGoHome }: AppProps) {
         }}
         onLoadOlder={() => {
           void handleLoadOlderExternalSessions();
+        }}
+        onRefresh={() => {
+          void handleRefreshExternalSessions();
         }}
       />
     ) : (

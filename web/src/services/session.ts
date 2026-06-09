@@ -219,6 +219,19 @@ export type FetchExternalSessionsOptions = {
   afterTime?: string;
   filterBound?: boolean;
   limit?: number;
+  refresh?: boolean;
+};
+
+export type AgentSDKStatus = {
+  enabled: boolean;
+  agent: string;
+  available: boolean;
+  last_latency_ms?: number;
+  last_error?: string;
+  last_checked_at?: string;
+  cache_entries?: number;
+  ttl_ms?: number;
+  capabilities?: string[];
 };
 
 type PendingMessage = {
@@ -952,11 +965,29 @@ class SessionService {
       if (typeof options?.limit === "number" && options.limit > 0) {
         params.set("limit", String(options.limit));
       }
+      if (options?.refresh) {
+        params.set("refresh", "true");
+      }
       const data = await protectedJSON<any[]>(appURL("/api/sessions/external", params));
       return Array.isArray(data) ? data : [];
     } catch (err) {
       console.error("[Session] Failed to fetch external sessions:", err);
       return [];
+    }
+  }
+
+  async fetchAgentSDKStatus(agent: string): Promise<AgentSDKStatus | null> {
+    try {
+      const trimmed = String(agent || "").trim();
+      if (!trimmed) {
+        return null;
+      }
+      return await protectedJSON<AgentSDKStatus>(
+        appURL(`/api/agents/${encodeURIComponent(trimmed)}/sdk-status`),
+      );
+    } catch (err) {
+      console.error("[Session] Failed to fetch agent SDK status:", err);
+      return null;
     }
   }
 

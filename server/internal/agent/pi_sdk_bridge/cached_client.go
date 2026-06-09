@@ -31,7 +31,13 @@ func (cc *CachedClient) ListSessions(ctx context.Context, cwd string, limit int)
 	if entry := cc.cache.Get(cwd, limit); entry != nil && entry.IsFresh(cc.cache.ttl) {
 		return entry.Data, nil
 	}
+	return cc.RefreshSessions(ctx, cwd, limit)
+}
 
+// RefreshSessions bypasses fresh cache and invokes the bridge. On failure it
+// still returns stale safe data when available, and otherwise fails closed with
+// an empty result.
+func (cc *CachedClient) RefreshSessions(ctx context.Context, cwd string, limit int) (ListSessionsData, error) {
 	start := time.Now()
 	data, err := cc.client.ListSessions(ctx, cwd, limit)
 	latency := time.Since(start)

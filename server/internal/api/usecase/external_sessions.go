@@ -20,6 +20,7 @@ type ListExternalSessionsInput struct {
 	AfterTime   time.Time
 	Limit       int
 	FilterBound bool
+	Refresh     bool
 }
 
 type ListExternalSessionsOutput struct {
@@ -125,6 +126,7 @@ func (s *Service) ListExternalSessions(ctx context.Context, in ListExternalSessi
 			AfterTime:   in.AfterTime,
 			Limit:       limit,
 			FilterBound: false,
+			Refresh:     in.Refresh,
 		}, visit)
 		if err != nil {
 			return ListExternalSessionsOutput{}, err
@@ -138,6 +140,7 @@ func (s *Service) ListExternalSessions(ctx context.Context, in ListExternalSessi
 		AfterTime:   in.AfterTime,
 		Limit:       limit,
 		FilterBound: false,
+		Refresh:     in.Refresh,
 	})
 	if err != nil {
 		return ListExternalSessionsOutput{}, err

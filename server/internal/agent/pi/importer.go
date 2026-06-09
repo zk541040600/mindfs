@@ -20,6 +20,10 @@ type BridgeClient interface {
 	ListSessions(ctx context.Context, cwd string, limit int) (pisdkbridge.ListSessionsData, error)
 }
 
+type BridgeRefresher interface {
+	RefreshSessions(ctx context.Context, cwd string, limit int) (pisdkbridge.ListSessionsData, error)
+}
+
 // BridgeCacher is an optional interface that BridgeClient implementations may
 // satisfy to expose SDK bridge cache/status metadata.
 type BridgeCacher interface {
@@ -66,7 +70,17 @@ func (i *Importer) ListExternalSessions(ctx context.Context, in agenttypes.ListE
 	if strings.TrimSpace(in.RootPath) == "" || i.bridge == nil {
 		return agenttypes.ListExternalSessionsResult{}, nil
 	}
-	data, err := i.bridge.ListSessions(ctx, in.RootPath, limit)
+	var data pisdkbridge.ListSessionsData
+	var err error
+	if in.Refresh {
+		if refresher, ok := i.bridge.(BridgeRefresher); ok {
+			data, err = refresher.RefreshSessions(ctx, in.RootPath, limit)
+		} else {
+			data, err = i.bridge.ListSessions(ctx, in.RootPath, limit)
+		}
+	} else {
+		data, err = i.bridge.ListSessions(ctx, in.RootPath, limit)
+	}
 	if err != nil {
 		// External Pi SDK metadata is auxiliary. Discovery must fail closed and
 		// never make the production pi-rpc runtime unavailable.

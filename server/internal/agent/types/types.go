@@ -100,6 +100,7 @@ type ListExternalSessionsInput struct {
 	AfterTime   time.Time
 	Limit       int
 	FilterBound bool
+	Refresh     bool
 }
 
 type ListExternalSessionsResult struct {

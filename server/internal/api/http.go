@@ -456,6 +456,11 @@ func (h *HTTPHandler) handleExternalSessionsList(w http.ResponseWriter, r *http.
 	case "1", "true", "TRUE", "True":
 		filterBound = true
 	}
+	refresh := false
+	switch strings.TrimSpace(r.URL.Query().Get("refresh")) {
+	case "1", "true", "TRUE", "True":
+		refresh = true
+	}
 	uc := h.service()
 	out, err := uc.ListExternalSessions(r.Context(), usecase.ListExternalSessionsInput{
 		RootID:      rootID,
@@ -464,6 +469,7 @@ func (h *HTTPHandler) handleExternalSessionsList(w http.ResponseWriter, r *http.
 		AfterTime:   afterTime,
 		Limit:       limit,
 		FilterBound: filterBound,
+		Refresh:     refresh,
 	})
 	if err != nil {
 		respondError(w, http.StatusBadRequest, err)
