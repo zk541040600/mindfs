@@ -226,8 +226,13 @@
     },
     {
       "name": "pi",
-      "command": "pi-acp",
-      "protocol": "acp",
+      "command": "pi",
+      "protocol": "pi-rpc",
+      "args": [
+        "--mode",
+        "rpc",
+        "--no-session"
+      ],
       "configBackup": {}
     },
     {

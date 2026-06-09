@@ -10,6 +10,7 @@ import (
 	"mindfs/server/internal/agent/acp"
 	"mindfs/server/internal/agent/claude"
 	"mindfs/server/internal/agent/codex"
+	"mindfs/server/internal/agent/pi"
 	agenttypes "mindfs/server/internal/agent/types"
 )
 
@@ -24,6 +25,7 @@ type Pool struct {
 	acp        *acp.Runtime
 	claude     *claude.Runtime
 	codex      *codex.Runtime
+	pi         *pi.Runtime
 }
 
 type sessionEntry struct {
@@ -44,6 +46,7 @@ func NewPool(cfg Config) *Pool {
 		acp:        acp.NewRuntime(processCtx),
 		claude:     claude.NewRuntime(),
 		codex:      codex.NewRuntime(),
+		pi:         pi.NewRuntime(),
 	}
 }
 
@@ -132,6 +135,18 @@ func (p *Pool) openSession(ctx context.Context, protocol Protocol, def Definitio
 			Env:             cloneEnv(def.Env),
 			ResumeSessionID: in.AgentSessionID,
 		})
+	case ProtocolPiRPC:
+		return p.pi.OpenSession(ctx, pi.OpenOptions{
+			AgentName:       in.AgentName,
+			SessionKey:      in.SessionKey,
+			Model:           in.Model,
+			Mode:            in.Mode,
+			RootPath:        in.RootPath,
+			Command:         def.Command,
+			Args:            def.BuildArgs(in.RootPath),
+			Env:             cloneEnv(def.Env),
+			ResumeSessionID: in.AgentSessionID,
+		})
 	case ProtocolACP:
 		fallthrough
 	default:
@@ -170,6 +185,11 @@ func (p *Pool) KillAgentProcess(agentName string, wait time.Duration) (string, b
 		p.closeSessionsForAgent(agentName, ProtocolCodexSDK)
 		_ = p.codex.Close(agentName)
 		log.Printf("[agent/pool] kill_agent_process.codex_closed agent=%s", agentName)
+		return "", true
+	case ProtocolPiRPC:
+		p.closeSessionsForAgent(agentName, ProtocolPiRPC)
+		_ = p.pi.Close(agentName)
+		log.Printf("[agent/pool] kill_agent_process.pi_rpc_closed agent=%s", agentName)
 		return "", true
 	case ProtocolACP:
 		p.closeSessionsForAgent(agentName, ProtocolACP)
@@ -298,6 +318,7 @@ func (p *Pool) CloseAll() {
 	acpRuntime := p.acp
 	claudeRuntime := p.claude
 	codexRuntime := p.codex
+	piRuntime := p.pi
 	p.mu.Unlock()
 
 	if cancel != nil {
@@ -311,5 +332,8 @@ func (p *Pool) CloseAll() {
 	}
 	if codexRuntime != nil {
 		codexRuntime.CloseAll()
+	}
+	if piRuntime != nil {
+		piRuntime.CloseAll()
 	}
 }

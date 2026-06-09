@@ -11,6 +11,8 @@ const (
 	ProtocolClaudeSDK Protocol = "claude-sdk"
 	// ProtocolCodexSDK uses codex-go-sdk app-server transport.
 	ProtocolCodexSDK Protocol = "codex-sdk"
+	// ProtocolPiRPC uses pi JSON-RPC mode over stdio.
+	ProtocolPiRPC Protocol = "pi-rpc"
 )
 
 // DefaultProtocol returns the default protocol for agents.
@@ -20,6 +22,9 @@ func DefaultProtocol(agentName string) Protocol {
 	}
 	if agentName == "codex" {
 		return ProtocolCodexSDK
+	}
+	if agentName == "pi" {
+		return ProtocolPiRPC
 	}
 	return ProtocolACP
 }
