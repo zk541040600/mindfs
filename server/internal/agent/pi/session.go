@@ -976,7 +976,11 @@ func (s *session) ListModels(ctx context.Context) (agenttypes.ModelList, error) 
 		if item.Provider != "" && !strings.HasPrefix(strings.ToLower(name), strings.ToLower(item.Provider)+"/") {
 			name = item.Provider + "/" + name
 		}
-		models = append(models, agenttypes.ModelInfo{ID: id, Name: name, SupportEffort: item.Reasoning || len(item.ThinkingLevel) > 0})
+		// Pi exposes reasoning control through ListModes/SetMode because the RPC API
+		// names the operation set_thinking_level. Do not also mark models as
+		// SupportEffort, otherwise MindFS shows duplicate "模式" and "思考等级"
+		// selectors that both represent the same Pi thinking level.
+		models = append(models, agenttypes.ModelInfo{ID: id, Name: name})
 	}
 	current := s.CurrentModel()
 	if current == "" {
