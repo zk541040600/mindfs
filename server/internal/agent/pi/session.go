@@ -24,6 +24,11 @@ const (
 	startupStateTimeout   = 30 * time.Second
 )
 
+var (
+	extensionOnlyProbeInterval  = 1500 * time.Millisecond
+	extensionOnlyFallbackPeriod = 6 * time.Second
+)
+
 type OpenOptions struct {
 	AgentName       string
 	SessionKey      string
@@ -36,11 +41,38 @@ type OpenOptions struct {
 	ResumeSessionID string
 }
 
-type Runtime struct{}
+type Runtime struct {
+	mu       sync.Mutex
+	sessions map[*session]struct{}
+}
 
-func NewRuntime() *Runtime { return &Runtime{} }
+func NewRuntime() *Runtime {
+	return &Runtime{sessions: make(map[*session]struct{})}
+}
+
+func (r *Runtime) register(s *session) {
+	if r == nil || s == nil {
+		return
+	}
+	r.mu.Lock()
+	r.sessions[s] = struct{}{}
+	r.mu.Unlock()
+}
+
+func (r *Runtime) unregister(s *session) {
+	if r == nil || s == nil {
+		return
+	}
+	r.mu.Lock()
+	delete(r.sessions, s)
+	r.mu.Unlock()
+}
 
 func (r *Runtime) OpenSession(ctx context.Context, opts OpenOptions) (agenttypes.Session, error) {
+	return r.openSession(ctx, opts, 2)
+}
+
+func (r *Runtime) openSession(ctx context.Context, opts OpenOptions, attempts int) (agenttypes.Session, error) {
 	if strings.TrimSpace(opts.SessionKey) == "" {
 		return nil, errors.New("session key required")
 	}
@@ -75,40 +107,107 @@ func (r *Runtime) OpenSession(ctx context.Context, opts OpenOptions) (agenttypes
 	}
 
 	s := &session{
+		runtime:    r,
 		cmd:        cmd,
 		stdin:      stdin,
 		sessionKey: strings.TrimSpace(opts.SessionKey),
 		agentName:  strings.TrimSpace(opts.AgentName),
+		starting:   true,
 		model:      normalizeModelID(strings.TrimSpace(opts.Model)),
 		mode:       strings.TrimSpace(opts.Mode),
 		pending:    make(map[string]chan rpcResponse),
 		turnDone:   make(chan error, 1),
 		closed:     make(chan struct{}),
 	}
+	r.register(s)
 	go s.readLoop(stdout)
 	go s.stderrLoop(stderr)
 	go s.waitLoop()
 
 	stateCtx, cancel := context.WithTimeout(ctx, startupStateTimeout)
-	defer cancel()
-	if err := s.refreshState(stateCtx); err != nil {
-		log.Printf("[agent/pi-rpc] startup_state.error session=%s err=%v", s.sessionKey, err)
+	stateErr := s.refreshState(stateCtx)
+	cancel()
+	if stateErr != nil && isStartupExitError(stateErr) {
+		_ = s.Close()
+		if attempts > 1 && ctx.Err() == nil {
+			time.Sleep(300 * time.Millisecond)
+			return r.openSession(ctx, opts, attempts-1)
+		}
+		log.Printf("[agent/pi-rpc] startup_state.error session=%s err=%v", s.sessionKey, stateErr)
+		return nil, stateErr
+	}
+	if stateErr != nil {
+		log.Printf("[agent/pi-rpc] startup_state.warn session=%s err=%v", s.sessionKey, stateErr)
 	}
 	if model := normalizeModelID(strings.TrimSpace(opts.Model)); model != "" {
-		_ = s.SetModel(ctx, model)
+		if err := s.SetModel(ctx, model); err != nil && s.isClosed() {
+			_ = s.Close()
+			if attempts > 1 && ctx.Err() == nil {
+				time.Sleep(300 * time.Millisecond)
+				return r.openSession(ctx, opts, attempts-1)
+			}
+			return nil, err
+		}
 	}
 	if mode := strings.TrimSpace(opts.Mode); mode != "" {
-		_ = s.SetMode(ctx, mode)
+		if err := s.SetMode(ctx, mode); err != nil && s.isClosed() {
+			_ = s.Close()
+			if attempts > 1 && ctx.Err() == nil {
+				time.Sleep(300 * time.Millisecond)
+				return r.openSession(ctx, opts, attempts-1)
+			}
+			return nil, err
+		}
 	}
+	if s.isClosed() {
+		if attempts > 1 && ctx.Err() == nil {
+			time.Sleep(300 * time.Millisecond)
+			return r.openSession(ctx, opts, attempts-1)
+		}
+		return nil, errors.New("pi rpc process exited during startup")
+	}
+	s.markStartupComplete()
 	return s, nil
 }
 
-func (r *Runtime) CloseAll()          {}
-func (r *Runtime) Close(string) error { return nil }
+func (r *Runtime) CloseAll() {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	sessions := make([]*session, 0, len(r.sessions))
+	for s := range r.sessions {
+		sessions = append(sessions, s)
+	}
+	r.mu.Unlock()
+	for _, s := range sessions {
+		_ = s.Close()
+	}
+}
+
+func (r *Runtime) Close(agentName string) error {
+	if r == nil {
+		return nil
+	}
+	agentName = strings.TrimSpace(agentName)
+	r.mu.Lock()
+	sessions := make([]*session, 0, len(r.sessions))
+	for s := range r.sessions {
+		if agentName == "" || strings.TrimSpace(s.agentName) == agentName {
+			sessions = append(sessions, s)
+		}
+	}
+	r.mu.Unlock()
+	for _, s := range sessions {
+		_ = s.Close()
+	}
+	return nil
+}
 
 type session struct {
-	cmd   *exec.Cmd
-	stdin io.WriteCloser
+	runtime *Runtime
+	cmd     *exec.Cmd
+	stdin   io.WriteCloser
 
 	sessionKey string
 	agentName  string
@@ -127,6 +226,7 @@ type session struct {
 	seenTextDelta      bool
 	seenThinkingDelta  bool
 	lastAssistantErr   string
+	starting           bool
 	activePromptID     string
 	activePromptSlash  bool
 	promptNotifySeen   bool
@@ -173,6 +273,21 @@ func ensureRPCArgs(args []string) []string {
 		out = append(out, "--no-session")
 	}
 	return out
+}
+
+func isStartupExitError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, os.ErrClosed) {
+		return true
+	}
+	value := strings.ToLower(strings.TrimSpace(err.Error()))
+	return strings.Contains(value, "closed") ||
+		strings.Contains(value, "broken pipe") ||
+		strings.Contains(value, "process exited") ||
+		strings.Contains(value, "file already closed") ||
+		strings.Contains(value, "eof")
 }
 
 func hasNoSessionArg(args []string) bool {
@@ -229,7 +344,8 @@ func (s *session) request(ctx context.Context, prefix string, payload map[string
 
 	if prefix == "prompt" {
 		defer s.clearActivePromptID(id)
-		probe := time.NewTimer(1500 * time.Millisecond)
+		promptStartedAt := time.Now()
+		probe := time.NewTimer(extensionOnlyProbeInterval)
 		defer probe.Stop()
 		for {
 			select {
@@ -243,11 +359,11 @@ func (s *session) request(ctx context.Context, prefix string, payload map[string
 				return resp, nil
 			case <-probe.C:
 				activeSlash, notifySeen, agentStarted := s.promptState()
-				if activeSlash && notifySeen && !agentStarted {
+				if activeSlash && !agentStarted && (notifySeen || time.Since(promptStartedAt) >= extensionOnlyFallbackPeriod) {
 					s.deletePending(id)
 					return rpcResponse{ID: id, Type: "response", Command: "prompt", Success: true}, nil
 				}
-				probe.Reset(1500 * time.Millisecond)
+				probe.Reset(extensionOnlyProbeInterval)
 			case <-ctx.Done():
 				s.deletePending(id)
 				return rpcResponse{}, ctx.Err()
@@ -326,13 +442,32 @@ func (s *session) stderrLoop(stderr io.Reader) {
 }
 
 func (s *session) waitLoop() {
+	defer s.unregisterRuntime()
 	err := s.cmd.Wait()
-	if err != nil && !s.isClosed() {
+	if err != nil && !s.isClosed() && !s.isStarting() {
 		log.Printf("[agent/pi-rpc] process.exit session=%s err=%v", s.sessionKey, err)
 	}
 	s.closeOnce.Do(func() { close(s.closed) })
 	s.failPending(err)
 	s.signalTurnDone(err)
+}
+
+func (s *session) unregisterRuntime() {
+	if s != nil && s.runtime != nil {
+		s.runtime.unregister(s)
+	}
+}
+
+func (s *session) markStartupComplete() {
+	s.mu.Lock()
+	s.starting = false
+	s.mu.Unlock()
+}
+
+func (s *session) isStarting() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.starting
 }
 
 func (s *session) isClosed() bool {
@@ -518,7 +653,7 @@ func (s *session) finishExtensionOnlyPromptIfIdle(ctx context.Context, content s
 	if !strings.HasPrefix(strings.TrimSpace(content), "/") {
 		return
 	}
-	timer := time.NewTimer(1500 * time.Millisecond)
+	timer := time.NewTimer(extensionOnlyProbeInterval)
 	defer timer.Stop()
 	select {
 	case <-timer.C:
@@ -527,9 +662,14 @@ func (s *session) finishExtensionOnlyPromptIfIdle(ctx context.Context, content s
 	case <-s.closed:
 		return
 	}
-	activeSlash, notifySeen, agentStarted := s.promptState()
-	if !activeSlash || !notifySeen || agentStarted {
+	activeSlash, _, agentStarted := s.promptState()
+	if !activeSlash || agentStarted {
 		return
+	}
+	if !s.hasTextDeltaSeen() {
+		fallback := "Command handled: " + strings.TrimSpace(content)
+		s.markTextDeltaSeen()
+		s.emit(agenttypes.Event{Type: agenttypes.EventTypeMessageChunk, SessionID: s.SessionID(), Data: agenttypes.MessageChunk{Content: fallback}})
 	}
 	s.emit(agenttypes.Event{Type: agenttypes.EventTypeMessageDone, SessionID: s.SessionID(), Data: agenttypes.MessageDone{ContextWindow: s.cachedContextWindow()}})
 	s.signalTurnDone(nil)
