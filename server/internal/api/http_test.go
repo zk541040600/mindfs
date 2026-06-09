@@ -23,6 +23,11 @@ func TestPathForStaticAssetCleansURLPaths(t *testing.T) {
 			requestPath: "/",
 			want:        "",
 		},
+		{
+			name:        "relayed asset alias",
+			requestPath: "/mindfs-assets/index-BhhZaySO.js",
+			want:        "assets/index-BhhZaySO.js",
+		},
 	}
 
 	for _, tt := range tests {
@@ -32,5 +37,13 @@ func TestPathForStaticAssetCleansURLPaths(t *testing.T) {
 				t.Fatalf("pathForStaticAsset(%q) = %q, want %q", tt.requestPath, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestRewriteRelayedFrontendContentKeepsRelativeAssets(t *testing.T) {
+	input := `<script type="module" src="./assets/index-app.js"></script>`
+	got := rewriteRelayedFrontendContent(input)
+	if got != input {
+		t.Fatalf("rewriteRelayedFrontendContent() = %q, want %q", got, input)
 	}
 }

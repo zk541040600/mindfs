@@ -1108,7 +1108,7 @@ func shouldRewriteRelayedStaticAsset(cleanPath string) bool {
 }
 
 func rewriteRelayedFrontendContent(content string) string {
-	return strings.ReplaceAll(content, "./assets/", "/mindfs-assets/")
+	return content
 }
 
 func serveRewrittenStaticAsset(w http.ResponseWriter, r *http.Request, assetPath string) {
@@ -1133,7 +1133,11 @@ func pathForStaticAsset(requestPath string) string {
 	if cleaned == "/" {
 		return ""
 	}
-	return strings.TrimPrefix(cleaned, "/")
+	cleaned = strings.TrimPrefix(cleaned, "/")
+	if strings.HasPrefix(cleaned, "mindfs-assets/") {
+		return "assets/" + strings.TrimPrefix(cleaned, "mindfs-assets/")
+	}
+	return cleaned
 }
 
 func (h *HTTPHandler) handleTree(w http.ResponseWriter, r *http.Request) {
