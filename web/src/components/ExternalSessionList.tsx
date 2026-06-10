@@ -191,7 +191,9 @@ export function ExternalSessionList({
               whiteSpace: "nowrap",
             }}
           >
-            {busy ? "导入中..." : `确认导入 ${selectedCount} 项`}
+            {busy
+              ? "导入中..."
+              : `${selectedAgent === "pi" ? "安全导入" : "确认导入"} ${selectedCount} 项`}
           </button>
         </div>
       ) : null}

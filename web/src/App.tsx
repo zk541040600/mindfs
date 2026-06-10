@@ -3707,6 +3707,46 @@ export function App({ onGoHome }: AppProps) {
     ) {
       return;
     }
+    if (externalImportAgent === "pi") {
+      const selectedSummaries = sessionKeys.map((sessionKey, index) => {
+        const source = externalSessionsRef.current.find((item) =>
+          String(item.agent_session_id || item.key || "").trim() === sessionKey,
+        );
+        const title = String(
+          source?.title || source?.name || source?.agent_session_id || sessionKey,
+        ).trim();
+        const dateValue = source?.updated_at || source?.created_at || "";
+        const date = dateValue ? new Date(dateValue) : null;
+        const dateText = date && !Number.isNaN(date.getTime())
+          ? date.toLocaleString("zh-CN", {
+              month: "2-digit",
+              day: "2-digit",
+              hour: "2-digit",
+              minute: "2-digit",
+            })
+          : "";
+        return `${index + 1}. ${title}${dateText ? ` · ${dateText}` : ""}`;
+      });
+      const visible = selectedSummaries.slice(0, 5);
+      const hiddenCount = Math.max(0, selectedSummaries.length - visible.length);
+      const confirmed = window.confirm(
+        [
+          `确认安全导入 ${sessionKeys.length} 个 Pi 会话？`,
+          "",
+          ...visible,
+          hiddenCount ? `...以及另外 ${hiddenCount} 个会话` : "",
+          "",
+          "导入模式：safe_transcript",
+          "只导入经过清洗的用户/助手可见文本。",
+          "不会预览或按原始 blob 导入工具结果、上下文文件、扩展内部载荷、密钥、认证头或环境变量。",
+        ]
+          .filter(Boolean)
+          .join("\n"),
+      );
+      if (!confirmed) {
+        return;
+      }
+    }
     setConfirmingExternalImport(true);
     setImportingExternalSessionKeys(new Set(sessionKeys));
     try {
