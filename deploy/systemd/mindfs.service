@@ -1,0 +1,23 @@
+[Unit]
+Description=MindFS service from /root/mindfs git checkout
+Documentation=file:/root/mindfs/README.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root
+Environment=HOME=/root
+Environment=MINDFS_STATIC_DIR=/root/mindfs/web/dist
+Environment=PATH=/root/.pi/agent/bin:/root/node-v22.22.0-linux-x64/bin:/root/.local/bin:/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+ExecStart=/root/mindfs/mindfs -foreground -addr 10.23.50.137:7331
+Restart=on-failure
+RestartSec=5s
+KillSignal=SIGTERM
+TimeoutStopSec=15s
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

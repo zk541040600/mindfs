@@ -1,0 +1,30 @@
+{
+  "dirs": [
+    {
+      "id": "root",
+      "name": "root",
+      "root_path": "/root",
+      "created_at": "2026-06-08T10:13:06Z",
+      "updated_at": "2026-06-08T10:13:06Z"
+    },
+    {
+      "id": "ge",
+      "name": "ge",
+      "root_path": "/root/work/l2/server/ge",
+      "created_at": "2026-06-08T10:13:06Z",
+      "updated_at": "2026-06-08T10:13:06Z"
+    },
+    {
+      "id": "b_trunk",
+      "name": "b_trunk",
+      "root_path": "/root/work/l2/server/b_trunk",
+      "created_at": "2026-06-08T10:13:06Z",
+      "updated_at": "2026-06-08T10:13:06Z"
+    }
+  ],
+  "order": [
+    "root",
+    "ge",
+    "b_trunk"
+  ]
+}
