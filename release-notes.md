@@ -1,4 +1,4 @@
-# MindFS v0.3.4
+# MindFS v0.3.4-sdk.1
 
 ## 新功能
 - Pi SDK 辅助桥接产品化：安全会话 metadata、SDK 状态、显式刷新、安全 transcript 导入与导入前确认 UI。

@@ -58,6 +58,19 @@ JSON
 	}
 }
 
+func TestProbePathCandidatesIncludeInstalledShareLayout(t *testing.T) {
+	prefix := t.TempDir()
+	exe := filepath.Join(prefix, "bin", "mindfs")
+	got := probePathCandidates("", exe)
+	want := filepath.Join(prefix, "share", "mindfs", "server", "internal", "agent", "pi_sdk_bridge", "probe.mjs")
+	for _, candidate := range got {
+		if candidate == want {
+			return
+		}
+	}
+	t.Fatalf("installed share probe path %q missing from candidates: %#v", want, got)
+}
+
 func TestClientFailsClosedOnBridgeErrorInvalidJSONAndTimeout(t *testing.T) {
 	dir := t.TempDir()
 	probe := filepath.Join(dir, "probe.mjs")

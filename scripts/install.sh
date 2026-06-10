@@ -114,6 +114,16 @@ if [[ -d "${PKG_DIR}/web" ]]; then
   echo "  Web     -> ${WEB_DEST}"
 fi
 
+# ── Install Pi SDK bridge assets (optional) ────────────────────────────────
+BRIDGE_SRC="${PKG_DIR}/server/internal/agent/pi_sdk_bridge"
+if [[ -d "$BRIDGE_SRC" ]]; then
+  BRIDGE_DEST="${PREFIX}/share/mindfs/server/internal/agent/pi_sdk_bridge"
+  mkdir -p "$(dirname "$BRIDGE_DEST")"
+  rm -rf "$BRIDGE_DEST"
+  cp -r "$BRIDGE_SRC" "$BRIDGE_DEST"
+  echo "  Pi SDK  -> ${BRIDGE_DEST}"
+fi
+
 # ── Ensure PATH contains the user bin directory ─────────────────────────────
 ensure_path_entry() {
   local bin_dir="$1"

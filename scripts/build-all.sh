@@ -52,12 +52,20 @@ for PLATFORM in "${PLATFORMS[@]}"; do
       -o "${ROOT}/${TARGET}" \
       ./cli/cmd
 
-  # Bundle web assets (already built) and install scripts
+  # Bundle web assets, default agent config, and Pi SDK bridge assets.
   if [[ -d "${ROOT}/web/dist" ]]; then
     cp -r "${ROOT}/web/dist" "${ROOT}/${OUT_DIR}/web"
   fi
   if [[ -f "${ROOT}/agents.json" ]]; then
     cp "${ROOT}/agents.json" "${ROOT}/${OUT_DIR}/agents.json"
+  fi
+  if [[ -f "${ROOT}/server/internal/agent/pi_sdk_bridge/probe.mjs" ]]; then
+    BRIDGE_OUT="${ROOT}/${OUT_DIR}/server/internal/agent/pi_sdk_bridge"
+    mkdir -p "${BRIDGE_OUT}"
+    cp "${ROOT}/server/internal/agent/pi_sdk_bridge/probe.mjs" "${BRIDGE_OUT}/probe.mjs"
+    if [[ -f "${ROOT}/server/internal/agent/pi_sdk_bridge/README.md" ]]; then
+      cp "${ROOT}/server/internal/agent/pi_sdk_bridge/README.md" "${BRIDGE_OUT}/README.md"
+    fi
   fi
 done
 

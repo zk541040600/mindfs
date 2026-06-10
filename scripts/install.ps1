@@ -148,6 +148,16 @@ try {
         Write-Host "  Web     -> $WebDest"
     }
 
+    # ── Install Pi SDK bridge assets (optional) ─────────────────────────────
+    $BridgeSrc = Join-Path $PkgDir "server\internal\agent\pi_sdk_bridge"
+    if (Test-Path $BridgeSrc -PathType Container) {
+        $BridgeDest = Join-Path $Prefix "share\mindfs\server\internal\agent\pi_sdk_bridge"
+        if (Test-Path $BridgeDest) { Remove-Item -Recurse -Force $BridgeDest }
+        New-Item -ItemType Directory -Force -Path (Split-Path $BridgeDest) | Out-Null
+        Copy-Item -Recurse $BridgeSrc $BridgeDest
+        Write-Host "  Pi SDK  -> $BridgeDest"
+    }
+
     # ── Add to user PATH (if not already present) ────────────────────────────
     $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
     if ($UserPath -notlike "*$BinDir*") {

@@ -461,6 +461,16 @@ func (s *Service) installPackage(pkgDir string) error {
 			return err
 		}
 	}
+	srcBridge := filepath.Join(pkgDir, "server", "internal", "agent", "pi_sdk_bridge")
+	if info, err := os.Stat(srcBridge); err == nil && info.IsDir() {
+		dstBridge := filepath.Join(prefix, "share", "mindfs", "server", "internal", "agent", "pi_sdk_bridge")
+		if err := os.RemoveAll(dstBridge); err != nil {
+			return err
+		}
+		if err := copyDir(srcBridge, dstBridge); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

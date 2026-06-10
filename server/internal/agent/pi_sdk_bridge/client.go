@@ -220,18 +220,11 @@ func (c *Client) resolveProbePath() (string, error) {
 		return requireReadableFile(path)
 	}
 	candidates := []string{}
-	if wd, err := os.Getwd(); err == nil && strings.TrimSpace(wd) != "" {
-		candidates = append(candidates,
-			filepath.Join(wd, "server", "internal", "agent", "pi_sdk_bridge", "probe.mjs"),
-			filepath.Join(wd, "internal", "agent", "pi_sdk_bridge", "probe.mjs"),
-		)
+	if wd, err := os.Getwd(); err == nil {
+		candidates = append(candidates, probePathCandidates(strings.TrimSpace(wd), "")...)
 	}
-	if exe, err := os.Executable(); err == nil && strings.TrimSpace(exe) != "" {
-		dir := filepath.Dir(exe)
-		candidates = append(candidates,
-			filepath.Join(dir, "server", "internal", "agent", "pi_sdk_bridge", "probe.mjs"),
-			filepath.Join(dir, "..", "server", "internal", "agent", "pi_sdk_bridge", "probe.mjs"),
-		)
+	if exe, err := os.Executable(); err == nil {
+		candidates = append(candidates, probePathCandidates("", strings.TrimSpace(exe))...)
 	}
 	for _, candidate := range candidates {
 		if path, err := requireReadableFile(candidate); err == nil {
@@ -239,6 +232,28 @@ func (c *Client) resolveProbePath() (string, error) {
 		}
 	}
 	return "", errors.New("pi sdk bridge probe.mjs not found")
+}
+
+func probePathCandidates(wd, exe string) []string {
+	candidates := []string{}
+	if strings.TrimSpace(wd) != "" {
+		candidates = append(candidates,
+			filepath.Join(wd, "server", "internal", "agent", "pi_sdk_bridge", "probe.mjs"),
+			filepath.Join(wd, "internal", "agent", "pi_sdk_bridge", "probe.mjs"),
+		)
+	}
+	if strings.TrimSpace(exe) != "" {
+		dir := filepath.Dir(exe)
+		prefix := filepath.Dir(dir)
+		candidates = append(candidates,
+			// Source tree or archive-extract layout: probe next to the binary.
+			filepath.Join(dir, "server", "internal", "agent", "pi_sdk_bridge", "probe.mjs"),
+			filepath.Join(dir, "..", "server", "internal", "agent", "pi_sdk_bridge", "probe.mjs"),
+			// Installed layout: <prefix>/bin/mindfs + <prefix>/share/mindfs/...
+			filepath.Join(prefix, "share", "mindfs", "server", "internal", "agent", "pi_sdk_bridge", "probe.mjs"),
+		)
+	}
+	return candidates
 }
 
 func requireReadableFile(path string) (string, error) {
