@@ -1,26 +1,32 @@
 #!/usr/bin/env node
 /**
- * Experimental Pi SDK bridge probe for MindFS.
+ * Pi SDK auxiliary bridge for MindFS.
  *
- * This file is intentionally standalone and reversible. It exercises SDK-only
- * integration seams without changing MindFS' production pi-rpc path.
+ * This bridge is production-wired only for bounded SDK-backed metadata,
+ * status, refresh, deterministic bridge probes, and explicit safe transcript
+ * import. MindFS' interactive Pi runtime intentionally remains the Go
+ * `pi-rpc` path so chat/slash/tool/cancel/retry streaming semantics stay
+ * stable while SDK features are used where they are safer and higher value.
  */
-import {
-  AuthStorage,
-  createAgentSession,
-  createAgentSessionFromServices,
-  createAgentSessionRuntime,
-  createAgentSessionServices,
-  DefaultResourceLoader,
-  ModelRegistry,
-  SessionManager,
-  SettingsManager,
-  VERSION,
-} from "/root/node-v22.22.0-linux-x64/lib/node_modules/@earendil-works/pi-coding-agent/dist/index.js";
+import { execFileSync } from "node:child_process";
+import { existsSync } from "node:fs";
+import { createRequire } from "node:module";
 import { createInterface } from "node:readline";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
+
+let AuthStorage;
+let createAgentSession;
+let createAgentSessionFromServices;
+let createAgentSessionRuntime;
+let createAgentSessionServices;
+let DefaultResourceLoader;
+let ModelRegistry;
+let SessionManager;
+let SettingsManager;
+let VERSION;
 
 const BRIDGE_PROTOCOL_VERSION = 1;
 const DEFAULT_CWD = "/root/mindfs";
@@ -34,6 +40,85 @@ for (const method of ["log", "info", "warn", "error", "debug"]) {
   console[method] = (...args) => process.stderr.write(`${args.map(String).join(" ")}\n`);
 }
 
+async function ensurePiSDK() {
+  if (SessionManager) {
+    return;
+  }
+  const sdk = await loadPiSDK();
+  ({
+    AuthStorage,
+    createAgentSession,
+    createAgentSessionFromServices,
+    createAgentSessionRuntime,
+    createAgentSessionServices,
+    DefaultResourceLoader,
+    ModelRegistry,
+    SessionManager,
+    SettingsManager,
+    VERSION,
+  } = sdk);
+}
+
+async function loadPiSDK() {
+  const packagePath = "@earendil-works/pi-coding-agent/dist/index.js";
+  const candidates = [];
+  addCandidate(candidates, process.env.MINDFS_PI_SDK_MODULE);
+  addCandidate(candidates, process.env.PI_SDK_MODULE_PATH);
+
+  const require = createRequire(import.meta.url);
+  try {
+    addCandidate(candidates, require.resolve(packagePath));
+  } catch {
+    // MindFS does not have to vendor Pi SDK; the global Pi install is a valid deployment source.
+  }
+
+  try {
+    const globalRoot = execFileSync("npm", ["root", "-g"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 2000,
+    }).trim();
+    if (globalRoot) {
+      addCandidate(candidates, join(globalRoot, packagePath));
+    }
+  } catch {
+    // npm may be unavailable in minimal environments; report all attempted candidates below.
+  }
+
+  const errors = [];
+  for (const candidate of candidates) {
+    try {
+      return await import(toImportSpecifier(candidate));
+    } catch (error) {
+      errors.push(`${candidate}: ${error?.message || String(error)}`);
+    }
+  }
+
+  throw new ProbeError(
+    "E_SDK_LOAD",
+    "unable to resolve Pi SDK module; set MINDFS_PI_SDK_MODULE to @earendil-works/pi-coding-agent/dist/index.js or to an absolute dist/index.js path",
+    { candidates, errors },
+  );
+}
+
+function addCandidate(candidates, value) {
+  const candidate = String(value || "").trim();
+  if (!candidate || candidates.includes(candidate)) {
+    return;
+  }
+  candidates.push(candidate);
+}
+
+function toImportSpecifier(candidate) {
+  if (candidate.startsWith("file://") || candidate.startsWith("node:")) {
+    return candidate;
+  }
+  if (candidate.startsWith(".") || candidate.startsWith("/") || existsSync(candidate)) {
+    return pathToFileURL(resolve(candidate)).href;
+  }
+  return candidate;
+}
+
 // Keep the CLI predictable for a Go subprocess caller: every failure is a JSON object.
 async function main() {
   const [command, ...argv] = process.argv.slice(2);
@@ -43,6 +128,8 @@ async function main() {
   }
 
   try {
+    await ensurePiSDK();
+
     if (command === "jsonl") {
       await runJsonl(argv);
       return;
@@ -192,7 +279,7 @@ function buildHelp() {
       "jsonl",
     ],
     notes: [
-      "Experimental probe only; does not modify MindFS agents.json or pi-rpc defaults.",
+      "Production auxiliary bridge; pi-rpc remains the intentional interactive runtime default.",
       "Capability output includes metadata, counts, and paths only; no credential values or context file contents.",
     ],
   };

@@ -1,3 +1,26 @@
+# MindFS v0.3.4
+
+## 新功能
+- Pi SDK 辅助桥接产品化：安全会话 metadata、SDK 状态、显式刷新、安全 transcript 导入与导入前确认 UI。
+- Docker 运行版本跟随当前 latest，避免 `/api/app/update` 对本地构建误报更新。
+
+## 优化和修复
+- Pi SDK bridge 改为环境变量 / 本地模块 / 全局 npm root 解析，不再硬编码主机绝对路径。
+- 明确 Pi 生产交互主链路仍为 `pi-rpc`，SDK 仅用于辅助 metadata/status/import 能力，失败时不影响聊天主链路。
+
+
+# MindFS v0.3.3
+
+## 新功能
+- Pi SDK-backed external session metadata listing。
+- Pi SDK bridge 60s cache、read-only `/api/agents/pi/sdk-status`、`refresh=true` 显式刷新。
+- 显式 `mode: "safe_transcript"` 的 Pi session 安全导入，包含 redaction、限制、warning code 和 fail-closed 行为。
+
+## 优化和修复
+- Pi import UI 展示 SDK 状态与刷新按钮。
+- 保持 `agents.json` 中 Pi 为 `protocol: "pi-rpc"`，普通聊天、slash、tool、extension UI 不切到 SDK。
+
+
 # MindFS v0.3.1
 
 ## 优化和修复
