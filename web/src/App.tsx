@@ -5847,11 +5847,7 @@ export function App({ onGoHome }: AppProps) {
   }, [currentRootId, gitStatus, selectedDir]);
 
   useEffect(() => {
-    if (!currentRootId) {
-      setStatus("disconnected");
-      return;
-    }
-    setStatus("connecting");
+    if (!currentRootId) return;
     sessionService.connect(currentRootId);
   }, [currentRootId]);
 
