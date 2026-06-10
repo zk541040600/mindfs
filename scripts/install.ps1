@@ -8,7 +8,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$Repo = "a9gent/mindfs"
+$Repo = "zk541040600/mindfs"
 $ReleaseNotesUrl = "https://raw.githubusercontent.com/$Repo/main/release-notes.md"
 
 function Add-ToCurrentSessionPath([string]$Dir) {

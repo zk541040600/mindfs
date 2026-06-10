@@ -88,7 +88,7 @@ func Start(ctx context.Context, addr string, opts StartOptions) error {
 		log.Printf("[preferences] init.error err=%v", err)
 	}
 	executable, _ := os.Executable()
-	updateSvc := update.NewService("a9gent/mindfs", opts.Version, executable, opts.Args, 10*time.Minute)
+	updateSvc := update.NewService("zk541040600/mindfs", opts.Version, executable, opts.Args, 10*time.Minute)
 	updateSvc.Start(ctx)
 
 	services := &api.AppContext{

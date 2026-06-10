@@ -109,24 +109,24 @@ Once an agent is installed, start MindFS and interact with it through the browse
 
 **macOS / Linux**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/a9gent/mindfs/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/zk541040600/mindfs/main/scripts/install.sh | bash
 ```
 
 Custom install path:
 ```bash
-curl -fsSL https://raw.githubusercontent.com/a9gent/mindfs/main/scripts/install.sh | bash -s -- --prefix your/path
+curl -fsSL https://raw.githubusercontent.com/zk541040600/mindfs/main/scripts/install.sh | bash -s -- --prefix your/path
 ```
 
 **Windows (PowerShell)**
 ```powershell
-irm https://raw.githubusercontent.com/a9gent/mindfs/main/scripts/install.ps1 | iex
+irm https://raw.githubusercontent.com/zk541040600/mindfs/main/scripts/install.ps1 | iex
 ```
 
-The install script auto-detects your OS and architecture, reads the latest version from the first line of [`release-notes.md`](https://raw.githubusercontent.com/a9gent/mindfs/main/release-notes.md), then downloads the matching binary from [GitHub Releases](https://github.com/a9gent/mindfs/releases). `release-notes.md` keeps release history with the newest entry at the top; `make release TAG=v1.2.3` commits and pushes it when changed, then uses only the top entry as the GitHub release notes.
+The install script auto-detects your OS and architecture, reads the latest version from the first line of [`release-notes.md`](https://raw.githubusercontent.com/zk541040600/mindfs/main/release-notes.md), then downloads the matching binary from [GitHub Releases](https://github.com/zk541040600/mindfs/releases). `release-notes.md` keeps release history with the newest entry at the top; `make release TAG=v1.2.3` commits and pushes it when changed, then uses only the top entry as the GitHub release notes.
 
 **Build from source** (requires Go 1.22+, Node.js 20+)
 ```bash
-git clone https://github.com/a9gent/mindfs.git
+git clone https://github.com/zk541040600/mindfs.git
 cd mindfs
 make build      # output: ./mindfs
 ```
