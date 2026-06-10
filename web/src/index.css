@@ -569,6 +569,17 @@ body[data-plugin-theme="1"] [data-slot="drawer-content"] {
   box-shadow: 0 12px 24px rgba(31, 37, 48, 0.08);
 }
 
+.markdown-viewer .katex-display {
+  margin: 1em 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 0.25em 0;
+}
+
+.markdown-viewer .katex {
+  font-size: 1.04em;
+}
+
 /* Scrollbar styling */
 ::-webkit-scrollbar {
   width: 6px;

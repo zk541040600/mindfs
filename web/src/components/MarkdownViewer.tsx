@@ -1,6 +1,8 @@
 import React, { memo, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
+import rehypeKatex from "rehype-katex";
 import rehypeRaw from "rehype-raw";
 import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import Prism from "prismjs";
@@ -8,6 +10,7 @@ import { copyText } from "../services/clipboard";
 import { fetchProofProtectedBlob } from "../services/file";
 import { openExternalURL } from "../services/platformNavigation";
 import "prismjs/themes/prism.css";
+import "katex/dist/katex.min.css";
 // Reuse the language imports from global Prism context (since they are imported in CodeViewer, they might be available if loaded, 
 // but strictly speaking we should import them here or centralize. For simplicity, we rely on the side-effects of CodeViewer imports 
 // if both are used, or we re-import essential ones here to be safe)
@@ -413,6 +416,38 @@ const markdownSanitizeSchema = {
   },
 };
 
+function normalizeMarkdownMathDelimiters(content: string): string {
+  const lines = content.split("\n");
+  let fenced = false;
+  let fenceMarker = "";
+
+  return lines
+    .map((line) => {
+      const fenceMatch = /^(\s*)(`{3,}|~{3,})/.exec(line);
+      if (fenceMatch) {
+        const marker = fenceMatch[2][0];
+        if (!fenced) {
+          fenced = true;
+          fenceMarker = marker;
+        } else if (marker === fenceMarker) {
+          fenced = false;
+          fenceMarker = "";
+        }
+        return line;
+      }
+
+      if (fenced) return line;
+
+      const trimmed = line.trim();
+      if (trimmed === "\\[" || trimmed === "\\]") {
+        return `${line.slice(0, line.indexOf(trimmed))}$$`;
+      }
+
+      return line.replace(/\\\((.+?)\\\)/g, (_match, formula: string) => `$${formula}$`);
+    })
+    .join("\n");
+}
+
 function MarkdownImage({
   src = "",
   alt = "",
@@ -516,6 +551,7 @@ function MarkdownViewerInner({
     if (!targetLine || targetLine < 1) return "";
     return "[data-source-line]";
   }, [targetLine]);
+  const normalizedContent = useMemo(() => normalizeMarkdownMathDelimiters(content), [content]);
 
   useEffect(() => {
     onFileClickRef.current = onFileClick;
@@ -564,9 +600,9 @@ function MarkdownViewerInner({
       }}
     >
       <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
+        remarkPlugins={[remarkGfm, remarkMath]}
         remarkRehypeOptions={{ allowDangerousHtml: true }}
-        rehypePlugins={[rehypeRaw, [rehypeSanitize, markdownSanitizeSchema]]}
+        rehypePlugins={[rehypeRaw, [rehypeSanitize, markdownSanitizeSchema], rehypeKatex]}
         components={{
           h1: ({ node, ...props }: any) => (
             <h1 style={{ fontSize: "24px", marginTop: 0 }} {...getSourceLineProps(node)} {...props} />
@@ -756,7 +792,7 @@ function MarkdownViewerInner({
           },
         }}
       >
-        {content}
+        {normalizedContent}
       </ReactMarkdown>
     </div>
   );
