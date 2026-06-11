@@ -7,7 +7,9 @@ import (
 	"reflect"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	agenttypes "mindfs/server/internal/agent/types"
 )
@@ -24,6 +26,15 @@ func loadPoolTestConfig(t *testing.T) Config {
 		t.Fatalf("LoadConfig(%s) failed: %v", cfgPath, err)
 	}
 	return cfg
+}
+
+func poolTestRepoRoot(t *testing.T) string {
+	t.Helper()
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatalf("runtime.Caller failed")
+	}
+	return filepath.Clean(filepath.Join(filepath.Dir(thisFile), "..", "..", ".."))
 }
 
 func TestPoolGetOrCreateRequiresSessionKey(t *testing.T) {
@@ -74,6 +85,79 @@ func TestPoolGetOrCreateUsesAgentsJSONConfig(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "this-command-should-not-exist-for-tests") {
 		t.Fatalf("expected overridden command in error, got: %v", err)
+	}
+}
+
+func TestDefaultProtocolPiRemainsPiRPC(t *testing.T) {
+	if got := DefaultProtocol("pi"); got != ProtocolPiRPC {
+		t.Fatalf("DefaultProtocol(pi) = %q, want %q", got, ProtocolPiRPC)
+	}
+}
+
+func TestPoolRoutesPiSDKProtocol(t *testing.T) {
+	cfg := Config{Agents: []Definition{{
+		Name:     "pi-sdk-test",
+		Command:  "pi",
+		Protocol: ProtocolPiSDK,
+	}}}
+	pool := NewPool(cfg)
+	defer pool.CloseAll()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	sess, err := pool.GetOrCreate(ctx, agenttypes.OpenSessionInput{
+		SessionKey: "pool-pi-sdk",
+		AgentName:  "pi-sdk-test",
+		RootPath:   poolTestRepoRoot(t),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var events []agenttypes.Event
+	var mu sync.Mutex
+	sess.OnUpdate(func(ev agenttypes.Event) {
+		mu.Lock()
+		events = append(events, ev)
+		mu.Unlock()
+	})
+	if err := sess.SendMessage(ctx, "/ui-demo"); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for _, ev := range events {
+		if ev.Type == agenttypes.EventTypeExtensionUI {
+			if req, ok := ev.Data.(agenttypes.ExtensionUIRequest); ok && req.Method == "select" {
+				return
+			}
+		}
+	}
+	t.Fatalf("expected select extension UI event from pi-sdk route, got %#v", events)
+}
+
+func TestPoolKillAgentProcessRoutesPiSDK(t *testing.T) {
+	cfg := Config{Agents: []Definition{{
+		Name:     "pi-sdk-test",
+		Command:  "pi",
+		Protocol: ProtocolPiSDK,
+	}}}
+	pool := NewPool(cfg)
+	defer pool.CloseAll()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := pool.GetOrCreate(ctx, agenttypes.OpenSessionInput{
+		SessionKey: "pool-pi-sdk-kill",
+		AgentName:  "pi-sdk-test",
+		RootPath:   poolTestRepoRoot(t),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := pool.KillAgentProcess("pi-sdk-test", 0); !ok {
+		t.Fatalf("expected pi-sdk kill route to report handled")
+	}
+	if _, ok := pool.Get("pool-pi-sdk-kill"); ok {
+		t.Fatalf("expected pi-sdk session removed after kill")
 	}
 }
 

@@ -216,7 +216,11 @@ func (c *Client) run(ctx context.Context, command string, args []string, out any
 }
 
 func (c *Client) resolveProbePath() (string, error) {
-	if path := strings.TrimSpace(c.probePath); path != "" {
+	return ResolveProbePath(c.probePath)
+}
+
+func ResolveProbePath(probePath string) (string, error) {
+	if path := strings.TrimSpace(probePath); path != "" {
 		return requireReadableFile(path)
 	}
 	candidates := []string{}
@@ -238,9 +242,19 @@ func probePathCandidates(wd, exe string) []string {
 	candidates := []string{}
 	if strings.TrimSpace(wd) != "" {
 		candidates = append(candidates,
+			filepath.Join(wd, "probe.mjs"),
+			filepath.Join(wd, "..", "pi_sdk_bridge", "probe.mjs"),
 			filepath.Join(wd, "server", "internal", "agent", "pi_sdk_bridge", "probe.mjs"),
 			filepath.Join(wd, "internal", "agent", "pi_sdk_bridge", "probe.mjs"),
 		)
+		for dir := filepath.Clean(wd); dir != "." && dir != string(filepath.Separator); {
+			candidates = append(candidates, filepath.Join(dir, "server", "internal", "agent", "pi_sdk_bridge", "probe.mjs"))
+			parent := filepath.Dir(dir)
+			if parent == dir {
+				break
+			}
+			dir = parent
+		}
 	}
 	if strings.TrimSpace(exe) != "" {
 		dir := filepath.Dir(exe)

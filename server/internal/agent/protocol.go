@@ -13,6 +13,8 @@ const (
 	ProtocolCodexSDK Protocol = "codex-sdk"
 	// ProtocolPiRPC uses pi JSON-RPC mode over stdio.
 	ProtocolPiRPC Protocol = "pi-rpc"
+	// ProtocolPiSDK uses the Pi SDK bridge runtime.
+	ProtocolPiSDK Protocol = "pi-sdk"
 )
 
 // DefaultProtocol returns the default protocol for agents.
