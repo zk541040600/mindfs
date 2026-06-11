@@ -75,6 +75,8 @@ type replayStep struct {
 	live   bool
 }
 
+var clearSessionPendingReplayWait = 2 * time.Second
+
 func blank(value string) bool {
 	return strings.TrimSpace(value) == ""
 }
@@ -456,7 +458,11 @@ func (h *StreamHub) ClearSessionPending(sessionKey string) {
 	if blank(sessionKey) {
 		return
 	}
+	deadline := time.Now().Add(clearSessionPendingReplayWait)
 	for h.HasReplayClients("", sessionKey) {
+		if clearSessionPendingReplayWait <= 0 || time.Now().After(deadline) {
+			break
+		}
 		time.Sleep(10 * time.Millisecond)
 	}
 	h.mu.Lock()

@@ -193,6 +193,7 @@ type session struct {
 	seenText     bool
 	seenThinking bool
 	lastTurnErr  string
+	turnComplete bool
 	turn         agenttypes.TurnCanceler
 	turnMu       sync.Mutex
 	turnDone     chan error
@@ -497,6 +498,8 @@ func (s *session) handleEvent(raw []byte, eventType string) {
 		s.handleContextWindow(raw)
 	case "agent_end":
 		s.handleAgentEnd()
+	case "turn_end":
+		s.handleTurnEnd(raw)
 	case "tool_execution_start":
 		s.handleToolExecutionStart(raw)
 	case "tool_execution_update":
@@ -505,7 +508,7 @@ func (s *session) handleEvent(raw []byte, eventType string) {
 		s.handleToolExecutionEnd(raw)
 	case "recovery", "auto_retry_start":
 		s.handleRecovery(raw)
-	case "queue_update", "turn_start", "turn_end", "session_info_changed", "thinking_level_changed":
+	case "queue_update", "turn_start", "session_info_changed", "thinking_level_changed":
 	default:
 		log.Printf("[agent/pi-sdk] stdout.ignored_event session=%s type=%q", s.sessionKey, eventType)
 	}
@@ -516,6 +519,7 @@ func (s *session) resetDeltaState() {
 	s.seenText = false
 	s.seenThinking = false
 	s.lastTurnErr = ""
+	s.turnComplete = false
 	s.mu.Unlock()
 }
 
@@ -696,6 +700,52 @@ func (s *session) handleRecovery(raw []byte) {
 }
 
 func (s *session) handleAgentEnd() {
+	s.completeTurn()
+}
+
+func (s *session) handleTurnEnd(raw []byte) {
+	var ev struct {
+		WillRetry     bool   `json:"willRetry"`
+		StopReason    string `json:"stopReason"`
+		ErrorMessage  string `json:"errorMessage"`
+		Error         string `json:"error"`
+		Cancelled     bool   `json:"cancelled"`
+		Canceled      bool   `json:"canceled"`
+		AbortReason   string `json:"abortReason"`
+		FailureReason string `json:"failureReason"`
+	}
+	_ = json.Unmarshal(raw, &ev)
+	if ev.WillRetry {
+		return
+	}
+	message := strings.TrimSpace(ev.ErrorMessage)
+	if message == "" {
+		message = strings.TrimSpace(ev.Error)
+	}
+	if message == "" {
+		message = strings.TrimSpace(ev.AbortReason)
+	}
+	if message == "" {
+		message = strings.TrimSpace(ev.FailureReason)
+	}
+	stopReason := strings.ToLower(strings.TrimSpace(ev.StopReason))
+	if message == "" && (stopReason == "error" || stopReason == "aborted" || stopReason == "cancelled" || ev.Cancelled || ev.Canceled) {
+		message = "pi sdk prompt " + strings.TrimSpace(ev.StopReason)
+		if strings.TrimSpace(message) == "pi sdk prompt" {
+			message = "pi sdk prompt aborted"
+		}
+	}
+	if message != "" {
+		s.setLastTurnErr(message)
+		s.emit(agenttypes.Event{Type: agenttypes.EventTypeRecovery, SessionID: s.SessionID(), Data: agenttypes.RecoveryStatus{Message: message}})
+	}
+	s.completeTurn()
+}
+
+func (s *session) completeTurn() {
+	if !s.markTurnComplete() {
+		return
+	}
 	contextWindow := s.cachedContextWindow()
 	s.emit(agenttypes.Event{Type: agenttypes.EventTypeMessageDone, SessionID: s.SessionID(), Data: agenttypes.MessageDone{ContextWindow: contextWindow}})
 	s.mu.RLock()
@@ -706,6 +756,26 @@ func (s *session) handleAgentEnd() {
 		return
 	}
 	s.signalTurnDone(nil)
+}
+
+func (s *session) markTurnComplete() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.turnComplete {
+		return false
+	}
+	s.turnComplete = true
+	return true
+}
+
+func (s *session) markTurnCompleteFor(ch chan error) bool {
+	s.turnMu.Lock()
+	current := s.turnDone
+	s.turnMu.Unlock()
+	if ch != nil && current != ch {
+		return false
+	}
+	return s.markTurnComplete()
 }
 
 func (s *session) handleToolExecutionStart(raw []byte) {
@@ -802,6 +872,9 @@ func (s *session) scheduleMessageEndFallback() {
 	s.turnMu.Unlock()
 	go func() {
 		time.Sleep(messageEndFallbackDelay)
+		if s.markTurnCompleteFor(ch) {
+			s.emit(agenttypes.Event{Type: agenttypes.EventTypeMessageDone, SessionID: s.SessionID(), Data: agenttypes.MessageDone{ContextWindow: s.cachedContextWindow()}})
+		}
 		s.signalTurnDoneTo(ch, nil)
 	}()
 }
@@ -1014,10 +1087,10 @@ func (s *session) ListCommands(ctx context.Context) (agenttypes.CommandList, err
 }
 
 func (s *session) CancelCurrentTurn() error {
+	abortID := s.nextID("abort")
+	err := s.writeJSON(map[string]any{"type": "abort", "id": abortID})
 	s.turn.Cancel()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	_, err := s.request(ctx, "abort", map[string]any{"type": "abort"})
+	s.signalTurnDone(context.Canceled)
 	if err != nil && !strings.Contains(err.Error(), "closed") {
 		return err
 	}

@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"strings"
@@ -519,13 +520,17 @@ func (h *WSHandler) handleSessionMessage(ctx context.Context, conn *websocket.Co
 		},
 	})
 	if err != nil {
-		log.Printf("[ws] session.message.error root=%s session=%s request=%s err=%v", rootID, key, req.ID, err)
-		errorMessage := normalizeAgentErrorMessage(err)
-		event := &StreamEvent{
-			Type: "error",
-			Data: map[string]string{"message": errorMessage},
+		if errors.Is(err, context.Canceled) {
+			log.Printf("[ws] session.message.cancelled root=%s session=%s request=%s", rootID, key, req.ID)
+		} else {
+			log.Printf("[ws] session.message.error root=%s session=%s request=%s err=%v", rootID, key, req.ID, err)
+			errorMessage := normalizeAgentErrorMessage(err)
+			event := &StreamEvent{
+				Type: "error",
+				Data: map[string]string{"message": errorMessage},
+			}
+			streamHub.BroadcastSessionStream(rootID, key, event)
 		}
-		streamHub.BroadcastSessionStream(rootID, key, event)
 	}
 	streamHub.ClearSessionPending(key)
 
@@ -575,6 +580,12 @@ func (h *WSHandler) handleSessionCancel(ctx context.Context, conn *websocket.Con
 		h.sendWSError(conn, clientID, req.ID, "session.cancel_failed", err.Error())
 		return
 	}
+	h.sendWSCancelled(conn, clientID, req.ID, rootID, key)
+	if h.AppContext != nil {
+		streamHub := h.AppContext.GetSessionStreamHub()
+		streamHub.ClearSessionPending(key)
+		streamHub.BroadcastSessionDone(rootID, key, req.ID)
+	}
 }
 
 func (h *WSHandler) sendWSError(conn *websocket.Conn, clientID, id, code, message string) {
@@ -599,6 +610,21 @@ func (h *WSHandler) sendE2EEError(conn *websocket.Conn, id, code string) {
 		},
 	}
 	_ = h.writeWSJSON("", conn, resp)
+}
+
+func (h *WSHandler) sendWSCancelled(conn *websocket.Conn, clientID, id, rootID, sessionKey string) {
+	if conn == nil {
+		return
+	}
+	resp := WSResponse{
+		ID:   id,
+		Type: "session.cancelled",
+		Payload: map[string]any{
+			"root_id":     rootID,
+			"session_key": sessionKey,
+		},
+	}
+	_ = h.writeWSJSON(clientID, conn, resp)
 }
 
 func (h *WSHandler) sendWSAccepted(conn *websocket.Conn, clientID, requestID, rootID, sessionKey string) {

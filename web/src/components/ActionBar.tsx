@@ -714,7 +714,7 @@ export function ActionBar({
     try {
       await onCancelCurrentTurn?.(sessionKey);
     } finally {
-      // Reset is driven by currentSession.pending.
+      setCancelling(false);
     }
   }, [currentSession?.key, cancelling, onCancelCurrentTurn]);
 

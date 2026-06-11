@@ -299,6 +299,28 @@ func TestRuntimeToolEventsMapToMindFSToolCalls(t *testing.T) {
 	}
 }
 
+func TestRuntimeTurnEndOnlyCompletesEmptyTurn(t *testing.T) {
+	sess := openTestSession(t, "turn-end-only")
+	events, mu := collectSessionEvents(sess)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	started := time.Now()
+	if err := sess.SendMessage(ctx, "empty answer"); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("SendMessage took %s, want turn_end to unblock promptly", elapsed)
+	}
+	gotEvents := snapshotEvents(events, mu)
+	if !hasEvent(gotEvents, agenttypes.EventTypeMessageDone) {
+		t.Fatalf("message_done not emitted for turn_end-only runtime: %#v", gotEvents)
+	}
+	if got := joinedMessageChunks(gotEvents); got != "" {
+		t.Fatalf("message chunks = %q, want empty", got)
+	}
+}
+
 func TestRuntimeSlashCommandsListAndExecute(t *testing.T) {
 	sess := openTestSession(t, "slash-controls")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -362,6 +384,35 @@ func TestRuntimeModelModeControls(t *testing.T) {
 	}
 	if modes.CurrentModeID != "high" {
 		t.Fatalf("CurrentModeID = %q, want high", modes.CurrentModeID)
+	}
+}
+
+func TestRuntimeCancelCurrentTurnDoesNotWaitForAbortResponse(t *testing.T) {
+	sess := openTestSessionWithModelMode(t, "abort-hangs", "", "")
+	events, mu := collectSessionEvents(sess)
+	done := make(chan error, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	go func() {
+		done <- sess.SendMessage(ctx, "wait-for-abort")
+	}()
+	waitForEvent(t, events, mu, agenttypes.EventTypeMessageChunk)
+
+	started := time.Now()
+	if err := sess.CancelCurrentTurn(); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("CancelCurrentTurn took %s, want it not to wait for abort response", elapsed)
+	}
+	select {
+	case err := <-done:
+		if err != nil && !errors.Is(err, context.Canceled) && !strings.Contains(err.Error(), "aborted") {
+			t.Fatalf("SendMessage after cancel = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("SendMessage did not unblock after CancelCurrentTurn")
 	}
 }
 

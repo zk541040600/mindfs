@@ -1203,11 +1203,17 @@ function createJsonlTestRuntime(scenario) {
   if (scenario === "tool-events") {
     return createJsonlToolRuntime();
   }
+  if (scenario === "turn-end-only") {
+    return createJsonlTurnEndOnlyRuntime();
+  }
   if (scenario === "slash-controls") {
     return createJsonlSlashRuntime();
   }
   if (scenario === "runtime-controls") {
     return createJsonlControlsRuntime();
+  }
+  if (scenario === "abort-hangs") {
+    return createJsonlAbortHangsRuntime();
   }
   throw new ProbeError("E_PARAM", `unsupported test runtime scenario: ${scenario}`);
 }
@@ -1365,6 +1371,25 @@ function createJsonlToolRuntime() {
   };
 }
 
+function createJsonlTurnEndOnlyRuntime() {
+  return {
+    kind: "turn-end-only",
+    prompt: async function (request) {
+      const message = String(request.message ?? "").trim();
+      if (!message) {
+        throw new ProbeError("E_PARAM", "prompt message required");
+      }
+      writeJsonl(successResponse("prompt", { scenario: "turn-end-only" }, request.id));
+      writeJsonl({ type: "agent_start" });
+      writeJsonl({ type: "turn_end", stopReason: "end_turn", willRetry: false });
+    },
+    answerExtensionUI: async function (request) {
+      throw new ProbeError("E_PARAM", `unknown extension UI request id: ${request.id}`);
+    },
+    dispose: async function () {},
+  };
+}
+
 function createJsonlSlashRuntime() {
   const commands = [
     { name: "jira", description: "Jira issue lookup", source: "extension" },
@@ -1487,6 +1512,33 @@ function createJsonlControlsRuntime() {
         },
       });
       writeJsonl({ type: "agent_end", willRetry: false });
+    },
+    answerExtensionUI: async function (request) {
+      throw new ProbeError("E_PARAM", `unknown extension UI request id: ${request.id}`);
+    },
+    dispose: async function () {},
+  };
+}
+
+function createJsonlAbortHangsRuntime() {
+  return {
+    kind: "abort-hangs",
+    prompt: async function (request) {
+      const message = String(request.message ?? "").trim();
+      if (!message) {
+        throw new ProbeError("E_PARAM", "prompt message required");
+      }
+      writeJsonl(successResponse("prompt", { scenario: "abort-hangs" }, request.id));
+      writeJsonl({ type: "agent_start" });
+      writeJsonl({ type: "message_start", message: { role: "assistant", content: [] } });
+      writeJsonl({
+        type: "message_update",
+        message: { role: "assistant", content: [{ type: "text", text: "waiting for abort" }] },
+        assistantMessageEvent: { type: "text_delta", delta: "waiting for abort" },
+      });
+    },
+    abort: async function () {
+      writeJsonl({ type: "turn_end", stopReason: "aborted", willRetry: false });
     },
     answerExtensionUI: async function (request) {
       throw new ProbeError("E_PARAM", `unknown extension UI request id: ${request.id}`);

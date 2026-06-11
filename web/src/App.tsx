@@ -6653,6 +6653,21 @@ export function App({ onGoHome }: AppProps) {
           }
           break;
         }
+        case "session.cancelled": {
+          const sessionKey =
+            typeof payload?.session_key === "string" ? payload.session_key : "";
+          console.info("[session/ws] cancelled", { rootId: typeof payload?.root_id === "string" ? payload.root_id : null, sessionKey: sessionKey || null });
+          const rootID =
+            typeof payload?.root_id === "string" && payload.root_id
+              ? payload.root_id
+              : resolveRootForSessionKey(sessionKey) ||
+                currentRootIdRef.current ||
+                "";
+          if (rootID && sessionKey) {
+            handleSessionStreamDone(rootID, sessionKey);
+          }
+          break;
+        }
         case "session.done": {
           const sessionKey =
             typeof payload?.session_key === "string" ? payload.session_key : "";
