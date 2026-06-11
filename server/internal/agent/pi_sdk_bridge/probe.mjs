@@ -1115,68 +1115,236 @@ async function bindProbeExtensions(session, uiContext, errors) {
 async function runJsonl(argv) {
   const baseOptions = parseArgs(argv);
   let runtime;
-  for await (const rawLine of createInterface({ input: process.stdin, crlfDelay: Infinity })) {
-    const line = rawLine.trim();
-    if (!line) {
-      continue;
-    }
-    let request;
-    try {
-      request = JSON.parse(line);
-    } catch (error) {
-      writeJsonl(errorResponse("jsonl", new ProbeError("E_JSON", "invalid JSON request", { rawLine: preview(line) })));
-      continue;
-    }
-
-    try {
-      if (request.type === "start_test_runtime") {
-        if (request.scenario !== "extension-ui") {
-          throw new ProbeError("E_PARAM", `unsupported test runtime scenario: ${request.scenario}`);
-        }
-        runtime = createJsonlUIRuntime();
-        writeJsonl({ id: request.id, type: "response", command: "start_test_runtime", success: true, data: { scenario: request.scenario } });
-      } else if (request.type === "prompt") {
-        if (!runtime) {
-          throw new ProbeError("E_STATE", "start_test_runtime must be sent before prompt");
-        }
-        if (request.message !== "/ui-demo") {
-          throw new ProbeError("E_PARAM", "jsonl smoke currently supports only /ui-demo");
-        }
-        for (const event of buildJsonlUIEvents()) {
-          runtime.pending.set(event.id, event);
-          writeJsonl(event);
-        }
-        writeJsonl({ id: request.id, type: "response", command: "prompt", success: true, data: { queuedUIRequests: runtime.pending.size } });
-      } else if (request.type === "extension_ui_response") {
-        if (!runtime) {
-          throw new ProbeError("E_STATE", "start_test_runtime must be sent before extension_ui_response");
-        }
-        const pending = runtime.pending.get(request.id);
-        if (!pending) {
-          throw new ProbeError("E_PARAM", `unknown extension UI request id: ${request.id}`);
-        }
-        runtime.pending.delete(request.id);
-        runtime.responses.push({ id: request.id, method: pending.method, value: request.value, confirmed: request.confirmed, text: request.text });
-        writeJsonl({ id: request.id, type: "response", command: "extension_ui_response", success: true, data: { method: pending.method, remaining: runtime.pending.size } });
-      } else if (request.type === "capabilities") {
-        const data = await capabilitiesProbe({ ...baseOptions, cwd: resolve(request.cwd ?? baseOptions.cwd), agentDir: resolve(request.agentDir ?? baseOptions.agentDir) });
-        writeJsonl(successResponse("capabilities", data, request.id));
-      } else if (request.type === "list_sessions") {
-        const data = await listSessionsProbe({ ...baseOptions, cwd: resolve(request.cwd ?? baseOptions.cwd), agentDir: resolve(request.agentDir ?? baseOptions.agentDir) });
-        writeJsonl(successResponse("list_sessions", data, request.id));
-      } else {
-        throw new ProbeError("E_PARAM", `unknown jsonl request type: ${request.type}`);
+  try {
+    for await (const rawLine of createInterface({ input: process.stdin, crlfDelay: Infinity })) {
+      const line = rawLine.trim();
+      if (!line) {
+        continue;
       }
-    } catch (error) {
-      writeJsonl(errorResponse(request.type ?? "jsonl", error, request.id));
+      let request;
+      try {
+        request = JSON.parse(line);
+      } catch (error) {
+        writeJsonl(errorResponse("jsonl", new ProbeError("E_JSON", "invalid JSON request", { rawLine: preview(line) })));
+        continue;
+      }
+
+      try {
+        if (request.type === "start_test_runtime") {
+          await runtime?.dispose?.();
+          runtime = createJsonlTestRuntime(request.scenario);
+          writeJsonl({ id: request.id, type: "response", command: "start_test_runtime", success: true, data: { scenario: request.scenario } });
+        } else if (request.type === "start_sdk_runtime") {
+          await runtime?.dispose?.();
+          runtime = await createJsonlSDKRuntime({ ...baseOptions, cwd: resolve(request.cwd ?? baseOptions.cwd), agentDir: resolve(request.agentDir ?? baseOptions.agentDir), model: request.model });
+          writeJsonl({ id: request.id, type: "response", command: "start_sdk_runtime", success: true, data: { cwd: runtime.cwd, agentDir: runtime.agentDir } });
+        } else if (request.type === "prompt") {
+          if (!runtime) {
+            throw new ProbeError("E_STATE", "runtime must be started before prompt");
+          }
+          await runtime.prompt(request);
+        } else if (request.type === "extension_ui_response") {
+          if (!runtime) {
+            throw new ProbeError("E_STATE", "runtime must be started before extension_ui_response");
+          }
+          await runtime.answerExtensionUI(request);
+        } else if (request.type === "capabilities") {
+          const data = await capabilitiesProbe({ ...baseOptions, cwd: resolve(request.cwd ?? baseOptions.cwd), agentDir: resolve(request.agentDir ?? baseOptions.agentDir) });
+          writeJsonl(successResponse("capabilities", data, request.id));
+        } else if (request.type === "list_sessions") {
+          const data = await listSessionsProbe({ ...baseOptions, cwd: resolve(request.cwd ?? baseOptions.cwd), agentDir: resolve(request.agentDir ?? baseOptions.agentDir) });
+          writeJsonl(successResponse("list_sessions", data, request.id));
+        } else {
+          throw new ProbeError("E_PARAM", `unknown jsonl request type: ${request.type}`);
+        }
+      } catch (error) {
+        writeJsonl(errorResponse(request.type ?? "jsonl", error, request.id));
+      }
     }
+  } finally {
+    await runtime?.dispose?.();
   }
 }
 
+function createJsonlTestRuntime(scenario) {
+  if (scenario === "extension-ui") {
+    return createJsonlUIRuntime();
+  }
+  if (scenario === "prompt-stream") {
+    return createJsonlPromptRuntime();
+  }
+  throw new ProbeError("E_PARAM", `unsupported test runtime scenario: ${scenario}`);
+}
+
 function createJsonlUIRuntime() {
-  return {
+  const runtime = {
+    kind: "extension-ui",
     pending: new Map(),
     responses: [],
+    prompt: async function (request) {
+      if (request.message !== "/ui-demo") {
+        throw new ProbeError("E_PARAM", "extension-ui jsonl smoke supports only /ui-demo");
+      }
+      for (const event of buildJsonlUIEvents()) {
+        runtime.pending.set(event.id, event);
+        writeJsonl(event);
+      }
+      writeJsonl({ id: request.id, type: "response", command: "prompt", success: true, data: { queuedUIRequests: runtime.pending.size } });
+    },
+    answerExtensionUI: async function (request) {
+      const pending = runtime.pending.get(request.id);
+      if (!pending) {
+        throw new ProbeError("E_PARAM", `unknown extension UI request id: ${request.id}`);
+      }
+      runtime.pending.delete(request.id);
+      runtime.responses.push({ id: request.id, method: pending.method, value: request.value, confirmed: request.confirmed, text: request.text });
+      writeJsonl({ id: request.id, type: "response", command: "extension_ui_response", success: true, data: { method: pending.method, remaining: runtime.pending.size } });
+    },
+    dispose: async function () {},
+  };
+  return runtime;
+}
+
+function createJsonlPromptRuntime() {
+  return {
+    kind: "prompt-stream",
+    pending: new Map(),
+    responses: [],
+    prompt: async function (request) {
+      const message = String(request.message ?? "").trim();
+      if (!message) {
+        throw new ProbeError("E_PARAM", "prompt message required");
+      }
+      if (message.includes("fail")) {
+        writeJsonl(errorResponse("prompt", new ProbeError("E_TEST_PROMPT", "deterministic prompt failure"), request.id));
+        return;
+      }
+      writeJsonl(successResponse("prompt", { scenario: "prompt-stream" }, request.id));
+      writeJsonl({ type: "agent_start" });
+      writeJsonl({ type: "message_start", message: { role: "assistant", content: [] } });
+      writeJsonl({
+        type: "message_update",
+        message: { role: "assistant", content: [{ type: "text", text: `sdk prompt: ${message}` }] },
+        assistantMessageEvent: { type: "text_delta", delta: "sdk prompt: " },
+      });
+      writeJsonl({
+        type: "message_update",
+        message: { role: "assistant", content: [{ type: "text", text: `sdk prompt: ${message}` }] },
+        assistantMessageEvent: { type: "text_delta", delta: message },
+      });
+      writeJsonl({
+        type: "message_end",
+        message: {
+          role: "assistant",
+          stopReason: "end_turn",
+          content: [{ type: "text", text: `sdk prompt: ${message}` }],
+          usage: { input: 3, output: 4, cacheRead: 0, cacheWrite: 0, totalTokens: 7 },
+        },
+      });
+      writeJsonl({ type: "context_window", totalTokens: 7, modelContextWindow: 100 });
+      writeJsonl({ type: "agent_end", willRetry: false });
+    },
+    answerExtensionUI: async function (request) {
+      throw new ProbeError("E_PARAM", `unknown extension UI request id: ${request.id}`);
+    },
+    dispose: async function () {},
+  };
+}
+
+async function createJsonlSDKRuntime(options) {
+  const cwd = options.cwd ?? DEFAULT_CWD;
+  const agentDir = options.agentDir ?? DEFAULT_AGENT_DIR;
+  const scratch = await mkdtemp(join(tmpdir(), "mindfs-pi-sdk-jsonl-"));
+  const sessionManager = SessionManager.create(cwd, join(scratch, "sessions"));
+  const services = await createAgentSessionServices({
+    cwd,
+    agentDir,
+    resourceLoaderOptions: {
+      noExtensions: true,
+      noSkills: true,
+      noPromptTemplates: true,
+      noThemes: true,
+      noContextFiles: true,
+    },
+  });
+  const model = resolveJsonlModel(services.modelRegistry, options.model);
+  const { session } = await createAgentSessionFromServices({
+    services,
+    sessionManager,
+    model,
+    noTools: "all",
+    thinkingLevel: "off",
+  });
+  let unsubscribe = session.subscribe((event) => {
+    if (event.type === "agent_end") {
+      writeJsonl(contextWindowEnvelope(session));
+    }
+    writeJsonl(event);
+  });
+  return {
+    kind: "sdk",
+    cwd,
+    agentDir,
+    pending: new Map(),
+    responses: [],
+    prompt: async function (request) {
+      let preflightSucceeded = false;
+      void session
+        .prompt(String(request.message ?? ""), {
+          source: "rpc",
+          preflightResult: (didSucceed) => {
+            if (didSucceed) {
+              preflightSucceeded = true;
+              writeJsonl(successResponse("prompt", { runtime: "sdk" }, request.id));
+            }
+          },
+        })
+        .catch((error) => {
+          if (!preflightSucceeded) {
+            writeJsonl(errorResponse("prompt", error, request.id));
+            return;
+          }
+          writeJsonl({ type: "recovery", message: error instanceof Error ? error.message : String(error) });
+          writeJsonl(contextWindowEnvelope(session));
+          writeJsonl({ type: "agent_end", willRetry: false });
+        });
+    },
+    answerExtensionUI: async function (request) {
+      throw new ProbeError("E_PARAM", `unknown extension UI request id: ${request.id}`);
+    },
+    dispose: async function () {
+      unsubscribe?.();
+      unsubscribe = undefined;
+      session.dispose?.();
+      await rm(scratch, { recursive: true, force: true });
+    },
+  };
+}
+
+function resolveJsonlModel(modelRegistry, modelRef) {
+  const ref = String(modelRef ?? "").trim();
+  if (!ref) {
+    return undefined;
+  }
+  const slash = ref.indexOf("/");
+  if (slash <= 0 || slash === ref.length - 1) {
+    throw new ProbeError("E_PARAM", "model must be provider/modelId");
+  }
+  const provider = ref.slice(0, slash);
+  const modelId = ref.slice(slash + 1);
+  const model = modelRegistry.find(provider, modelId);
+  if (!model) {
+    throw new ProbeError("E_PARAM", `model not found: ${ref}`);
+  }
+  return model;
+}
+
+function contextWindowEnvelope(session) {
+  const usage = session.getContextUsage?.();
+  return {
+    type: "context_window",
+    totalTokens: Number(usage?.tokens ?? 0) || 0,
+    modelContextWindow: Number(usage?.contextWindow ?? session.state?.model?.contextWindow ?? 0) || 0,
   };
 }
 

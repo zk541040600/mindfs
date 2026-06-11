@@ -109,6 +109,7 @@ func TestPoolRoutesPiSDKProtocol(t *testing.T) {
 		SessionKey: "pool-pi-sdk",
 		AgentName:  "pi-sdk-test",
 		RootPath:   poolTestRepoRoot(t),
+		Probe:      true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -120,19 +121,22 @@ func TestPoolRoutesPiSDKProtocol(t *testing.T) {
 		events = append(events, ev)
 		mu.Unlock()
 	})
-	if err := sess.SendMessage(ctx, "/ui-demo"); err != nil {
+	if err := sess.SendMessage(ctx, "pool route"); err != nil {
 		t.Fatal(err)
 	}
 	mu.Lock()
 	defer mu.Unlock()
+	var chunks strings.Builder
 	for _, ev := range events {
-		if ev.Type == agenttypes.EventTypeExtensionUI {
-			if req, ok := ev.Data.(agenttypes.ExtensionUIRequest); ok && req.Method == "select" {
-				return
+		if ev.Type == agenttypes.EventTypeMessageChunk {
+			if chunk, ok := ev.Data.(agenttypes.MessageChunk); ok {
+				chunks.WriteString(chunk.Content)
 			}
 		}
 	}
-	t.Fatalf("expected select extension UI event from pi-sdk route, got %#v", events)
+	if got := chunks.String(); got != "sdk prompt: pool route" {
+		t.Fatalf("message chunks from pi-sdk route = %q, events=%#v", got, events)
+	}
 }
 
 func TestPoolKillAgentProcessRoutesPiSDK(t *testing.T) {
@@ -150,6 +154,7 @@ func TestPoolKillAgentProcessRoutesPiSDK(t *testing.T) {
 		SessionKey: "pool-pi-sdk-kill",
 		AgentName:  "pi-sdk-test",
 		RootPath:   poolTestRepoRoot(t),
+		Probe:      true,
 	}); err != nil {
 		t.Fatal(err)
 	}

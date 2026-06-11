@@ -160,6 +160,7 @@ func (p *Pool) openSession(ctx context.Context, protocol Protocol, def Definitio
 			Command:         def.Command,
 			Env:             cloneEnv(def.Env),
 			ResumeSessionID: in.AgentSessionID,
+			Probe:           in.Probe,
 		})
 	case ProtocolACP:
 		fallthrough

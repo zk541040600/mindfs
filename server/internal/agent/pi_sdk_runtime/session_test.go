@@ -21,17 +21,18 @@ func repoRoot(t *testing.T) string {
 	return filepath.Clean(filepath.Join(filepath.Dir(file), "..", "..", "..", ".."))
 }
 
-func openTestSession(t *testing.T) agenttypes.Session {
+func openTestSession(t *testing.T, scenario string) agenttypes.Session {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	sess, err := NewRuntime().OpenSession(ctx, OpenOptions{
-		AgentName:  "pi",
-		SessionKey: "sdk-test",
-		RootPath:   repoRoot(t),
-		Command:    "pi",
-		Model:      "sdk-model",
-		Mode:       "sdk-mode",
+		AgentName:    "pi",
+		SessionKey:   "sdk-test",
+		RootPath:     repoRoot(t),
+		Command:      "pi",
+		Model:        "sdk-model",
+		Mode:         "sdk-mode",
+		TestScenario: scenario,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -72,8 +73,30 @@ func extensionMethods(events []agenttypes.Event) map[string]agenttypes.Extension
 	return methods
 }
 
+func joinedMessageChunks(events []agenttypes.Event) string {
+	var b strings.Builder
+	for _, ev := range events {
+		if ev.Type != agenttypes.EventTypeMessageChunk {
+			continue
+		}
+		if chunk, ok := ev.Data.(agenttypes.MessageChunk); ok {
+			b.WriteString(chunk.Content)
+		}
+	}
+	return b.String()
+}
+
+func hasEvent(events []agenttypes.Event, typ agenttypes.EventType) bool {
+	for _, ev := range events {
+		if ev.Type == typ {
+			return true
+		}
+	}
+	return false
+}
+
 func TestRuntimeUIDemoEmitsExtensionUIAndAcceptsResponses(t *testing.T) {
-	sess := openTestSession(t)
+	sess := openTestSession(t, "extension-ui")
 	events, mu := collectSessionEvents(sess)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -110,7 +133,7 @@ func TestRuntimeUIDemoEmitsExtensionUIAndAcceptsResponses(t *testing.T) {
 }
 
 func TestRuntimeCloseCleansPendingRequests(t *testing.T) {
-	sess := openTestSession(t)
+	sess := openTestSession(t, "extension-ui")
 	events, mu := collectSessionEvents(sess)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -129,12 +152,44 @@ func TestRuntimeCloseCleansPendingRequests(t *testing.T) {
 	}
 }
 
-func TestRuntimeUnsupportedMethodsReturnErrors(t *testing.T) {
-	sess := openTestSession(t)
-	ctx := context.Background()
-	if err := sess.SendMessage(ctx, "hello"); err == nil || !strings.Contains(err.Error(), "only /ui-demo") {
-		t.Fatalf("expected unsupported prompt error, got %v", err)
+func TestRuntimePromptStreamEmitsMessageDoneAndContextWindow(t *testing.T) {
+	sess := openTestSession(t, "prompt-stream")
+	events, mu := collectSessionEvents(sess)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := sess.SendMessage(ctx, "hello sdk"); err != nil {
+		t.Fatal(err)
 	}
+
+	gotEvents := snapshotEvents(events, mu)
+	if got := joinedMessageChunks(gotEvents); got != "sdk prompt: hello sdk" {
+		t.Fatalf("message chunks = %q, want deterministic sdk prompt", got)
+	}
+	if !hasEvent(gotEvents, agenttypes.EventTypeMessageDone) {
+		t.Fatalf("message_done event missing: %#v", gotEvents)
+	}
+	window, err := sess.ContextWindow(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if window.TotalTokens != 7 || window.ModelContextWindow != 100 {
+		t.Fatalf("context window = %+v, want total=7 window=100", window)
+	}
+}
+
+func TestRuntimePromptFailureReturnsError(t *testing.T) {
+	sess := openTestSession(t, "prompt-stream")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := sess.SendMessage(ctx, "please fail"); err == nil || !strings.Contains(err.Error(), "E_TEST_PROMPT") {
+		t.Fatalf("expected deterministic prompt failure, got %v", err)
+	}
+}
+
+func TestRuntimeUnsupportedMethodsReturnErrors(t *testing.T) {
+	sess := openTestSession(t, "extension-ui")
+	ctx := context.Background()
 	if err := sess.SetModel(ctx, "provider/model"); err == nil || !strings.Contains(err.Error(), "not supported") {
 		t.Fatalf("expected SetModel unsupported error, got %v", err)
 	}

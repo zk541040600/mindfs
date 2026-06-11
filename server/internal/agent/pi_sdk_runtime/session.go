@@ -35,6 +35,8 @@ type OpenOptions struct {
 	Env             map[string]string
 	ResumeSessionID string
 	ProbePath       string
+	Probe           bool
+	TestScenario    string
 }
 
 type Runtime struct {
@@ -96,6 +98,7 @@ func (r *Runtime) OpenSession(ctx context.Context, opts OpenOptions) (agenttypes
 		mode:               strings.TrimSpace(opts.Mode),
 		pending:            make(map[string]chan bridgeResponse),
 		pendingExtensionUI: make(map[string]string),
+		turnDone:           make(chan error, 1),
 		closed:             make(chan struct{}),
 	}
 	r.register(s)
@@ -105,7 +108,16 @@ func (r *Runtime) OpenSession(ctx context.Context, opts OpenOptions) (agenttypes
 
 	startCtx, cancel := context.WithTimeout(ctx, startupTimeout)
 	defer cancel()
-	if _, err := s.request(startCtx, "start", map[string]any{"type": "start_test_runtime", "scenario": "extension-ui"}); err != nil {
+	startPayload := map[string]any{"type": "start_sdk_runtime"}
+	if model := strings.TrimSpace(opts.Model); model != "" {
+		startPayload["model"] = model
+	}
+	if scenario := strings.TrimSpace(opts.TestScenario); scenario != "" {
+		startPayload = map[string]any{"type": "start_test_runtime", "scenario": scenario}
+	} else if opts.Probe {
+		startPayload = map[string]any{"type": "start_test_runtime", "scenario": "prompt-stream"}
+	}
+	if _, err := s.request(startCtx, "start", startPayload); err != nil {
 		_ = s.Close()
 		return nil, err
 	}
@@ -173,7 +185,12 @@ type session struct {
 	model        string
 	mode         string
 	contextStats agenttypes.ContextWindow
+	seenText     bool
+	seenThinking bool
+	lastTurnErr  string
 	turn         agenttypes.TurnCanceler
+	turnMu       sync.Mutex
+	turnDone     chan error
 
 	closeOnce sync.Once
 	closed    chan struct{}
@@ -416,7 +433,7 @@ func (s *session) handleLine(line string) {
 	case "extension_ui_request":
 		s.handleExtensionUIRequest([]byte(line), envelope.ID, envelope.Method)
 	default:
-		log.Printf("[agent/pi-sdk] stdout.ignored_event session=%s type=%q", s.sessionKey, envelope.Type)
+		s.handleEvent([]byte(line), envelope.Type)
 	}
 }
 
@@ -461,6 +478,247 @@ func isExtensionUIDialogMethod(method string) bool {
 	}
 }
 
+func (s *session) handleEvent(raw []byte, eventType string) {
+	switch eventType {
+	case "agent_start":
+		s.resetDeltaState()
+	case "message_start":
+		s.resetDeltaState()
+	case "message_update":
+		s.handleMessageUpdate(raw)
+	case "message_end":
+		s.handleMessageEnd(raw)
+	case "context_window":
+		s.handleContextWindow(raw)
+	case "agent_end":
+		s.handleAgentEnd()
+	case "recovery", "auto_retry_start":
+		s.handleRecovery(raw)
+	case "queue_update", "turn_start", "turn_end", "session_info_changed", "thinking_level_changed":
+	default:
+		log.Printf("[agent/pi-sdk] stdout.ignored_event session=%s type=%q", s.sessionKey, eventType)
+	}
+}
+
+func (s *session) resetDeltaState() {
+	s.mu.Lock()
+	s.seenText = false
+	s.seenThinking = false
+	s.lastTurnErr = ""
+	s.mu.Unlock()
+}
+
+func (s *session) markTextSeen() {
+	s.mu.Lock()
+	s.seenText = true
+	s.mu.Unlock()
+}
+
+func (s *session) markThinkingSeen() {
+	s.mu.Lock()
+	s.seenThinking = true
+	s.mu.Unlock()
+}
+
+func (s *session) hasTextSeen() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.seenText
+}
+
+func (s *session) hasThinkingSeen() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.seenThinking
+}
+
+func (s *session) handleMessageUpdate(raw []byte) {
+	var ev struct {
+		Message struct {
+			Role    string `json:"role"`
+			Content []struct {
+				Type     string `json:"type"`
+				Text     string `json:"text"`
+				Thinking string `json:"thinking"`
+			} `json:"content"`
+		} `json:"message"`
+		AssistantMessageEvent struct {
+			Type     string `json:"type"`
+			Delta    string `json:"delta"`
+			Content  string `json:"content"`
+			Thinking string `json:"thinking"`
+		} `json:"assistantMessageEvent"`
+	}
+	if err := json.Unmarshal(raw, &ev); err != nil {
+		return
+	}
+	if ev.Message.Role != "" && ev.Message.Role != "assistant" {
+		return
+	}
+	switch ev.AssistantMessageEvent.Type {
+	case "text_delta":
+		if ev.AssistantMessageEvent.Delta != "" {
+			s.markTextSeen()
+			s.emit(agenttypes.Event{Type: agenttypes.EventTypeMessageChunk, SessionID: s.SessionID(), Data: agenttypes.MessageChunk{Content: ev.AssistantMessageEvent.Delta}})
+			return
+		}
+	case "thinking_delta":
+		if ev.AssistantMessageEvent.Delta != "" {
+			s.markThinkingSeen()
+			s.emit(agenttypes.Event{Type: agenttypes.EventTypeThoughtChunk, SessionID: s.SessionID(), Data: agenttypes.ThoughtChunk{Content: ev.AssistantMessageEvent.Delta}})
+			return
+		}
+	case "text_end":
+		if text := strings.TrimSpace(ev.AssistantMessageEvent.Content); text != "" && !s.hasTextSeen() {
+			s.markTextSeen()
+			s.emit(agenttypes.Event{Type: agenttypes.EventTypeMessageChunk, SessionID: s.SessionID(), Data: agenttypes.MessageChunk{Content: text}})
+			return
+		}
+	case "thinking_end":
+		thinking := strings.TrimSpace(ev.AssistantMessageEvent.Thinking)
+		if thinking == "" {
+			thinking = strings.TrimSpace(ev.AssistantMessageEvent.Content)
+		}
+		if thinking != "" && !s.hasThinkingSeen() {
+			s.markThinkingSeen()
+			s.emit(agenttypes.Event{Type: agenttypes.EventTypeThoughtChunk, SessionID: s.SessionID(), Data: agenttypes.ThoughtChunk{Content: thinking}})
+			return
+		}
+	}
+}
+
+func (s *session) handleMessageEnd(raw []byte) {
+	var ev struct {
+		Message struct {
+			Role         string `json:"role"`
+			StopReason   string `json:"stopReason"`
+			ErrorMessage string `json:"errorMessage"`
+			Content      []struct {
+				Type     string `json:"type"`
+				Text     string `json:"text"`
+				Thinking string `json:"thinking"`
+			} `json:"content"`
+			Usage struct {
+				Input       int `json:"input"`
+				Output      int `json:"output"`
+				CacheRead   int `json:"cacheRead"`
+				CacheWrite  int `json:"cacheWrite"`
+				TotalTokens int `json:"totalTokens"`
+			} `json:"usage"`
+		} `json:"message"`
+	}
+	if err := json.Unmarshal(raw, &ev); err != nil {
+		return
+	}
+	if ev.Message.Role != "assistant" {
+		return
+	}
+	if msg := strings.TrimSpace(ev.Message.ErrorMessage); msg != "" || ev.Message.StopReason == "error" || ev.Message.StopReason == "aborted" {
+		if msg == "" {
+			msg = "pi sdk prompt " + strings.TrimSpace(ev.Message.StopReason)
+		}
+		s.setLastTurnErr(msg)
+		s.emit(agenttypes.Event{Type: agenttypes.EventTypeRecovery, SessionID: s.SessionID(), Data: agenttypes.RecoveryStatus{Message: msg}})
+		return
+	}
+	for _, item := range ev.Message.Content {
+		switch item.Type {
+		case "text":
+			text := strings.TrimSpace(item.Text)
+			if text != "" && !s.hasTextSeen() {
+				s.markTextSeen()
+				s.emit(agenttypes.Event{Type: agenttypes.EventTypeMessageChunk, SessionID: s.SessionID(), Data: agenttypes.MessageChunk{Content: text}})
+			}
+		case "thinking":
+			thinking := strings.TrimSpace(item.Thinking)
+			if thinking != "" && !s.hasThinkingSeen() {
+				s.markThinkingSeen()
+				s.emit(agenttypes.Event{Type: agenttypes.EventTypeThoughtChunk, SessionID: s.SessionID(), Data: agenttypes.ThoughtChunk{Content: thinking}})
+			}
+		}
+	}
+	total := ev.Message.Usage.TotalTokens
+	if total == 0 {
+		total = ev.Message.Usage.Input + ev.Message.Usage.Output + ev.Message.Usage.CacheRead + ev.Message.Usage.CacheWrite
+	}
+	if total > 0 {
+		s.mu.Lock()
+		s.contextStats.TotalTokens = total
+		s.mu.Unlock()
+	}
+}
+
+func (s *session) handleContextWindow(raw []byte) {
+	var ev struct {
+		TotalTokens        int `json:"totalTokens"`
+		ModelContextWindow int `json:"modelContextWindow"`
+	}
+	if err := json.Unmarshal(raw, &ev); err != nil {
+		return
+	}
+	s.mu.Lock()
+	if ev.TotalTokens > 0 {
+		s.contextStats.TotalTokens = ev.TotalTokens
+	}
+	if ev.ModelContextWindow > 0 {
+		s.contextStats.ModelContextWindow = ev.ModelContextWindow
+	}
+	s.mu.Unlock()
+}
+
+func (s *session) handleRecovery(raw []byte) {
+	var ev struct {
+		Message      string `json:"message"`
+		ErrorMessage string `json:"errorMessage"`
+	}
+	_ = json.Unmarshal(raw, &ev)
+	message := strings.TrimSpace(ev.Message)
+	if message == "" {
+		message = strings.TrimSpace(ev.ErrorMessage)
+	}
+	if message == "" {
+		return
+	}
+	s.setLastTurnErr(message)
+	s.emit(agenttypes.Event{Type: agenttypes.EventTypeRecovery, SessionID: s.SessionID(), Data: agenttypes.RecoveryStatus{Message: message}})
+}
+
+func (s *session) handleAgentEnd() {
+	contextWindow := s.cachedContextWindow()
+	s.emit(agenttypes.Event{Type: agenttypes.EventTypeMessageDone, SessionID: s.SessionID(), Data: agenttypes.MessageDone{ContextWindow: contextWindow}})
+	s.mu.RLock()
+	lastErr := strings.TrimSpace(s.lastTurnErr)
+	s.mu.RUnlock()
+	if lastErr != "" {
+		s.signalTurnDone(errors.New(lastErr))
+		return
+	}
+	s.signalTurnDone(nil)
+}
+
+func (s *session) setLastTurnErr(message string) {
+	s.mu.Lock()
+	s.lastTurnErr = strings.TrimSpace(message)
+	s.mu.Unlock()
+}
+
+func (s *session) signalTurnDone(err error) {
+	s.turnMu.Lock()
+	ch := s.turnDone
+	select {
+	case ch <- err:
+	default:
+	}
+	s.turnMu.Unlock()
+}
+
+func (s *session) resetTurnDone() chan error {
+	s.turnMu.Lock()
+	defer s.turnMu.Unlock()
+	s.turnDone = make(chan error, 1)
+	return s.turnDone
+}
+
 func (s *session) emit(ev agenttypes.Event) {
 	s.mu.RLock()
 	onUpdate := s.onUpdate
@@ -475,16 +733,28 @@ func (s *session) SendMessage(ctx context.Context, content string) error {
 	if content == "" {
 		return nil
 	}
-	if content != "/ui-demo" {
-		return errors.New("pi sdk runtime foundation supports only /ui-demo")
-	}
 	turnCtx, turnID := s.turn.Begin(ctx)
 	defer s.turn.End(turnID)
+	turnDone := s.resetTurnDone()
+	s.resetDeltaState()
 	if _, err := s.request(turnCtx, "prompt", map[string]any{"type": "prompt", "message": content}); err != nil {
 		return err
 	}
-	s.emit(agenttypes.Event{Type: agenttypes.EventTypeMessageDone, SessionID: s.SessionID(), Data: agenttypes.MessageDone{ContextWindow: s.cachedContextWindow()}})
-	return nil
+	if content == "/ui-demo" {
+		s.emit(agenttypes.Event{Type: agenttypes.EventTypeMessageDone, SessionID: s.SessionID(), Data: agenttypes.MessageDone{ContextWindow: s.cachedContextWindow()}})
+		return nil
+	}
+	select {
+	case err := <-turnDone:
+		if err != nil && !errors.Is(err, io.EOF) {
+			return err
+		}
+		return nil
+	case <-turnCtx.Done():
+		return turnCtx.Err()
+	case <-s.closed:
+		return errors.New("pi sdk runtime session closed")
+	}
 }
 
 func (s *session) AnswerQuestion(context.Context, agenttypes.AskUserAnswer) error {
@@ -570,7 +840,7 @@ func (s *session) SessionID() string {
 }
 
 func (s *session) ContextWindow(context.Context) (agenttypes.ContextWindow, error) {
-	return s.cachedContextWindow(), errors.New("context window is not supported by pi-sdk runtime foundation")
+	return s.cachedContextWindow(), nil
 }
 
 func (s *session) cachedContextWindow() agenttypes.ContextWindow {
