@@ -68,6 +68,7 @@ type OpenSessionInput struct {
 	RootPath       string
 	AgentSessionID string
 	AgentCtxSeq    int
+	TestScenario   string
 }
 
 type RuntimeDefaults struct {

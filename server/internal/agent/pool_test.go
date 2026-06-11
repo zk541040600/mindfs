@@ -120,10 +120,11 @@ func TestPoolRoutesPiSDKProtocol(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	sess, err := pool.GetOrCreate(ctx, agenttypes.OpenSessionInput{
-		SessionKey: "pool-pi-sdk",
-		AgentName:  "pi-sdk-test",
-		RootPath:   poolTestRepoRoot(t),
-		Probe:      true,
+		SessionKey:   "pool-pi-sdk",
+		AgentName:    "pi-sdk-test",
+		RootPath:     poolTestRepoRoot(t),
+		Probe:        true,
+		TestScenario: "prompt-stream",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -165,10 +166,11 @@ func TestPoolKillAgentProcessRoutesPiSDK(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if _, err := pool.GetOrCreate(ctx, agenttypes.OpenSessionInput{
-		SessionKey: "pool-pi-sdk-kill",
-		AgentName:  "pi-sdk-test",
-		RootPath:   poolTestRepoRoot(t),
-		Probe:      true,
+		SessionKey:   "pool-pi-sdk-kill",
+		AgentName:    "pi-sdk-test",
+		RootPath:     poolTestRepoRoot(t),
+		Probe:        true,
+		TestScenario: "prompt-stream",
 	}); err != nil {
 		t.Fatal(err)
 	}

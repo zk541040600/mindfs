@@ -47,6 +47,33 @@ func openTestSessionWithModelMode(t *testing.T, scenario, model, mode string) ag
 	return sess
 }
 
+func TestStartPayloadForOptionsUsesSDKRuntimeForProbe(t *testing.T) {
+	payload := startPayloadForOptions(OpenOptions{
+		Model: "provider/model",
+		Probe: true,
+	})
+	if payload["type"] != "start_sdk_runtime" {
+		t.Fatalf("payload type = %v, want start_sdk_runtime", payload["type"])
+	}
+	if payload["model"] != "provider/model" {
+		t.Fatalf("payload model = %v, want provider/model", payload["model"])
+	}
+	if _, ok := payload["scenario"]; ok {
+		t.Fatalf("probe payload unexpectedly selected test scenario: %+v", payload)
+	}
+}
+
+func TestStartPayloadForOptionsUsesExplicitTestScenario(t *testing.T) {
+	payload := startPayloadForOptions(OpenOptions{
+		Model:        "provider/model",
+		Probe:        true,
+		TestScenario: "prompt-stream",
+	})
+	if payload["type"] != "start_test_runtime" || payload["scenario"] != "prompt-stream" {
+		t.Fatalf("payload = %+v, want explicit prompt-stream test runtime", payload)
+	}
+}
+
 func collectSessionEvents(sess agenttypes.Session) (*[]agenttypes.Event, *sync.Mutex) {
 	events := make([]agenttypes.Event, 0, 12)
 	var mu sync.Mutex
