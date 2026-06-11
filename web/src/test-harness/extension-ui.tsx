@@ -3,6 +3,7 @@ import { createRoot } from "react-dom/client";
 import "../index.css";
 import {
   ExtensionUIDialog,
+  extensionUIPayloadLines,
   extensionUIPayloadString,
   extensionUIPayloadStringArray,
   isExtensionUIDialogMethod,
@@ -90,7 +91,7 @@ const fireAndForgetRequests: Record<string, ExtensionUIRequest> = {
     method: "notify",
     payload: {
       message: "ui-demo notification",
-      notifyType: "info",
+      notificationType: "info",
     },
   },
   setStatus: {
@@ -106,8 +107,8 @@ const fireAndForgetRequests: Record<string, ExtensionUIRequest> = {
     method: "setWidget",
     payload: {
       widgetKey: "mindfs.pi_sdk_bridge",
-      widgetLines: ["SDK bridge widget"],
-      widgetPlacement: "aboveEditor",
+      content: ["SDK bridge widget"],
+      placement: "aboveEditor",
     },
   },
   setTitle: {
@@ -233,8 +234,11 @@ function ExtensionUIHarness() {
       updatePublishedSnapshot(nextChrome);
     } else if (method === "setWidget") {
       const widgetKey = extensionUIPayloadString(payload, "widgetKey") || request.id;
-      const lines = extensionUIPayloadStringArray(payload, "widgetLines");
-      const placement = extensionUIPayloadString(payload, "widgetPlacement");
+      const legacyLines = extensionUIPayloadStringArray(payload, "widgetLines");
+      const lines = legacyLines.length > 0 ? legacyLines : extensionUIPayloadLines(payload, "content");
+      const placement =
+        extensionUIPayloadString(payload, "widgetPlacement") ||
+        extensionUIPayloadString(payload, "placement");
       const widgets = { ...chrome.widgets };
       if (lines.length > 0) widgets[widgetKey] = { lines, placement };
       else delete widgets[widgetKey];

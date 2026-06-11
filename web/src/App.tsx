@@ -99,6 +99,7 @@ import { ToastContainer } from "./components/Toast";
 import { BottomSheet } from "./components/BottomSheet";
 import {
   ExtensionUIDialog,
+  extensionUIPayloadLines,
   extensionUIPayloadString,
   extensionUIPayloadStringArray,
   isExtensionUIDialogMethod,
@@ -6266,7 +6267,9 @@ export function App({ onGoHome }: AppProps) {
               extensionUIPayloadString(payloadData, "message") ||
               extensionUIPayloadString(payloadData, "title") ||
               "Pi extension notification";
-            const notifyType = extensionUIPayloadString(payloadData, "notifyType");
+            const notifyType =
+              extensionUIPayloadString(payloadData, "notifyType") ||
+              extensionUIPayloadString(payloadData, "notificationType");
             reportError("session.extension_ui", message, {
               severity:
                 notifyType === "error"
@@ -6288,8 +6291,14 @@ export function App({ onGoHome }: AppProps) {
             });
           } else if (method === "setWidget") {
             const widgetKey = extensionUIPayloadString(payloadData, "widgetKey") || request.id;
-            const lines = extensionUIPayloadStringArray(payloadData, "widgetLines");
-            const placement = extensionUIPayloadString(payloadData, "widgetPlacement");
+            const legacyLines = extensionUIPayloadStringArray(payloadData, "widgetLines");
+            const lines =
+              legacyLines.length > 0
+                ? legacyLines
+                : extensionUIPayloadLines(payloadData, "content");
+            const placement =
+              extensionUIPayloadString(payloadData, "widgetPlacement") ||
+              extensionUIPayloadString(payloadData, "placement");
             setExtensionUIChrome((prev) => {
               const widgets = { ...prev.widgets };
               if (lines.length > 0) widgets[widgetKey] = { lines, placement };

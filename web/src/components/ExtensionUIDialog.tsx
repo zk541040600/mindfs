@@ -34,6 +34,17 @@ export function extensionUIPayloadStringArray(
   return value.filter((item): item is string => typeof item === "string");
 }
 
+export function extensionUIPayloadLines(
+  payload: Record<string, unknown> | undefined,
+  key: string,
+): string[] {
+  const values = extensionUIPayloadStringArray(payload, key);
+  if (values.length > 0) return values;
+  const text = extensionUIPayloadString(payload, key);
+  if (!text) return [];
+  return text.split(/\r?\n/).filter((line) => line.trim() !== "");
+}
+
 export function isExtensionUIDialogMethod(method: string): boolean {
   return ["select", "confirm", "input", "editor"].includes(method);
 }
