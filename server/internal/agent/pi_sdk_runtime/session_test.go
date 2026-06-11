@@ -2,6 +2,7 @@ package pisdkruntime
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -23,6 +24,11 @@ func repoRoot(t *testing.T) string {
 
 func openTestSession(t *testing.T, scenario string) agenttypes.Session {
 	t.Helper()
+	return openTestSessionWithModelMode(t, scenario, "sdk-model", "sdk-mode")
+}
+
+func openTestSessionWithModelMode(t *testing.T, scenario, model, mode string) agenttypes.Session {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	sess, err := NewRuntime().OpenSession(ctx, OpenOptions{
@@ -30,8 +36,8 @@ func openTestSession(t *testing.T, scenario string) agenttypes.Session {
 		SessionKey:   "sdk-test",
 		RootPath:     repoRoot(t),
 		Command:      "pi",
-		Model:        "sdk-model",
-		Mode:         "sdk-mode",
+		Model:        model,
+		Mode:         mode,
 		TestScenario: scenario,
 	})
 	if err != nil {
@@ -93,6 +99,32 @@ func hasEvent(events []agenttypes.Event, typ agenttypes.EventType) bool {
 		}
 	}
 	return false
+}
+
+func toolCalls(events []agenttypes.Event, typ agenttypes.EventType) []agenttypes.ToolCall {
+	calls := make([]agenttypes.ToolCall, 0)
+	for _, ev := range events {
+		if ev.Type != typ {
+			continue
+		}
+		call, ok := ev.Data.(agenttypes.ToolCall)
+		if ok {
+			calls = append(calls, call)
+		}
+	}
+	return calls
+}
+
+func waitForEvent(t *testing.T, events *[]agenttypes.Event, mu *sync.Mutex, typ agenttypes.EventType) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if hasEvent(snapshotEvents(events, mu), typ) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("event %q not observed: %#v", typ, snapshotEvents(events, mu))
 }
 
 func TestRuntimeUIDemoEmitsExtensionUIAndAcceptsResponses(t *testing.T) {
@@ -187,16 +219,122 @@ func TestRuntimePromptFailureReturnsError(t *testing.T) {
 	}
 }
 
-func TestRuntimeUnsupportedMethodsReturnErrors(t *testing.T) {
-	sess := openTestSession(t, "extension-ui")
-	ctx := context.Background()
-	if err := sess.SetModel(ctx, "provider/model"); err == nil || !strings.Contains(err.Error(), "not supported") {
-		t.Fatalf("expected SetModel unsupported error, got %v", err)
+func TestRuntimeToolEventsMapToMindFSToolCalls(t *testing.T) {
+	sess := openTestSession(t, "tool-events")
+	events, mu := collectSessionEvents(sess)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := sess.SendMessage(ctx, "list files"); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := sess.ListCommands(ctx); err == nil || !strings.Contains(err.Error(), "not supported") {
-		t.Fatalf("expected ListCommands unsupported error, got %v", err)
+
+	gotEvents := snapshotEvents(events, mu)
+	starts := toolCalls(gotEvents, agenttypes.EventTypeToolCall)
+	if len(starts) != 1 {
+		t.Fatalf("tool_call events = %#v, want 1", starts)
 	}
-	if err := sess.CancelCurrentTurn(); err == nil || !strings.Contains(err.Error(), "not supported") {
-		t.Fatalf("expected CancelCurrentTurn unsupported error, got %v", err)
+	if starts[0].CallID != "tool-1" || starts[0].RawType != "pi-sdk" || starts[0].Kind != agenttypes.ToolKindRead || starts[0].Status != "running" {
+		t.Fatalf("tool start = %+v", starts[0])
+	}
+	updates := toolCalls(gotEvents, agenttypes.EventTypeToolUpdate)
+	if len(updates) != 2 {
+		t.Fatalf("tool_update events = %#v, want update and end", updates)
+	}
+	if updates[0].Status != "running" || len(updates[0].Content) != 1 || updates[0].Content[0].Text != "AGENTS.md" {
+		t.Fatalf("tool partial update = %+v", updates[0])
+	}
+	if updates[1].Status != "complete" || len(updates[1].Content) != 1 || updates[1].Content[0].Text != "README.md" {
+		t.Fatalf("tool final update = %+v", updates[1])
+	}
+}
+
+func TestRuntimeSlashCommandsListAndExecute(t *testing.T) {
+	sess := openTestSession(t, "slash-controls")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	commands, err := sess.ListCommands(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(commands.Commands) != 3 {
+		t.Fatalf("commands = %+v, want 3", commands)
+	}
+	if commands.Commands[0].Name != "jira" || commands.Commands[0].Description != "extension: Jira issue lookup" {
+		t.Fatalf("first command = %+v", commands.Commands[0])
+	}
+
+	events, mu := collectSessionEvents(sess)
+	if err := sess.SendMessage(ctx, "/skill:jira GE-1"); err != nil {
+		t.Fatal(err)
+	}
+	if got := joinedMessageChunks(snapshotEvents(events, mu)); got != "slash command executed: /skill:jira GE-1" {
+		t.Fatalf("slash response = %q", got)
+	}
+}
+
+func TestRuntimeModelModeControls(t *testing.T) {
+	sess := openTestSessionWithModelMode(t, "runtime-controls", "", "")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	models, err := sess.ListModels(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if models.CurrentModelID != "fake/model" || len(models.Models) != 2 || models.Models[0].ID != "fake/model" {
+		t.Fatalf("models = %+v", models)
+	}
+	if err := sess.SetModel(ctx, "fake/plain"); err != nil {
+		t.Fatal(err)
+	}
+	if got := sess.CurrentModel(); got != "fake/plain" {
+		t.Fatalf("CurrentModel = %q, want fake/plain", got)
+	}
+	if err := sess.SetModel(ctx, "missing/model"); err == nil || !strings.Contains(err.Error(), "model not found") {
+		t.Fatalf("expected missing model error, got %v", err)
+	}
+
+	modes, err := sess.ListModes(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if modes.CurrentModeID != "off" || len(modes.Modes) == 0 {
+		t.Fatalf("modes = %+v", modes)
+	}
+	if err := sess.SetMode(ctx, "high"); err != nil {
+		t.Fatal(err)
+	}
+	modes, err = sess.ListModes(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if modes.CurrentModeID != "high" {
+		t.Fatalf("CurrentModeID = %q, want high", modes.CurrentModeID)
+	}
+}
+
+func TestRuntimeCancelCurrentTurnUnblocksPrompt(t *testing.T) {
+	sess := openTestSessionWithModelMode(t, "runtime-controls", "", "")
+	events, mu := collectSessionEvents(sess)
+	done := make(chan error, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	go func() {
+		done <- sess.SendMessage(ctx, "wait-for-cancel")
+	}()
+	waitForEvent(t, events, mu, agenttypes.EventTypeMessageChunk)
+	if err := sess.CancelCurrentTurn(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil && !errors.Is(err, context.Canceled) && !strings.Contains(err.Error(), "aborted") {
+			t.Fatalf("SendMessage after cancel = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("SendMessage did not unblock after CancelCurrentTurn")
 	}
 }

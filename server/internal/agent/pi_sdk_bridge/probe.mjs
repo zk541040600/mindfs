@@ -1148,6 +1148,8 @@ async function runJsonl(argv) {
             throw new ProbeError("E_STATE", "runtime must be started before extension_ui_response");
           }
           await runtime.answerExtensionUI(request);
+        } else if (await dispatchJsonlRuntimeControl(runtime, request)) {
+          // Handled by the active JSONL runtime.
         } else if (request.type === "capabilities") {
           const data = await capabilitiesProbe({ ...baseOptions, cwd: resolve(request.cwd ?? baseOptions.cwd), agentDir: resolve(request.agentDir ?? baseOptions.agentDir) });
           writeJsonl(successResponse("capabilities", data, request.id));
@@ -1166,12 +1168,44 @@ async function runJsonl(argv) {
   }
 }
 
+async function dispatchJsonlRuntimeControl(runtime, request) {
+  const handlers = {
+    get_state: "getState",
+    get_available_models: "getAvailableModels",
+    set_model: "setModel",
+    set_thinking_level: "setThinkingLevel",
+    get_commands: "getCommands",
+    abort: "abort",
+  };
+  const method = handlers[request.type];
+  if (!method) {
+    return false;
+  }
+  if (!runtime) {
+    throw new ProbeError("E_STATE", `runtime must be started before ${request.type}`);
+  }
+  if (typeof runtime[method] !== "function") {
+    throw new ProbeError("E_PARAM", `${runtime.kind ?? "jsonl"} runtime does not support ${request.type}`);
+  }
+  await runtime[method](request);
+  return true;
+}
+
 function createJsonlTestRuntime(scenario) {
   if (scenario === "extension-ui") {
     return createJsonlUIRuntime();
   }
   if (scenario === "prompt-stream") {
     return createJsonlPromptRuntime();
+  }
+  if (scenario === "tool-events") {
+    return createJsonlToolRuntime();
+  }
+  if (scenario === "slash-controls") {
+    return createJsonlSlashRuntime();
+  }
+  if (scenario === "runtime-controls") {
+    return createJsonlControlsRuntime();
   }
   throw new ProbeError("E_PARAM", `unsupported test runtime scenario: ${scenario}`);
 }
@@ -1251,6 +1285,180 @@ function createJsonlPromptRuntime() {
   };
 }
 
+function createJsonlToolRuntime() {
+  return {
+    kind: "tool-events",
+    prompt: async function (request) {
+      const message = String(request.message ?? "").trim();
+      if (!message) {
+        throw new ProbeError("E_PARAM", "prompt message required");
+      }
+      writeJsonl(successResponse("prompt", { scenario: "tool-events" }, request.id));
+      writeJsonl({ type: "agent_start" });
+      writeJsonl({ type: "tool_execution_start", toolCallId: "tool-1", toolName: "ls", args: { path: "." } });
+      writeJsonl({
+        type: "tool_execution_update",
+        toolCallId: "tool-1",
+        toolName: "ls",
+        args: { path: "." },
+        partialResult: { content: [{ type: "text", text: "AGENTS.md" }] },
+      });
+      writeJsonl({
+        type: "tool_execution_end",
+        toolCallId: "tool-1",
+        toolName: "ls",
+        result: { content: [{ type: "text", text: "README.md" }] },
+        isError: false,
+      });
+      writeJsonl({
+        type: "message_end",
+        message: {
+          role: "assistant",
+          stopReason: "end_turn",
+          content: [{ type: "text", text: "listed files" }],
+          usage: { input: 1, output: 2, totalTokens: 3 },
+        },
+      });
+      writeJsonl({ type: "context_window", totalTokens: 3, modelContextWindow: 100 });
+      writeJsonl({ type: "agent_end", willRetry: false });
+    },
+    answerExtensionUI: async function (request) {
+      throw new ProbeError("E_PARAM", `unknown extension UI request id: ${request.id}`);
+    },
+    dispose: async function () {},
+  };
+}
+
+function createJsonlSlashRuntime() {
+  const commands = [
+    { name: "jira", description: "Jira issue lookup", source: "extension" },
+    { name: "skill:jira", description: "Jira skill workflow", source: "skill" },
+    { name: "review", description: "Review current changes", source: "prompt" },
+  ];
+  return {
+    kind: "slash-controls",
+    prompt: async function (request) {
+      const message = String(request.message ?? "").trim();
+      if (!message.startsWith("/")) {
+        throw new ProbeError("E_PARAM", "slash-controls runtime supports only slash prompts");
+      }
+      writeJsonl(successResponse("prompt", { scenario: "slash-controls" }, request.id));
+      writeJsonl({ type: "agent_start" });
+      writeJsonl({ type: "message_start", message: { role: "assistant", content: [] } });
+      writeJsonl({
+        type: "message_update",
+        message: { role: "assistant", content: [{ type: "text", text: `slash command executed: ${message}` }] },
+        assistantMessageEvent: { type: "text_delta", delta: `slash command executed: ${message}` },
+      });
+      writeJsonl({
+        type: "message_end",
+        message: {
+          role: "assistant",
+          stopReason: "end_turn",
+          content: [{ type: "text", text: `slash command executed: ${message}` }],
+          usage: { input: 2, output: 3, totalTokens: 5 },
+        },
+      });
+      writeJsonl({ type: "context_window", totalTokens: 5, modelContextWindow: 100 });
+      writeJsonl({ type: "agent_end", willRetry: false });
+    },
+    getCommands: async function (request) {
+      writeJsonl(successResponse("get_commands", { commands }, request.id));
+    },
+    answerExtensionUI: async function (request) {
+      throw new ProbeError("E_PARAM", `unknown extension UI request id: ${request.id}`);
+    },
+    dispose: async function () {},
+  };
+}
+
+function createJsonlControlsRuntime() {
+  const models = [
+    { id: "model", name: "Fake Model", provider: "fake", reasoning: true, thinkingLevelMap: { off: "off", high: "high" } },
+    { id: "plain", name: "Plain Model", provider: "fake", reasoning: false },
+  ];
+  const state = {
+    sessionId: "sdk-test",
+    model: { provider: "fake", id: "model" },
+    thinkingLevel: "off",
+    isStreaming: false,
+  };
+  return {
+    kind: "runtime-controls",
+    prompt: async function (request) {
+      const message = String(request.message ?? "").trim();
+      if (!message) {
+        throw new ProbeError("E_PARAM", "prompt message required");
+      }
+      writeJsonl(successResponse("prompt", { scenario: "runtime-controls" }, request.id));
+      writeJsonl({ type: "agent_start" });
+      if (message === "wait-for-cancel") {
+        state.isStreaming = true;
+        writeJsonl({ type: "message_start", message: { role: "assistant", content: [] } });
+        writeJsonl({
+          type: "message_update",
+          message: { role: "assistant", content: [{ type: "text", text: "waiting for cancel" }] },
+          assistantMessageEvent: { type: "text_delta", delta: "waiting for cancel" },
+        });
+        return;
+      }
+      writeJsonl({
+        type: "message_end",
+        message: {
+          role: "assistant",
+          stopReason: "end_turn",
+          content: [{ type: "text", text: `runtime controls: ${message}` }],
+          usage: { input: 1, output: 1, totalTokens: 2 },
+        },
+      });
+      writeJsonl({ type: "agent_end", willRetry: false });
+    },
+    getState: async function (request) {
+      writeJsonl(successResponse("get_state", state, request.id));
+    },
+    getAvailableModels: async function (request) {
+      writeJsonl(successResponse("get_available_models", { models }, request.id));
+    },
+    setModel: async function (request) {
+      const model = models.find((item) => item.provider === request.provider && item.id === request.modelId);
+      if (!model) {
+        throw new ProbeError("E_PARAM", `model not found: ${request.provider}/${request.modelId}`);
+      }
+      state.model = { provider: model.provider, id: model.id };
+      writeJsonl(successResponse("set_model", model, request.id));
+    },
+    setThinkingLevel: async function (request) {
+      const level = String(request.level ?? "").trim();
+      if (!level) {
+        throw new ProbeError("E_PARAM", "thinking level required");
+      }
+      state.thinkingLevel = level;
+      writeJsonl(successResponse("set_thinking_level", { level }, request.id));
+    },
+    getCommands: async function (request) {
+      writeJsonl(successResponse("get_commands", { commands: [] }, request.id));
+    },
+    abort: async function (request) {
+      state.isStreaming = false;
+      writeJsonl(successResponse("abort", { aborted: true }, request.id));
+      writeJsonl({
+        type: "message_end",
+        message: {
+          role: "assistant",
+          stopReason: "aborted",
+          content: [],
+          errorMessage: "pi sdk prompt aborted",
+        },
+      });
+      writeJsonl({ type: "agent_end", willRetry: false });
+    },
+    answerExtensionUI: async function (request) {
+      throw new ProbeError("E_PARAM", `unknown extension UI request id: ${request.id}`);
+    },
+    dispose: async function () {},
+  };
+}
+
 async function createJsonlSDKRuntime(options) {
   const cwd = options.cwd ?? DEFAULT_CWD;
   const agentDir = options.agentDir ?? DEFAULT_AGENT_DIR;
@@ -1259,20 +1467,12 @@ async function createJsonlSDKRuntime(options) {
   const services = await createAgentSessionServices({
     cwd,
     agentDir,
-    resourceLoaderOptions: {
-      noExtensions: true,
-      noSkills: true,
-      noPromptTemplates: true,
-      noThemes: true,
-      noContextFiles: true,
-    },
   });
   const model = resolveJsonlModel(services.modelRegistry, options.model);
   const { session } = await createAgentSessionFromServices({
     services,
     sessionManager,
     model,
-    noTools: "all",
     thinkingLevel: "off",
   });
   let unsubscribe = session.subscribe((event) => {
@@ -1311,6 +1511,71 @@ async function createJsonlSDKRuntime(options) {
     },
     answerExtensionUI: async function (request) {
       throw new ProbeError("E_PARAM", `unknown extension UI request id: ${request.id}`);
+    },
+    getState: async function (request) {
+      writeJsonl(successResponse("get_state", {
+        model: session.model,
+        thinkingLevel: session.thinkingLevel,
+        isStreaming: session.isStreaming,
+        isCompacting: session.isCompacting,
+        steeringMode: session.steeringMode,
+        followUpMode: session.followUpMode,
+        sessionFile: session.sessionFile,
+        sessionId: session.sessionId,
+        sessionName: session.sessionName,
+        autoCompactionEnabled: session.autoCompactionEnabled,
+        messageCount: session.messages?.length ?? 0,
+        pendingMessageCount: session.pendingMessageCount,
+      }, request.id));
+    },
+    getAvailableModels: async function (request) {
+      const models = await session.modelRegistry.getAvailable();
+      writeJsonl(successResponse("get_available_models", { models }, request.id));
+    },
+    setModel: async function (request) {
+      const models = await session.modelRegistry.getAvailable();
+      const model = models.find((item) => item.provider === request.provider && item.id === request.modelId);
+      if (!model) {
+        throw new ProbeError("E_PARAM", `model not found: ${request.provider}/${request.modelId}`);
+      }
+      await session.setModel(model);
+      writeJsonl(successResponse("set_model", model, request.id));
+    },
+    setThinkingLevel: async function (request) {
+      session.setThinkingLevel(request.level);
+      writeJsonl(successResponse("set_thinking_level", { level: session.thinkingLevel }, request.id));
+    },
+    getCommands: async function (request) {
+      const commands = [];
+      for (const command of session.extensionRunner?.getRegisteredCommands?.() ?? []) {
+        commands.push({
+          name: command.invocationName,
+          description: command.description,
+          source: "extension",
+          sourceInfo: command.sourceInfo,
+        });
+      }
+      for (const template of session.promptTemplates ?? []) {
+        commands.push({
+          name: template.name,
+          description: template.description,
+          source: "prompt",
+          sourceInfo: template.sourceInfo,
+        });
+      }
+      for (const skill of session.resourceLoader?.getSkills?.().skills ?? []) {
+        commands.push({
+          name: `skill:${skill.name}`,
+          description: skill.description,
+          source: "skill",
+          sourceInfo: skill.sourceInfo,
+        });
+      }
+      writeJsonl(successResponse("get_commands", { commands }, request.id));
+    },
+    abort: async function (request) {
+      await session.abort();
+      writeJsonl(successResponse("abort", {}, request.id));
     },
     dispose: async function () {
       unsubscribe?.();

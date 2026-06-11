@@ -21,8 +21,9 @@ import (
 )
 
 const (
-	defaultNodeCommand = "node"
-	startupTimeout     = 10 * time.Second
+	defaultNodeCommand    = "node"
+	defaultCommandTimeout = 30 * time.Second
+	startupTimeout        = 10 * time.Second
 )
 
 type OpenOptions struct {
@@ -492,6 +493,12 @@ func (s *session) handleEvent(raw []byte, eventType string) {
 		s.handleContextWindow(raw)
 	case "agent_end":
 		s.handleAgentEnd()
+	case "tool_execution_start":
+		s.handleToolExecutionStart(raw)
+	case "tool_execution_update":
+		s.handleToolExecutionUpdate(raw)
+	case "tool_execution_end":
+		s.handleToolExecutionEnd(raw)
 	case "recovery", "auto_retry_start":
 		s.handleRecovery(raw)
 	case "queue_update", "turn_start", "turn_end", "session_info_changed", "thinking_level_changed":
@@ -696,6 +703,71 @@ func (s *session) handleAgentEnd() {
 	s.signalTurnDone(nil)
 }
 
+func (s *session) handleToolExecutionStart(raw []byte) {
+	var ev struct {
+		ToolCallID string         `json:"toolCallId"`
+		ToolName   string         `json:"toolName"`
+		Args       map[string]any `json:"args"`
+	}
+	if err := json.Unmarshal(raw, &ev); err != nil {
+		return
+	}
+	s.emit(agenttypes.Event{Type: agenttypes.EventTypeToolCall, SessionID: s.SessionID(), Data: agenttypes.ToolCall{
+		CallID:  ev.ToolCallID,
+		Title:   toolTitle(ev.ToolName, ev.Args),
+		Status:  "running",
+		Kind:    inferToolKind(ev.ToolName),
+		RawType: "pi-sdk",
+		Meta:    map[string]any{"input": rawValueString(ev.Args), "rawInput": ev.Args},
+	}})
+}
+
+func (s *session) handleToolExecutionUpdate(raw []byte) {
+	var ev struct {
+		ToolCallID    string          `json:"toolCallId"`
+		ToolName      string          `json:"toolName"`
+		Args          map[string]any  `json:"args"`
+		PartialResult json.RawMessage `json:"partialResult"`
+	}
+	if err := json.Unmarshal(raw, &ev); err != nil {
+		return
+	}
+	s.emit(agenttypes.Event{Type: agenttypes.EventTypeToolUpdate, SessionID: s.SessionID(), Data: agenttypes.ToolCall{
+		CallID:  ev.ToolCallID,
+		Title:   toolTitle(ev.ToolName, ev.Args),
+		Status:  "running",
+		Kind:    inferToolKind(ev.ToolName),
+		Content: resultContentItems(ev.PartialResult),
+		RawType: "pi-sdk",
+		Meta:    resultMeta(ev.Args, ev.PartialResult),
+	}})
+}
+
+func (s *session) handleToolExecutionEnd(raw []byte) {
+	var ev struct {
+		ToolCallID string          `json:"toolCallId"`
+		ToolName   string          `json:"toolName"`
+		Result     json.RawMessage `json:"result"`
+		IsError    bool            `json:"isError"`
+	}
+	if err := json.Unmarshal(raw, &ev); err != nil {
+		return
+	}
+	status := "complete"
+	if ev.IsError {
+		status = "failed"
+	}
+	s.emit(agenttypes.Event{Type: agenttypes.EventTypeToolUpdate, SessionID: s.SessionID(), Data: agenttypes.ToolCall{
+		CallID:  ev.ToolCallID,
+		Title:   strings.TrimSpace(ev.ToolName),
+		Status:  status,
+		Kind:    inferToolKind(ev.ToolName),
+		Content: resultContentItems(ev.Result),
+		RawType: "pi-sdk",
+		Meta:    resultMeta(nil, ev.Result),
+	}})
+}
+
 func (s *session) setLastTurnErr(message string) {
 	s.mu.Lock()
 	s.lastTurnErr = strings.TrimSpace(message)
@@ -802,29 +874,132 @@ func (s *session) CurrentModel() string {
 	return s.model
 }
 
-func (s *session) SetModel(context.Context, string) error {
-	return errors.New("model switching is not supported by pi-sdk runtime foundation")
+func (s *session) SetModel(ctx context.Context, model string) error {
+	provider, modelID := splitModelID(model)
+	if provider == "" || modelID == "" {
+		return errors.New("model must be provider/modelId")
+	}
+	_, err := s.request(withDefaultTimeout(ctx), "set-model", map[string]any{"type": "set_model", "provider": provider, "modelId": modelID})
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.model = provider + "/" + modelID
+	s.mu.Unlock()
+	return nil
 }
 
-func (s *session) ListModels(context.Context) (agenttypes.ModelList, error) {
-	return agenttypes.ModelList{}, errors.New("model listing is not supported by pi-sdk runtime foundation")
+func (s *session) ListModels(ctx context.Context) (agenttypes.ModelList, error) {
+	resp, err := s.request(withDefaultTimeout(ctx), "models", map[string]any{"type": "get_available_models"})
+	if err != nil {
+		return agenttypes.ModelList{}, err
+	}
+	var data struct {
+		Models []struct {
+			ID            string         `json:"id"`
+			Name          string         `json:"name"`
+			Provider      string         `json:"provider"`
+			Reasoning     bool           `json:"reasoning"`
+			ThinkingLevel map[string]any `json:"thinkingLevelMap"`
+		} `json:"models"`
+	}
+	if err := json.Unmarshal(resp.Data, &data); err != nil {
+		return agenttypes.ModelList{}, err
+	}
+	models := make([]agenttypes.ModelInfo, 0, len(data.Models))
+	for _, item := range data.Models {
+		id := normalizeModelID(item.Provider + "/" + item.ID)
+		if id == "/" || strings.Trim(id, "/") == "" {
+			continue
+		}
+		name := strings.TrimSpace(item.Name)
+		if name == "" {
+			name = item.ID
+		}
+		if item.Provider != "" && !strings.HasPrefix(strings.ToLower(name), strings.ToLower(item.Provider)+"/") {
+			name = item.Provider + "/" + name
+		}
+		models = append(models, agenttypes.ModelInfo{ID: id, Name: name})
+	}
+	current := s.CurrentModel()
+	if current == "" {
+		_ = s.refreshState(ctx)
+		current = s.CurrentModel()
+	}
+	return agenttypes.ModelList{CurrentModelID: current, Models: models}, nil
 }
 
-func (s *session) SetMode(context.Context, string) error {
-	return errors.New("mode switching is not supported by pi-sdk runtime foundation")
+func (s *session) SetMode(ctx context.Context, mode string) error {
+	mode = strings.TrimSpace(mode)
+	if mode == "" {
+		return nil
+	}
+	_, err := s.request(withDefaultTimeout(ctx), "set-mode", map[string]any{"type": "set_thinking_level", "level": mode})
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.mode = mode
+	s.mu.Unlock()
+	return nil
 }
 
-func (s *session) ListModes(context.Context) (agenttypes.ModeList, error) {
-	return agenttypes.ModeList{}, errors.New("mode listing is not supported by pi-sdk runtime foundation")
+func (s *session) ListModes(ctx context.Context) (agenttypes.ModeList, error) {
+	_ = s.refreshState(ctx)
+	modes := []agenttypes.ModeInfo{
+		{ID: "off", Name: "Thinking: off"},
+		{ID: "minimal", Name: "Thinking: minimal"},
+		{ID: "low", Name: "Thinking: low"},
+		{ID: "medium", Name: "Thinking: medium"},
+		{ID: "high", Name: "Thinking: high"},
+		{ID: "xhigh", Name: "Thinking: xhigh"},
+	}
+	s.mu.RLock()
+	current := s.mode
+	s.mu.RUnlock()
+	return agenttypes.ModeList{CurrentModeID: current, Modes: modes}, nil
 }
 
-func (s *session) ListCommands(context.Context) (agenttypes.CommandList, error) {
-	return agenttypes.CommandList{}, errors.New("command listing is not supported by pi-sdk runtime foundation")
+func (s *session) ListCommands(ctx context.Context) (agenttypes.CommandList, error) {
+	resp, err := s.request(withDefaultTimeout(ctx), "commands", map[string]any{"type": "get_commands"})
+	if err != nil {
+		return agenttypes.CommandList{}, err
+	}
+	var data struct {
+		Commands []struct {
+			Name        string `json:"name"`
+			Description string `json:"description"`
+			Source      string `json:"source"`
+		} `json:"commands"`
+	}
+	if err := json.Unmarshal(resp.Data, &data); err != nil {
+		return agenttypes.CommandList{}, err
+	}
+	commands := make([]agenttypes.CommandInfo, 0, len(data.Commands))
+	for _, command := range data.Commands {
+		name := strings.TrimSpace(command.Name)
+		if name == "" {
+			continue
+		}
+		desc := strings.TrimSpace(command.Description)
+		if src := strings.TrimSpace(command.Source); src != "" && desc != "" && !strings.HasPrefix(strings.ToLower(desc), strings.ToLower(src)+":") {
+			desc = src + ": " + desc
+		}
+		commands = append(commands, agenttypes.CommandInfo{Name: name, Description: desc})
+	}
+	log.Printf("[agent/pi-sdk] commands.cached session=%s count=%d", s.sessionKey, len(commands))
+	return agenttypes.CommandList{Commands: commands}, nil
 }
 
 func (s *session) CancelCurrentTurn() error {
 	s.turn.Cancel()
-	return errors.New("turn cancellation is not supported by pi-sdk runtime foundation")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := s.request(ctx, "abort", map[string]any{"type": "abort"})
+	if err != nil && !strings.Contains(err.Error(), "closed") {
+		return err
+	}
+	return nil
 }
 
 func (s *session) OnUpdate(onUpdate func(agenttypes.Event)) {
@@ -847,6 +1022,160 @@ func (s *session) cachedContextWindow() agenttypes.ContextWindow {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.contextStats
+}
+
+func (s *session) refreshState(ctx context.Context) error {
+	resp, err := s.request(withDefaultTimeout(ctx), "state", map[string]any{"type": "get_state"})
+	if err != nil {
+		return err
+	}
+	var data struct {
+		SessionID     string `json:"sessionId"`
+		ThinkingLevel string `json:"thinkingLevel"`
+		Model         *struct {
+			ID       string `json:"id"`
+			Provider string `json:"provider"`
+		} `json:"model"`
+	}
+	if err := json.Unmarshal(resp.Data, &data); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	if strings.TrimSpace(data.SessionID) != "" {
+		s.sessionID = strings.TrimSpace(data.SessionID)
+	}
+	if strings.TrimSpace(data.ThinkingLevel) != "" {
+		s.mode = strings.TrimSpace(data.ThinkingLevel)
+	}
+	if data.Model != nil {
+		if id := normalizeModelID(data.Model.Provider + "/" + data.Model.ID); strings.Trim(id, "/") != "" {
+			s.model = id
+		}
+	}
+	s.mu.Unlock()
+	return nil
+}
+
+func withDefaultTimeout(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, ok := ctx.Deadline(); ok {
+		return ctx
+	}
+	child, _ := context.WithTimeout(ctx, defaultCommandTimeout)
+	return child
+}
+
+func splitModelID(model string) (string, string) {
+	model = normalizeModelID(model)
+	provider, id, ok := strings.Cut(model, "/")
+	if !ok {
+		return "", ""
+	}
+	return strings.TrimSpace(provider), strings.TrimSpace(id)
+}
+
+func normalizeModelID(model string) string {
+	model = strings.TrimSpace(model)
+	model = strings.Trim(model, "/")
+	return model
+}
+
+func inferToolKind(name string) agenttypes.ToolKind {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "read", "read_file", "grep", "find", "ls":
+		return agenttypes.ToolKindRead
+	case "edit", "write", "write_file":
+		return agenttypes.ToolKindEdit
+	case "bash", "shell", "run_command":
+		return agenttypes.ToolKindExecute
+	case "web_search", "search_web":
+		return agenttypes.ToolKindWebSearch
+	case "ask_user_question":
+		return agenttypes.ToolKindAskUser
+	default:
+		return agenttypes.ToolKindOther
+	}
+}
+
+func toolTitle(name string, args map[string]any) string {
+	name = strings.TrimSpace(name)
+	if cmd, ok := args["command"].(string); ok && strings.TrimSpace(cmd) != "" {
+		return name + ": " + strings.TrimSpace(cmd)
+	}
+	if path, ok := args["path"].(string); ok && strings.TrimSpace(path) != "" {
+		return name + ": " + filepath.Base(strings.TrimSpace(path))
+	}
+	return name
+}
+
+func resultContentItems(raw json.RawMessage) []agenttypes.ToolCallContentItem {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	var result struct {
+		Content []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(raw, &result); err == nil && len(result.Content) > 0 {
+		items := make([]agenttypes.ToolCallContentItem, 0, len(result.Content))
+		for _, item := range result.Content {
+			if strings.TrimSpace(item.Text) != "" {
+				items = append(items, agenttypes.ToolCallContentItem{Type: "text", Text: item.Text})
+			}
+		}
+		if len(items) > 0 {
+			return items
+		}
+	}
+	text := strings.TrimSpace(rawValueString(json.RawMessage(raw)))
+	if text == "" {
+		return nil
+	}
+	return []agenttypes.ToolCallContentItem{{Type: "text", Text: text}}
+}
+
+func resultMeta(input map[string]any, raw json.RawMessage) map[string]any {
+	meta := make(map[string]any)
+	if len(input) > 0 {
+		meta["input"] = rawValueString(input)
+		meta["rawInput"] = input
+	}
+	if len(raw) > 0 && string(raw) != "null" {
+		var value any
+		if err := json.Unmarshal(raw, &value); err == nil {
+			meta["output"] = rawValueString(value)
+			meta["rawOutput"] = value
+		}
+	}
+	if len(meta) == 0 {
+		return nil
+	}
+	return meta
+}
+
+func rawValueString(value any) string {
+	switch v := value.(type) {
+	case nil:
+		return ""
+	case string:
+		return v
+	case json.RawMessage:
+		var decoded any
+		if err := json.Unmarshal(v, &decoded); err == nil {
+			return rawValueString(decoded)
+		}
+		return string(v)
+	default:
+		raw, err := json.Marshal(v)
+		if err != nil {
+			return fmt.Sprint(v)
+		}
+		return string(raw)
+	}
 }
 
 func (s *session) Close() error {
