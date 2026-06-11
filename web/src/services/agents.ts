@@ -133,8 +133,12 @@ async function fetchAgentRuntime(force = false): Promise<{ agents: AgentStatus[]
 
   inFlightAgents = (async () => {
     const data = await protectedJSON<any>(appPath("/api/agents"));
-    const agentItems = Array.isArray(data) ? data : Array.isArray(data?.agents) ? data.agents : [];
-    const shellItems = Array.isArray(data?.shells) ? data.shells : [];
+    const agentItems: unknown[] = Array.isArray(data)
+      ? data
+      : Array.isArray(data?.agents)
+        ? data.agents
+        : [];
+    const shellItems: unknown[] = Array.isArray(data?.shells) ? data.shells : [];
     cachedAgents = agentItems
       ? agentItems.map(normalizeAgentStatus).filter((item): item is AgentStatus => item !== null)
       : [];

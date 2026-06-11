@@ -7,7 +7,7 @@ type ToastItem = {
   expiresAt: number;
 };
 
-export function ToastContainer(): JSX.Element {
+export function ToastContainer(): React.ReactElement {
   const [toasts, setToasts] = useState<ToastItem[]>([]);
 
   // Subscribe to errors
@@ -95,7 +95,7 @@ type ToastProps = {
   onRetry?: () => void;
 };
 
-function Toast({ error, onClose, onRetry }: ToastProps): JSX.Element {
+function Toast({ error, onClose, onRetry }: ToastProps): React.ReactElement {
   const bgColor =
     error.severity === "error"
       ? "rgba(239, 68, 68, 0.95)"

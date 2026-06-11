@@ -17,6 +17,8 @@ export type ErrorCode =
   | "root.delete_failed"
   | "root.rename_failed"
   | "git.checkout_failed"
+  | "git.worktree_switch_failed"
+  | "git.worktree_remove_failed"
   // Agent errors
   | "agent.unavailable"
   | "agent.timeout"
@@ -176,6 +178,16 @@ class ErrorService {
       },
       "git.checkout_failed": {
         message: "切换分支失败",
+        severity: "error",
+        recoverable: true,
+      },
+      "git.worktree_switch_failed": {
+        message: "切换 worktree 失败",
+        severity: "error",
+        recoverable: true,
+      },
+      "git.worktree_remove_failed": {
+        message: "移除 worktree 失败",
         severity: "error",
         recoverable: true,
       },

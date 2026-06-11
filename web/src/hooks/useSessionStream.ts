@@ -244,9 +244,10 @@ function buildAssistantTimeline(
     }
   } else {
     for (let i = out.length - 1; i >= 0; i -= 1) {
-      if (out[i].type === "assistant_text") {
+      const item = out[i];
+      if (item.type === "assistant_text") {
         out[i] = {
-          ...out[i],
+          ...item,
           contextWindow: ex.context_window,
         };
         break;

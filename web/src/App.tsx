@@ -126,6 +126,8 @@ export type SessionItem = {
   root_id?: string;
   name?: string;
   type?: SessionMode;
+  parent_session_key?: string;
+  parent_tool_call_id?: string;
   agent?: string;
   model?: string;
   shell?: string;
@@ -1014,7 +1016,7 @@ export function App({ onGoHome }: AppProps) {
   const cancelRequestedBySessionRef = useRef<Record<string, boolean>>({});
   const sessionCacheRef = useRef<Record<string, Session>>({});
   const loadedSessionRef = useRef<Record<string, boolean>>({});
-  const loadingSessionRef = useRef<Record<string, Promise<SyncSessionResult>>>({});
+  const loadingSessionRef = useRef<Record<string, Promise<SyncSessionResult> | undefined>>({});
   const staleSessionKeysRef = useRef<Set<string>>(new Set());
   const invalidTreeCacheKeysRef = useRef<Set<string>>(new Set());
   const boundSessionByRootRef = useRef<Record<string, string | null>>({});
@@ -6202,7 +6204,6 @@ export function App({ onGoHome }: AppProps) {
                   mode: pending.agentMode,
                   effort: pending.effort,
                   fast_service: pending.fastService || "",
-                  shell: pending.shell || "",
                 }
               : undefined,
           );

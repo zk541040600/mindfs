@@ -83,20 +83,25 @@ export function getStoredLauncherNodes(): LauncherNode[] {
       return [];
     }
     return parsed
-      .map((item) => {
+      .map((item): LauncherNode | null => {
         if (!item || typeof item !== "object") {
           return null;
         }
-        const id = typeof item.id === "string" ? item.id.trim() : "";
-        const name = typeof item.name === "string" ? item.name.trim() : "";
-        const url = typeof item.url === "string" ? item.url.trim() : "";
-        const createdAt = typeof item.createdAt === "string" ? item.createdAt.trim() : "";
+        const raw = item as Record<string, unknown>;
+        const id = typeof raw.id === "string" ? raw.id.trim() : "";
+        const name = typeof raw.name === "string" ? raw.name.trim() : "";
+        const url = typeof raw.url === "string" ? raw.url.trim() : "";
+        const createdAt = typeof raw.createdAt === "string" ? raw.createdAt.trim() : "";
         const lastOpenedAt =
-          typeof item.lastOpenedAt === "string" ? item.lastOpenedAt.trim() : undefined;
+          typeof raw.lastOpenedAt === "string" ? raw.lastOpenedAt.trim() : undefined;
         if (!id || !name || !url || !createdAt) {
           return null;
         }
-        return { id, name, url, createdAt, lastOpenedAt };
+        const node: LauncherNode = { id, name, url, createdAt };
+        if (lastOpenedAt) {
+          node.lastOpenedAt = lastOpenedAt;
+        }
+        return node;
       })
       .filter((item): item is LauncherNode => item !== null);
   } catch {
