@@ -111,10 +111,12 @@ func (r *Runtime) OpenSession(ctx context.Context, opts OpenOptions) (agenttypes
 	startCtx, cancel := context.WithTimeout(ctx, startupTimeout)
 	defer cancel()
 	startPayload := startPayloadForOptions(opts)
-	if _, err := s.request(startCtx, "start", startPayload); err != nil {
+	startResp, err := s.request(startCtx, "start", startPayload)
+	if err != nil {
 		_ = s.Close()
 		return nil, err
 	}
+	s.applyStartResponse(startResp)
 	return s, nil
 }
 
@@ -126,7 +128,32 @@ func startPayloadForOptions(opts OpenOptions) map[string]any {
 	if model := strings.TrimSpace(opts.Model); model != "" {
 		payload["model"] = model
 	}
+	if mode := strings.TrimSpace(opts.Mode); mode != "" {
+		payload["mode"] = mode
+	}
+	if sessionID := strings.TrimSpace(opts.ResumeSessionID); sessionID != "" {
+		payload["sessionId"] = sessionID
+	}
 	return payload
+}
+
+func (s *session) applyStartResponse(resp bridgeResponse) {
+	if len(resp.Data) == 0 {
+		return
+	}
+	var data struct {
+		SessionID string `json:"sessionId"`
+	}
+	if err := json.Unmarshal(resp.Data, &data); err != nil {
+		return
+	}
+	sessionID := strings.TrimSpace(data.SessionID)
+	if sessionID == "" {
+		return
+	}
+	s.mu.Lock()
+	s.sessionID = sessionID
+	s.mu.Unlock()
 }
 
 func (r *Runtime) Close(agentName string) error {

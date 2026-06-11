@@ -1135,8 +1135,8 @@ async function runJsonl(argv) {
           writeJsonl({ id: request.id, type: "response", command: "start_test_runtime", success: true, data: { scenario: request.scenario } });
         } else if (request.type === "start_sdk_runtime") {
           await runtime?.dispose?.();
-          runtime = await createJsonlSDKRuntime({ ...baseOptions, cwd: resolve(request.cwd ?? baseOptions.cwd), agentDir: resolve(request.agentDir ?? baseOptions.agentDir), model: request.model });
-          writeJsonl({ id: request.id, type: "response", command: "start_sdk_runtime", success: true, data: { cwd: runtime.cwd, agentDir: runtime.agentDir } });
+          runtime = await createJsonlSDKRuntime({ ...baseOptions, cwd: resolve(request.cwd ?? baseOptions.cwd), agentDir: resolve(request.agentDir ?? baseOptions.agentDir), model: request.model, mode: request.mode, sessionId: request.sessionId });
+          writeJsonl({ id: request.id, type: "response", command: "start_sdk_runtime", success: true, data: { cwd: runtime.cwd, agentDir: runtime.agentDir, sessionDir: runtime.sessionDir, sessionId: runtime.sessionId, sessionFile: runtime.sessionFile, resumed: runtime.resumed } });
         } else if (request.type === "prompt") {
           if (!runtime) {
             throw new ProbeError("E_STATE", "runtime must be started before prompt");
@@ -1550,8 +1550,8 @@ function createJsonlAbortHangsRuntime() {
 async function createJsonlSDKRuntime(options) {
   const cwd = options.cwd ?? DEFAULT_CWD;
   const agentDir = options.agentDir ?? DEFAULT_AGENT_DIR;
-  const scratch = await mkdtemp(join(tmpdir(), "mindfs-pi-sdk-jsonl-"));
-  const sessionManager = SessionManager.create(cwd, join(scratch, "sessions"));
+  const thinkingLevel = typeof options.mode === "string" && options.mode.trim() ? options.mode.trim() : "off";
+  const sessionState = await openJsonlSDKSessionManager(options, cwd, agentDir);
   const services = await createAgentSessionServices({
     cwd,
     agentDir,
@@ -1559,9 +1559,9 @@ async function createJsonlSDKRuntime(options) {
   const model = resolveJsonlModel(services.modelRegistry, options.model);
   const { session } = await createAgentSessionFromServices({
     services,
-    sessionManager,
+    sessionManager: sessionState.sessionManager,
     model,
-    thinkingLevel: "off",
+    thinkingLevel,
   });
   let unsubscribe = session.subscribe((event) => {
     if (event.type === "agent_end") {
@@ -1573,6 +1573,10 @@ async function createJsonlSDKRuntime(options) {
     kind: "sdk",
     cwd,
     agentDir,
+    sessionDir: sessionState.sessionDir,
+    sessionId: session.sessionId,
+    sessionFile: session.sessionFile,
+    resumed: sessionState.resumed,
     pending: new Map(),
     responses: [],
     prompt: async function (request) {
@@ -1669,8 +1673,38 @@ async function createJsonlSDKRuntime(options) {
       unsubscribe?.();
       unsubscribe = undefined;
       session.dispose?.();
-      await rm(scratch, { recursive: true, force: true });
     },
+  };
+}
+
+async function openJsonlSDKSessionManager(options, cwd, agentDir) {
+  const sessionDir = options.sessionDir ?? defaultSessionDirPath(cwd, agentDir);
+  const sessionId = String(options.sessionId ?? options.resumeSessionId ?? "").trim();
+  if (sessionId) {
+    const directPath = resolve(sessionId);
+    if (existsSync(directPath)) {
+      return {
+        sessionManager: SessionManager.open(directPath),
+        sessionDir,
+        resumed: true,
+      };
+    }
+    if (existsSync(sessionDir)) {
+      const sessions = await SessionManager.list(cwd, sessionDir);
+      const found = sessions.find((entry) => entry.id === sessionId || entry.path === sessionId);
+      if (found?.path) {
+        return {
+          sessionManager: SessionManager.open(found.path),
+          sessionDir,
+          resumed: true,
+        };
+      }
+    }
+  }
+  return {
+    sessionManager: SessionManager.create(cwd, sessionDir),
+    sessionDir,
+    resumed: false,
   };
 }
 

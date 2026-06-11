@@ -2,6 +2,7 @@ package pisdkruntime
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"path/filepath"
 	"runtime"
@@ -50,6 +51,7 @@ func openTestSessionWithModelMode(t *testing.T, scenario, model, mode string) ag
 func TestStartPayloadForOptionsUsesSDKRuntimeForProbe(t *testing.T) {
 	payload := startPayloadForOptions(OpenOptions{
 		Model: "provider/model",
+		Mode:  "high",
 		Probe: true,
 	})
 	if payload["type"] != "start_sdk_runtime" {
@@ -58,8 +60,20 @@ func TestStartPayloadForOptionsUsesSDKRuntimeForProbe(t *testing.T) {
 	if payload["model"] != "provider/model" {
 		t.Fatalf("payload model = %v, want provider/model", payload["model"])
 	}
+	if payload["mode"] != "high" {
+		t.Fatalf("payload mode = %v, want high", payload["mode"])
+	}
 	if _, ok := payload["scenario"]; ok {
 		t.Fatalf("probe payload unexpectedly selected test scenario: %+v", payload)
+	}
+}
+
+func TestStartPayloadForOptionsPassesResumeSessionID(t *testing.T) {
+	payload := startPayloadForOptions(OpenOptions{
+		ResumeSessionID: " 019eb637-77d1-7567-ab40-4e22386a40c1 ",
+	})
+	if payload["sessionId"] != "019eb637-77d1-7567-ab40-4e22386a40c1" {
+		t.Fatalf("payload sessionId = %v", payload["sessionId"])
 	}
 }
 
@@ -71,6 +85,18 @@ func TestStartPayloadForOptionsUsesExplicitTestScenario(t *testing.T) {
 	})
 	if payload["type"] != "start_test_runtime" || payload["scenario"] != "prompt-stream" {
 		t.Fatalf("payload = %+v, want explicit prompt-stream test runtime", payload)
+	}
+}
+
+func TestApplyStartResponseUpdatesSessionID(t *testing.T) {
+	data, err := json.Marshal(map[string]any{"sessionId": "019eb637-77d1-7567-ab40-4e22386a40c1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess := &session{sessionID: "synthetic-session"}
+	sess.applyStartResponse(bridgeResponse{Data: data})
+	if got := sess.SessionID(); got != "019eb637-77d1-7567-ab40-4e22386a40c1" {
+		t.Fatalf("SessionID = %q, want real SDK session id", got)
 	}
 }
 

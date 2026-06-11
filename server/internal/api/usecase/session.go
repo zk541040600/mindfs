@@ -1074,15 +1074,27 @@ func (s *Service) ensureAgentSession(
 		log.Printf("[session/model] open.error session=%s agent=%s model=%q mode=%q effort=%q fast_service=%q pool_session=%s err=%v", current.Key, agentName, nextModel, nextMode, nextEffort, nextFastService, poolSessionKey, err)
 		return nil, nil, err
 	}
-	if ctxSeqOverride == nil && statelessRuntimeCtx {
-		zero := 0
-		ctxSeqOverride = &zero
-	} else if ctxSeqOverride == nil && binding != nil && openInput.AgentSessionID != "" {
-		last := binding.AgentCtxSeq
-		ctxSeqOverride = &last
+	if ctxSeqOverride == nil {
+		ctxSeqOverride = agentContextSeqOverrideAfterOpen(statelessRuntimeCtx, binding, openInput.AgentSessionID, sess.SessionID())
 	}
 	log.Printf("[session/model] open.done session=%s agent=%s model=%q mode=%q effort=%q fast_service=%q pool_session=%s", current.Key, agentName, nextModel, nextMode, nextEffort, nextFastService, poolSessionKey)
 	return sess, ctxSeqOverride, nil
+}
+
+func agentContextSeqOverrideAfterOpen(statelessRuntimeCtx bool, binding *session.AgentBinding, requestedAgentSessionID, openedAgentSessionID string) *int {
+	if statelessRuntimeCtx {
+		zero := 0
+		return &zero
+	}
+	if binding == nil || strings.TrimSpace(requestedAgentSessionID) == "" {
+		return nil
+	}
+	if strings.TrimSpace(openedAgentSessionID) != strings.TrimSpace(requestedAgentSessionID) {
+		zero := 0
+		return &zero
+	}
+	last := binding.AgentCtxSeq
+	return &last
 }
 
 func usesStatelessRuntimeContext(pool *agent.Pool, agentName string) bool {

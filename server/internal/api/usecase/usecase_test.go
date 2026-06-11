@@ -433,6 +433,36 @@ func TestUsesStatelessRuntimeContextOnlyForPiRPC(t *testing.T) {
 	}
 }
 
+func TestAgentContextSeqOverrideAfterOpenResetsWhenResumeCreatesNewSession(t *testing.T) {
+	binding := &session.AgentBinding{
+		AgentSessionID: "pi-synthetic-session",
+		AgentCtxSeq:    6,
+	}
+
+	got := agentContextSeqOverrideAfterOpen(false, binding, "pi-synthetic-session", "019eb637-77d1-7567-ab40-4e22386a40c1")
+	if got == nil {
+		t.Fatal("agentCtxSeq override is nil, want reset marker")
+	}
+	if *got != 0 {
+		t.Fatalf("agentCtxSeq override = %d, want reset marker when SDK opened a new session", *got)
+	}
+}
+
+func TestAgentContextSeqOverrideAfterOpenKeepsSeqWhenResumeSucceeds(t *testing.T) {
+	binding := &session.AgentBinding{
+		AgentSessionID: "019eb637-77d1-7567-ab40-4e22386a40c1",
+		AgentCtxSeq:    6,
+	}
+
+	got := agentContextSeqOverrideAfterOpen(false, binding, binding.AgentSessionID, binding.AgentSessionID)
+	if got == nil {
+		t.Fatal("agentCtxSeq override is nil, want existing seq")
+	}
+	if *got != 6 {
+		t.Fatalf("agentCtxSeq override = %d, want existing seq when SDK resumed the same session", *got)
+	}
+}
+
 func TestSendCommandMessageUsesLongShellPerSession(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("windows long-shell behavior is covered by cross-compile checks")
