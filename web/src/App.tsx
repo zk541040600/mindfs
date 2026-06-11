@@ -98,6 +98,12 @@ import { ActionBar } from "./components/ActionBar";
 import { ToastContainer } from "./components/Toast";
 import { BottomSheet } from "./components/BottomSheet";
 import {
+  ExtensionUIDialog,
+  extensionUIPayloadString,
+  extensionUIPayloadStringArray,
+  isExtensionUIDialogMethod,
+} from "./components/ExtensionUIDialog";
+import {
   type GitHubImportState,
   type LocalDirBrowserState,
   ProjectAddPopover,
@@ -978,30 +984,6 @@ type ExtensionUIChromeState = {
   widgets: Record<string, { lines: string[]; placement?: string }>;
   title: string;
 };
-
-function extensionUIPayloadString(payload: Record<string, unknown> | undefined, key: string): string {
-  const value = payload?.[key];
-  return typeof value === "string" ? value : "";
-}
-
-function extensionUIPayloadStringArray(payload: Record<string, unknown> | undefined, key: string): string[] {
-  const value = payload?.[key];
-  if (!Array.isArray(value)) return [];
-  return value.filter((item): item is string => typeof item === "string");
-}
-
-function isExtensionUIDialogMethod(method: string): boolean {
-  return ["select", "confirm", "input", "editor"].includes(method);
-}
-
-function extensionUITitle(request: PendingExtensionUIRequest): string {
-  const payload = request.payload || {};
-  return (
-    extensionUIPayloadString(payload, "title") ||
-    extensionUIPayloadString(payload, "message") ||
-    `Pi extension UI: ${request.method}`
-  );
-}
 
 function loadMobileEnterKeySends(): boolean {
   if (typeof window === "undefined") {
@@ -6319,7 +6301,7 @@ export function App({ onGoHome }: AppProps) {
               document.title = title;
               setExtensionUIChrome((prev) => ({ ...prev, title }));
             }
-          } else if (method === "set_editor_text") {
+          } else if (method === "set_editor_text" || method === "setEditorText") {
             const text = extensionUIPayloadString(payloadData, "text");
             setEditDraftRequest({ id: Date.now(), content: text });
           }
@@ -8521,15 +8503,6 @@ export function App({ onGoHome }: AppProps) {
 
   const extensionUIStatusEntries = Object.entries(extensionUIChrome.statuses);
   const extensionUIWidgetEntries = Object.entries(extensionUIChrome.widgets);
-  const pendingExtensionUIOptions = extensionUIPayloadStringArray(
-    pendingExtensionUI?.payload,
-    "options",
-  );
-  const pendingExtensionUIPlaceholder = extensionUIPayloadString(
-    pendingExtensionUI?.payload,
-    "placeholder",
-  );
-
   return (
     <>
       <AppShell
@@ -8945,157 +8918,14 @@ export function App({ onGoHome }: AppProps) {
         </div>
       ) : null}
       {pendingExtensionUI ? (
-        <div
-          style={{
-            position: "fixed",
-            inset: 0,
-            background: "rgba(15, 23, 42, 0.42)",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            padding: "24px",
-            zIndex: 1800,
-          }}
-        >
-          <div
-            style={{
-              width: "min(520px, 100%)",
-              background: "#fff",
-              borderRadius: "18px",
-              padding: "20px",
-              boxShadow: "0 28px 80px rgba(15, 23, 42, 0.22)",
-              display: "flex",
-              flexDirection: "column",
-              gap: "14px",
-            }}
-          >
-            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-              <div style={{ fontSize: "12px", color: "#64748b", fontWeight: 700 }}>
-                Pi extension UI · {pendingExtensionUI.method}
-              </div>
-              <div style={{ fontSize: "18px", fontWeight: 700, color: "#0f172a" }}>
-                {extensionUITitle(pendingExtensionUI)}
-              </div>
-              {extensionUIPayloadString(pendingExtensionUI.payload, "message") &&
-              extensionUIPayloadString(pendingExtensionUI.payload, "message") !== extensionUITitle(pendingExtensionUI) ? (
-                <div style={{ color: "#475569", fontSize: "13px", lineHeight: 1.5 }}>
-                  {extensionUIPayloadString(pendingExtensionUI.payload, "message")}
-                </div>
-              ) : null}
-            </div>
-            {pendingExtensionUI.method === "select" ? (
-              <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
-                {pendingExtensionUIOptions.map((option) => (
-                  <button
-                    key={option}
-                    type="button"
-                    disabled={extensionUISubmitting}
-                    onClick={() => void submitExtensionUIResponse(pendingExtensionUI, { value: option })}
-                    style={{
-                      border: "1px solid rgba(148, 163, 184, 0.5)",
-                      background: "#f8fafc",
-                      borderRadius: "10px",
-                      padding: "10px 12px",
-                      textAlign: "left",
-                      cursor: extensionUISubmitting ? "not-allowed" : "pointer",
-                    }}
-                  >
-                    {option}
-                  </button>
-                ))}
-              </div>
-            ) : pendingExtensionUI.method === "confirm" ? (
-              <div style={{ display: "flex", justifyContent: "flex-end", gap: "10px" }}>
-                <button
-                  type="button"
-                  disabled={extensionUISubmitting}
-                  onClick={cancelExtensionUI}
-                  style={{ border: "1px solid #cbd5e1", background: "#fff", borderRadius: "999px", padding: "8px 14px", cursor: "pointer" }}
-                >
-                  取消
-                </button>
-                <button
-                  type="button"
-                  disabled={extensionUISubmitting}
-                  onClick={() => void submitExtensionUIResponse(pendingExtensionUI, { confirmed: false })}
-                  style={{ border: "1px solid #cbd5e1", background: "#fff", borderRadius: "999px", padding: "8px 14px", cursor: "pointer" }}
-                >
-                  否
-                </button>
-                <button
-                  type="button"
-                  disabled={extensionUISubmitting}
-                  onClick={() => void submitExtensionUIResponse(pendingExtensionUI, { confirmed: true })}
-                  style={{ border: "none", background: "#0f172a", color: "#fff", borderRadius: "999px", padding: "8px 16px", cursor: "pointer" }}
-                >
-                  是
-                </button>
-              </div>
-            ) : pendingExtensionUI.method === "editor" ? (
-              <textarea
-                value={extensionUIInputValue}
-                onChange={(event) => setExtensionUIInputValue(event.target.value)}
-                placeholder={pendingExtensionUIPlaceholder}
-                rows={8}
-                style={{
-                  width: "100%",
-                  borderRadius: "12px",
-                  border: "1px solid rgba(148, 163, 184, 0.5)",
-                  padding: "12px",
-                  resize: "vertical",
-                  fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
-                  fontSize: "13px",
-                }}
-              />
-            ) : (
-              <input
-                type="text"
-                value={extensionUIInputValue}
-                onChange={(event) => setExtensionUIInputValue(event.target.value)}
-                placeholder={pendingExtensionUIPlaceholder}
-                autoFocus
-                style={{
-                  width: "100%",
-                  borderRadius: "12px",
-                  border: "1px solid rgba(148, 163, 184, 0.5)",
-                  padding: "12px",
-                  fontSize: "14px",
-                }}
-              />
-            )}
-            {(pendingExtensionUI.method === "input" || pendingExtensionUI.method === "editor") ? (
-              <div style={{ display: "flex", justifyContent: "flex-end", gap: "10px" }}>
-                <button
-                  type="button"
-                  disabled={extensionUISubmitting}
-                  onClick={cancelExtensionUI}
-                  style={{ border: "1px solid #cbd5e1", background: "#fff", borderRadius: "999px", padding: "8px 14px", cursor: "pointer" }}
-                >
-                  取消
-                </button>
-                <button
-                  type="button"
-                  disabled={extensionUISubmitting}
-                  onClick={() => void submitExtensionUIResponse(pendingExtensionUI, { value: extensionUIInputValue })}
-                  style={{ border: "none", background: "#0f172a", color: "#fff", borderRadius: "999px", padding: "8px 16px", cursor: "pointer" }}
-                >
-                  提交
-                </button>
-              </div>
-            ) : pendingExtensionUI.method === "select" ? (
-              <div style={{ display: "flex", justifyContent: "flex-end" }}>
-                <button
-                  type="button"
-                  disabled={extensionUISubmitting}
-                  onClick={cancelExtensionUI}
-                  style={{ border: "1px solid #cbd5e1", background: "#fff", borderRadius: "999px", padding: "8px 14px", cursor: "pointer" }}
-                >
-                  取消
-                </button>
-              </div>
-            ) : null}
-          </div>
-        </div>
+        <ExtensionUIDialog
+          request={pendingExtensionUI}
+          inputValue={extensionUIInputValue}
+          submitting={extensionUISubmitting}
+          onInputValueChange={setExtensionUIInputValue}
+          onSubmit={(response) => submitExtensionUIResponse(pendingExtensionUI, response)}
+          onCancel={cancelExtensionUI}
+        />
       ) : null}
       <ToastContainer />
     </>

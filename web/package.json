@@ -8,6 +8,7 @@
     "build": "vite build",
     "build:android": "rimraf ../android/app/src/main/assets/public && VITE_APP_SHELL=1 vite build --outDir ../android/app/src/main/assets/public --emptyOutDir",
     "build:harmony": "rimraf ../harmony/entry/src/main/resources/rawfile/public && VITE_APP_SHELL=1 VITE_NATIVE_PLATFORM=harmony vite build --outDir ../harmony/entry/src/main/resources/rawfile/public --emptyOutDir",
+    "test:extension-ui": "playwright test tests/extension-ui.spec.ts",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "preview": "vite preview"
   },
@@ -40,6 +41,7 @@
   },
   "devDependencies": {
     "@capacitor/cli": "^8.3.1",
+    "@playwright/test": "^1.60.0",
     "@tailwindcss/vite": "^4.2.1",
     "@types/prismjs": "^1.26.6",
     "@types/react": "^19.0.0",
