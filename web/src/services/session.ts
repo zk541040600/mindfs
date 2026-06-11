@@ -226,6 +226,8 @@ export type AgentSDKStatus = {
   enabled: boolean;
   agent: string;
   available: boolean;
+  checked?: boolean;
+  state?: "disabled" | "unchecked" | "available" | "unavailable" | string;
   last_latency_ms?: number;
   last_error?: string;
   last_checked_at?: string;

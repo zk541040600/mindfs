@@ -76,6 +76,8 @@ func TestAgentSDKStatusWithCacher(t *testing.T) {
 		agentName: "pi",
 		status: pisdkbridge.BridgeStatus{
 			Available:     true,
+			Checked:       true,
+			State:         "available",
 			LastLatency:   150 * time.Millisecond,
 			LastError:     "",
 			LastCheckedAt: now,
@@ -98,6 +100,12 @@ func TestAgentSDKStatusWithCacher(t *testing.T) {
 	}
 	if !out.Available {
 		t.Fatal("expected available=true")
+	}
+	if !out.Checked {
+		t.Fatal("expected checked=true")
+	}
+	if out.State != "available" {
+		t.Fatalf("expected state=available, got %s", out.State)
 	}
 	if out.LastLatencyMs != 150 {
 		t.Fatalf("expected last_latency_ms=150, got %d", out.LastLatencyMs)
@@ -128,6 +136,12 @@ func TestAgentSDKStatusNonCacherImporter(t *testing.T) {
 	if out.Enabled {
 		t.Fatal("expected enabled=false for agent without cacher")
 	}
+	if out.Checked {
+		t.Fatal("expected checked=false for disabled agent")
+	}
+	if out.State != "disabled" {
+		t.Fatalf("expected state=disabled, got %s", out.State)
+	}
 	if out.Agent != "claude" {
 		t.Fatalf("expected agent=claude, got %s", out.Agent)
 	}
@@ -147,14 +161,18 @@ func TestAgentSDKStatusMissingAgent(t *testing.T) {
 }
 
 func TestAgentSDKStatusBridgeUnavailable(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Millisecond)
 	importer := &mockSDKStatusImporter{
 		agentName: "pi",
 		status: pisdkbridge.BridgeStatus{
-			Available:    false,
-			LastLatency:  5 * time.Second,
-			LastError:    "E_FAIL: bridge timed out",
-			CacheEntries: 1,
-			TTL:          60 * time.Second,
+			Available:     false,
+			Checked:       true,
+			State:         "unavailable",
+			LastLatency:   5 * time.Second,
+			LastError:     "E_FAIL: bridge timed out",
+			LastCheckedAt: now,
+			CacheEntries:  1,
+			TTL:           60 * time.Second,
 		},
 	}
 	registry := &sdkStatusTestRegistry{importer: importer}
@@ -170,7 +188,46 @@ func TestAgentSDKStatusBridgeUnavailable(t *testing.T) {
 	if out.Available {
 		t.Fatal("expected available=false")
 	}
+	if !out.Checked {
+		t.Fatal("expected checked=true")
+	}
+	if out.State != "unavailable" {
+		t.Fatalf("expected state=unavailable, got %s", out.State)
+	}
 	if !strings.Contains(out.LastError, "E_FAIL") {
 		t.Fatalf("expected error to contain E_FAIL, got %q", out.LastError)
+	}
+}
+
+func TestAgentSDKStatusUnchecked(t *testing.T) {
+	importer := &mockSDKStatusImporter{
+		agentName: "pi",
+		status: pisdkbridge.BridgeStatus{
+			Available:    false,
+			CacheEntries: 0,
+			TTL:          60 * time.Second,
+		},
+	}
+	registry := &sdkStatusTestRegistry{importer: importer}
+	service := Service{Registry: registry}
+
+	out, err := service.AgentSDKStatus(AgentSDKStatusInput{AgentName: "pi"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !out.Enabled {
+		t.Fatal("expected enabled=true")
+	}
+	if out.Available {
+		t.Fatal("expected available=false before first check")
+	}
+	if out.Checked {
+		t.Fatal("expected checked=false before first check")
+	}
+	if out.State != "unchecked" {
+		t.Fatalf("expected state=unchecked, got %s", out.State)
+	}
+	if out.CacheEntries != 0 {
+		t.Fatalf("expected cache_entries=0, got %d", out.CacheEntries)
 	}
 }

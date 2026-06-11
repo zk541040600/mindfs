@@ -155,6 +155,12 @@ func TestSessionCacheStatus(t *testing.T) {
 	if status.Available {
 		t.Fatal("initial status should not be available")
 	}
+	if status.Checked {
+		t.Fatal("initial status should not be checked")
+	}
+	if status.State != "unchecked" {
+		t.Fatalf("expected initial state=unchecked, got %s", status.State)
+	}
 	if status.CacheEntries != 0 {
 		t.Fatal("initial cache should have 0 entries")
 	}
@@ -166,6 +172,12 @@ func TestSessionCacheStatus(t *testing.T) {
 	status = cache.Status()
 	if !status.Available {
 		t.Fatal("should be available after successful set")
+	}
+	if !status.Checked {
+		t.Fatal("should be checked after successful set")
+	}
+	if status.State != "available" {
+		t.Fatalf("expected state=available, got %s", status.State)
 	}
 	if status.LastLatency != 100*time.Millisecond {
 		t.Fatalf("unexpected latency: %v", status.LastLatency)
@@ -181,6 +193,12 @@ func TestSessionCacheStatus(t *testing.T) {
 	status = cache.Status()
 	if status.Available {
 		t.Fatal("should not be available after failure")
+	}
+	if !status.Checked {
+		t.Fatal("should be checked after failure")
+	}
+	if status.State != "unavailable" {
+		t.Fatalf("expected state=unavailable, got %s", status.State)
 	}
 	if status.LastError != "timeout" {
 		t.Fatalf("unexpected error: %s", status.LastError)

@@ -55,7 +55,16 @@ The Go bridge wraps session metadata discovery in a 60s cache and exposes a read
 GET /api/agents/pi/sdk-status
 ```
 
-The status endpoint reports cached bridge health and does not trigger extension commands or transcript reads.
+The status endpoint reports cached bridge health and does not trigger extension commands or transcript reads. A fresh cache returns `available=false`, `checked=false`, and `state=unchecked`; after a successful external-session refresh it returns `checked=true` and `state=available`. If a bridge subprocess check fails, `checked=true`, `state=unavailable`, and `last_error` explain the failure while normal `pi-rpc` chat remains unaffected.
+
+Response fields:
+
+- `enabled`: whether the agent exposes the SDK status bridge.
+- `available`: backward-compatible health boolean; false also covers the unchecked state.
+- `checked`: whether a bridge subprocess check has run.
+- `state`: one of `disabled`, `unchecked`, `available`, or `unavailable`.
+- `cache_entries`: number of cached external-session entries.
+- `last_checked_at`, `last_latency_ms`, `last_error`, `ttl_ms`: passive cache/status metadata.
 
 ### Explicit refresh
 

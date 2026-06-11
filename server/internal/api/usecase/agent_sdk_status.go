@@ -18,6 +18,8 @@ type AgentSDKStatusOutput struct {
 	Enabled       bool               `json:"enabled"`
 	Agent         string             `json:"agent"`
 	Available     bool               `json:"available"`
+	Checked       bool               `json:"checked"`
+	State         string             `json:"state"`
 	LastLatencyMs int64              `json:"last_latency_ms"`
 	LastError     string             `json:"last_error,omitempty"`
 	LastCheckedAt time.Time          `json:"last_checked_at"`
@@ -51,7 +53,7 @@ func (s *Service) AgentSDKStatus(in AgentSDKStatusInput) (AgentSDKStatusOutput, 
 	importer, err := s.Registry.GetExternalSessionImporter(agentName)
 	if err != nil {
 		// Agent not configured or no importer — not an error, just disabled.
-		return AgentSDKStatusOutput{Enabled: false, Agent: agentName}, nil
+		return AgentSDKStatusOutput{Enabled: false, Agent: agentName, State: "disabled"}, nil
 	}
 
 	type bridgeStatusProvider interface {
@@ -70,12 +72,29 @@ func (s *Service) AgentSDKStatus(in AgentSDKStatusInput) (AgentSDKStatusOutput, 
 		ok = true
 	}
 	if !ok {
-		return AgentSDKStatusOutput{Enabled: false, Agent: agentName}, nil
+		return AgentSDKStatusOutput{Enabled: false, Agent: agentName, State: "disabled"}, nil
+	}
+	checked := status.Checked
+	if !checked && !status.LastCheckedAt.IsZero() {
+		checked = true
+	}
+	state := strings.TrimSpace(status.State)
+	if state == "" {
+		state = "unchecked"
+		if checked {
+			if status.Available {
+				state = "available"
+			} else {
+				state = "unavailable"
+			}
+		}
 	}
 	return AgentSDKStatusOutput{
 		Enabled:       true,
 		Agent:         agentName,
 		Available:     status.Available,
+		Checked:       checked,
+		State:         state,
 		LastLatencyMs: status.LastLatency.Milliseconds(),
 		LastError:     status.LastError,
 		LastCheckedAt: status.LastCheckedAt,

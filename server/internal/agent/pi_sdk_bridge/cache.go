@@ -160,8 +160,19 @@ func (c *SessionCache) EntryCount() int {
 func (c *SessionCache) Status() BridgeStatus {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	checked := !c.lastBridgeCheckAt.IsZero()
+	state := "unchecked"
+	if checked {
+		if c.bridgeAvailable {
+			state = "available"
+		} else {
+			state = "unavailable"
+		}
+	}
 	return BridgeStatus{
 		Available:     c.bridgeAvailable,
+		Checked:       checked,
+		State:         state,
 		LastLatency:   c.lastBridgeLatency,
 		LastError:     c.lastBridgeError,
 		LastCheckedAt: c.lastBridgeCheckAt,
@@ -173,6 +184,8 @@ func (c *SessionCache) Status() BridgeStatus {
 // BridgeStatus is a read-only snapshot of SDK bridge health.
 type BridgeStatus struct {
 	Available     bool          `json:"available"`
+	Checked       bool          `json:"checked"`
+	State         string        `json:"state"`
 	LastLatency   time.Duration `json:"last_latency_ms"`
 	LastError     string        `json:"last_error,omitempty"`
 	LastCheckedAt time.Time     `json:"last_checked_at"`

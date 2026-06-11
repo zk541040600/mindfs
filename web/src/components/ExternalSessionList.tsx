@@ -5,6 +5,8 @@ type SDKStatus = {
   enabled: boolean;
   agent: string;
   available: boolean;
+  checked?: boolean;
+  state?: "disabled" | "unchecked" | "available" | "unavailable" | string;
   last_latency_ms?: number;
   last_error?: string;
   last_checked_at?: string;
@@ -215,14 +217,17 @@ function SDKStatusBar({
   onRefresh?: () => void;
 }) {
   const enabled = Boolean(status?.enabled);
-  const checked = status?.last_checked_at && !status.last_checked_at.startsWith("0001-");
+  const checked =
+    status?.checked === true ||
+    Boolean(status?.last_checked_at && !status.last_checked_at.startsWith("0001-"));
+  const state = status?.state || (checked ? (status?.available ? "available" : "unavailable") : "unchecked");
   const label = loading
     ? "SDK 状态加载中"
-    : !enabled
+    : !enabled || state === "disabled"
       ? "SDK 未启用"
-      : status?.available
+      : state === "available" || status?.available
         ? "SDK 可用"
-        : checked
+        : state === "unavailable" || checked
           ? "SDK 不可用"
           : "SDK 未检查";
   const meta: string[] = [];
@@ -237,7 +242,7 @@ function SDKStatusBar({
   }
   const dotColor = status?.available
     ? "#10b981"
-    : checked
+    : state === "unavailable" || checked
       ? "#f59e0b"
       : "var(--text-muted)";
   return (
