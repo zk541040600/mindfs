@@ -1197,6 +1197,9 @@ function createJsonlTestRuntime(scenario) {
   if (scenario === "prompt-stream") {
     return createJsonlPromptRuntime();
   }
+  if (scenario === "message-end-only") {
+    return createJsonlMessageEndOnlyRuntime();
+  }
   if (scenario === "tool-events") {
     return createJsonlToolRuntime();
   }
@@ -1276,6 +1279,40 @@ function createJsonlPromptRuntime() {
       });
       writeJsonl({ type: "context_window", totalTokens: 7, modelContextWindow: 100 });
       writeJsonl({ type: "agent_end", willRetry: false });
+    },
+    answerExtensionUI: async function (request) {
+      throw new ProbeError("E_PARAM", `unknown extension UI request id: ${request.id}`);
+    },
+    dispose: async function () {},
+  };
+}
+
+function createJsonlMessageEndOnlyRuntime() {
+  return {
+    kind: "message-end-only",
+    prompt: async function (request) {
+      const message = String(request.message ?? "").trim();
+      if (!message) {
+        throw new ProbeError("E_PARAM", "prompt message required");
+      }
+      writeJsonl(successResponse("prompt", { scenario: "message-end-only" }, request.id));
+      writeJsonl({ type: "agent_start" });
+      writeJsonl({ type: "message_start", message: { role: "assistant", content: [] } });
+      writeJsonl({
+        type: "message_update",
+        message: { role: "assistant", content: [{ type: "text", text: `sdk prompt: ${message}` }] },
+        assistantMessageEvent: { type: "text_delta", delta: `sdk prompt: ${message}` },
+      });
+      writeJsonl({
+        type: "message_end",
+        message: {
+          role: "assistant",
+          stopReason: "end_turn",
+          content: [{ type: "text", text: `sdk prompt: ${message}` }],
+          usage: { input: 3, output: 4, cacheRead: 0, cacheWrite: 0, totalTokens: 7 },
+        },
+      });
+      writeJsonl({ type: "context_window", totalTokens: 7, modelContextWindow: 100 });
     },
     answerExtensionUI: async function (request) {
       throw new ProbeError("E_PARAM", `unknown extension UI request id: ${request.id}`);

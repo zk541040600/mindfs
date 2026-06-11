@@ -237,6 +237,29 @@ func TestRuntimePromptStreamEmitsMessageDoneAndContextWindow(t *testing.T) {
 	}
 }
 
+func TestRuntimeMessageEndFallbackCompletesTurn(t *testing.T) {
+	sess := openTestSession(t, "message-end-only")
+	events, mu := collectSessionEvents(sess)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := sess.SendMessage(ctx, "hello sdk"); err != nil {
+		t.Fatal(err)
+	}
+
+	gotEvents := snapshotEvents(events, mu)
+	if got := joinedMessageChunks(gotEvents); got != "sdk prompt: hello sdk" {
+		t.Fatalf("message chunks = %q, want deterministic sdk prompt", got)
+	}
+	window, err := sess.ContextWindow(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if window.TotalTokens != 7 || window.ModelContextWindow != 100 {
+		t.Fatalf("context window = %+v, want total=7 window=100", window)
+	}
+}
+
 func TestRuntimePromptFailureReturnsError(t *testing.T) {
 	sess := openTestSession(t, "prompt-stream")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

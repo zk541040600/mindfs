@@ -21,9 +21,10 @@ import (
 )
 
 const (
-	defaultNodeCommand    = "node"
-	defaultCommandTimeout = 30 * time.Second
-	startupTimeout        = 10 * time.Second
+	defaultNodeCommand      = "node"
+	defaultCommandTimeout   = 30 * time.Second
+	startupTimeout          = 10 * time.Second
+	messageEndFallbackDelay = 1500 * time.Millisecond
 )
 
 type OpenOptions struct {
@@ -656,6 +657,7 @@ func (s *session) handleMessageEnd(raw []byte) {
 		s.contextStats.TotalTokens = total
 		s.mu.Unlock()
 	}
+	s.scheduleMessageEndFallback()
 }
 
 func (s *session) handleContextWindow(raw []byte) {
@@ -780,11 +782,28 @@ func (s *session) setLastTurnErr(message string) {
 func (s *session) signalTurnDone(err error) {
 	s.turnMu.Lock()
 	ch := s.turnDone
+	s.turnMu.Unlock()
+	s.signalTurnDoneTo(ch, err)
+}
+
+func (s *session) signalTurnDoneTo(ch chan error, err error) {
+	if ch == nil {
+		return
+	}
 	select {
 	case ch <- err:
 	default:
 	}
+}
+
+func (s *session) scheduleMessageEndFallback() {
+	s.turnMu.Lock()
+	ch := s.turnDone
 	s.turnMu.Unlock()
+	go func() {
+		time.Sleep(messageEndFallbackDelay)
+		s.signalTurnDoneTo(ch, nil)
+	}()
 }
 
 func (s *session) resetTurnDone() chan error {

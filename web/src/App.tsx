@@ -4113,9 +4113,30 @@ export function App({ onGoHome }: AppProps) {
       const sent = await sessionService.cancelMessage(activeRoot, sessionKey);
       if (!sent) {
         delete cancelRequestedBySessionRef.current[cacheKey];
+        return;
       }
+      delete pendingBySessionRef.current[cacheKey];
+      const cached = sessionCacheRef.current[cacheKey];
+      if (cached && cached.key === sessionKey) {
+        sessionCacheRef.current[cacheKey] = {
+          ...(cached as any),
+          pending: false,
+        } as Session;
+      }
+      setSelectedPendingByKey(sessionKey, false);
+      const drawer = drawerSessionByRootRef.current[activeRoot];
+      if (drawer && drawer.key === sessionKey) {
+        setDrawerSessionForRoot(activeRoot, {
+          ...(drawer as any),
+          pending: false,
+        } as Session);
+      }
+      bumpCacheVersion();
+      window.setTimeout(() => {
+        delete cancelRequestedBySessionRef.current[cacheKey];
+      }, 30000);
     },
-    [rootSessionKey],
+    [bumpCacheVersion, rootSessionKey, setDrawerSessionForRoot, setSelectedPendingByKey],
   );
 
   const submitExtensionUIResponse = useCallback(
