@@ -227,7 +227,7 @@
     {
       "name": "pi",
       "command": "pi",
-      "protocol": "pi-rpc",
+      "protocol": "pi-sdk",
       "args": [
         "--mode",
         "rpc",

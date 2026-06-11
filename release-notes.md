@@ -1,3 +1,14 @@
+# MindFS v0.3.4-sdk-runtime.5-default
+
+## 新功能
+- Pi 默认交互 runtime 切换为 `pi-sdk`，普通聊天、工具事件、slash、模型/思考等级、取消和扩展 UI 走 SDK runtime。
+- 保留 `pi-rpc` 作为显式回滚协议，便于 SDK 默认版本出现环境问题时快速切回。
+
+## 优化和修复
+- 前端扩展 UI 兼容 SDK `notificationType`、`content` 和 `placement` payload 形状。
+- SDK bridge 文档更新为默认 runtime + metadata/import probe 的双角色说明。
+
+
 # MindFS v0.3.4-sdk.1
 
 ## 新功能

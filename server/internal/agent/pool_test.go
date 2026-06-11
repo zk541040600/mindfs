@@ -88,9 +88,23 @@ func TestPoolGetOrCreateUsesAgentsJSONConfig(t *testing.T) {
 	}
 }
 
-func TestDefaultProtocolPiRemainsPiRPC(t *testing.T) {
-	if got := DefaultProtocol("pi"); got != ProtocolPiRPC {
-		t.Fatalf("DefaultProtocol(pi) = %q, want %q", got, ProtocolPiRPC)
+func TestDefaultProtocolPiUsesPiSDK(t *testing.T) {
+	if got := DefaultProtocol("pi"); got != ProtocolPiSDK {
+		t.Fatalf("DefaultProtocol(pi) = %q, want %q", got, ProtocolPiSDK)
+	}
+}
+
+func TestBundledAgentsJSONPiUsesPiSDK(t *testing.T) {
+	cfg, err := LoadConfig(filepath.Join(poolTestRepoRoot(t), "agents.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	def, ok := cfg.GetAgent("pi")
+	if !ok {
+		t.Fatalf("expected pi in bundled agents.json")
+	}
+	if def.Protocol != ProtocolPiSDK {
+		t.Fatalf("bundled pi protocol = %q, want %q", def.Protocol, ProtocolPiSDK)
 	}
 }
 

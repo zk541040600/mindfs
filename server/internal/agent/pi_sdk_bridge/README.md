@@ -1,15 +1,16 @@
-# Pi SDK auxiliary bridge
+# Pi SDK bridge and runtime
 
-This directory contains the production auxiliary Pi SDK bridge used by MindFS for SDK-backed features that are safer and more valuable outside the interactive `pi-rpc` streaming runtime.
+This directory contains the Pi SDK bridge used by MindFS for the default Pi interactive runtime and for bounded SDK-backed metadata/import probes.
 
 ## Runtime boundary
 
-MindFS deliberately keeps two Pi layers:
+MindFS keeps two Pi protocols:
 
-- **Interactive runtime:** `agents.json` keeps Pi on `protocol: "pi-rpc"` with `pi --mode rpc --no-session`. Normal chat, slash commands, tool events, extension UI, cancellation, retry, model selection, and thinking-level behavior stay on this stable path.
-- **SDK auxiliary bridge:** this Node bridge is invoked by Go for bounded SDK-backed capabilities: safe external session metadata, cache/status discovery, explicit refresh, deterministic bridge probes, and explicit `safe_transcript` import.
+- **Default interactive runtime:** `agents.json` uses `protocol: "pi-sdk"`. Normal chat, slash commands, tool events, extension UI, cancellation, model selection, and thinking-level behavior route through the SDK JSONL runtime.
+- **Rollback runtime:** `protocol: "pi-rpc"` remains compiled and tested. Restoring `agents.json` or an explicit agent config override to `pi-rpc` switches Pi back to the old RPC path.
+- **SDK metadata bridge:** this Node bridge is also invoked by Go for bounded SDK-backed capabilities: safe external session metadata, cache/status discovery, explicit refresh, deterministic bridge probes, and explicit `safe_transcript` import.
 
-This is the completed product shape for the current integration. The SDK bridge does not replace the `pi-rpc` runtime unless a future product decision explicitly changes that boundary.
+The SDK bridge is therefore both the default runtime transport and the bounded metadata/import probe. Passive metadata endpoints still fail closed and never execute extension commands.
 
 ## SDK module resolution
 
@@ -55,7 +56,7 @@ The Go bridge wraps session metadata discovery in a 60s cache and exposes a read
 GET /api/agents/pi/sdk-status
 ```
 
-The status endpoint reports cached bridge health and does not trigger extension commands or transcript reads. A fresh cache returns `available=false`, `checked=false`, and `state=unchecked`; after a successful external-session refresh it returns `checked=true` and `state=available`. If a bridge subprocess check fails, `checked=true`, `state=unavailable`, and `last_error` explain the failure while normal `pi-rpc` chat remains unaffected.
+The status endpoint reports cached bridge health and does not trigger extension commands or transcript reads. A fresh cache returns `available=false`, `checked=false`, and `state=unchecked`; after a successful external-session refresh it returns `checked=true` and `state=available`. If a bridge subprocess check fails, `checked=true`, `state=unavailable`, and `last_error` explain the passive metadata failure while explicit `pi-rpc` rollback remains available for chat.
 
 Response fields:
 
@@ -123,7 +124,7 @@ Builds an in-memory SDK session with an inline extension factory. The extension 
 - `input`
 - `editor`
 
-The probe binds a recording RPC-style UI context and returns the stable event schema plus canned responses. This validates the SDK/runtime/UI seam deterministically while production UI remains served by `pi-rpc`.
+The probe binds a recording RPC-style UI context and returns the stable event schema plus canned responses. This validates the SDK/runtime/UI seam deterministically for the default SDK runtime.
 
 ### `runtime-replacement-smoke`
 
@@ -153,7 +154,7 @@ It emits deterministic `extension_ui_request` events for UI contract mapping.
 
 ## Operational notes
 
-- Keep SDK subprocess failures fail-closed; do not degrade the `pi-rpc` runtime.
+- Keep passive SDK metadata subprocess failures fail-closed; do not remove the explicit `pi-rpc` rollback runtime.
 - Do not add transcript previews to passive list/status endpoints.
 - Do not expose credential values, raw context files, raw tool results, extension internals, auth headers/tokens/API keys, or environment variables.
 - Rebuild MindFS with the current release version ldflag so `/api/app/update` does not report a false update for Docker deployments.

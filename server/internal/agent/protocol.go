@@ -26,7 +26,7 @@ func DefaultProtocol(agentName string) Protocol {
 		return ProtocolCodexSDK
 	}
 	if agentName == "pi" {
-		return ProtocolPiRPC
+		return ProtocolPiSDK
 	}
 	return ProtocolACP
 }

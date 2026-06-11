@@ -89,7 +89,7 @@ func (i *Importer) ListExternalSessions(ctx context.Context, in agenttypes.ListE
 	}
 	if err != nil {
 		// External Pi SDK metadata is auxiliary. Discovery must fail closed and
-		// never make the production pi-rpc runtime unavailable.
+		// never make the interactive runtime or explicit pi-rpc rollback unavailable.
 		log.Printf("[agent/pi/importer] sdk bridge list-sessions failed: %v", err)
 		return agenttypes.ListExternalSessionsResult{}, nil
 	}

@@ -1,12 +1,11 @@
 #!/usr/bin/env node
 /**
- * Pi SDK auxiliary bridge for MindFS.
+ * Pi SDK bridge and runtime for MindFS.
  *
- * This bridge is production-wired only for bounded SDK-backed metadata,
- * status, refresh, deterministic bridge probes, and explicit safe transcript
- * import. MindFS' interactive Pi runtime intentionally remains the Go
- * `pi-rpc` path so chat/slash/tool/cancel/retry streaming semantics stay
- * stable while SDK features are used where they are safer and higher value.
+ * This bridge is production-wired for the default Pi SDK interactive runtime
+ * and for bounded SDK-backed metadata, status, refresh, deterministic bridge
+ * probes, and explicit safe transcript import. The Go `pi-rpc` path remains
+ * available as an explicit rollback protocol.
  */
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
@@ -279,7 +278,7 @@ function buildHelp() {
       "jsonl",
     ],
     notes: [
-      "Production auxiliary bridge; pi-rpc remains the intentional interactive runtime default.",
+      "Pi SDK is the default interactive runtime; pi-rpc remains available as an explicit rollback protocol.",
       "Capability output includes metadata, counts, and paths only; no credential values or context file contents.",
     ],
   };
