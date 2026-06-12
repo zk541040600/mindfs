@@ -25,6 +25,15 @@ const AGENT_MENU_MIN_VISIBLE_ROWS = 3;
 const AGENT_MENU_MIN_BODY_HEIGHT =
   AGENT_MENU_HEADER_HEIGHT + AGENT_MENU_ROW_HEIGHT * AGENT_MENU_MIN_VISIBLE_ROWS;
 
+function hasAgentConfigurationOptions(entry: AgentStatus): boolean {
+  return (
+    (entry.models?.length ?? 0) > 0 ||
+    (entry.modes?.length ?? 0) > 0 ||
+    (entry.efforts?.length ?? 0) > 0 ||
+    !!entry.supports_fast_service
+  );
+}
+
 function parseAgentErrorMessage(error?: string): string {
   const raw = String(error || "").trim();
   if (!raw) {
@@ -189,11 +198,7 @@ export function AgentSelector({
       if (!name || !onAgentRefresh) {
         return;
       }
-      const hasOptions =
-        (entry.models?.length ?? 0) > 0 ||
-        (entry.modes?.length ?? 0) > 0 ||
-        (entry.efforts?.length ?? 0) > 0 ||
-        !!entry.supports_fast_service;
+      const hasOptions = hasAgentConfigurationOptions(entry);
       if (entry.available && hasOptions && !entry.models_error && !entry.modes_error) {
         return;
       }
@@ -262,23 +267,10 @@ export function AgentSelector({
     [onAgentChange]
   );
 
-  const handleAgentRowClick = useCallback(
-    (entry: AgentStatus) => {
-      requestAgentRefresh(entry);
-      handleAgentSelect(entry.name, "");
-    },
-    [handleAgentSelect, requestAgentRefresh]
-  );
-
   const handleSubmenuToggle = useCallback(
     (entry: AgentStatus) => {
       requestAgentRefresh(entry);
-      if (
-        (entry.models?.length ?? 0) === 0 &&
-        (entry.modes?.length ?? 0) === 0 &&
-        (entry.efforts?.length ?? 0) === 0 &&
-        !entry.supports_fast_service
-      ) {
+      if (!hasAgentConfigurationOptions(entry)) {
         return;
       }
       setErrorAgent(null);
@@ -298,6 +290,18 @@ export function AgentSelector({
       setSubmenuAgent((prev) => (prev === entry.name ? null : entry.name));
     },
     [requestAgentRefresh]
+  );
+
+  const handleAgentRowClick = useCallback(
+    (entry: AgentStatus) => {
+      if (hasAgentConfigurationOptions(entry)) {
+        handleSubmenuToggle(entry);
+        return;
+      }
+      requestAgentRefresh(entry);
+      handleAgentSelect(entry.name, "");
+    },
+    [handleAgentSelect, handleSubmenuToggle, requestAgentRefresh]
   );
 
   const handleEffortSelect = useCallback(
@@ -455,11 +459,7 @@ export function AgentSelector({
               Agent
             </div>
             {agents.map((a) => {
-              const hasModelOptions =
-                (a.models?.length ?? 0) > 0 ||
-                (a.modes?.length ?? 0) > 0 ||
-                (a.efforts?.length ?? 0) > 0 ||
-                !!a.supports_fast_service;
+              const hasModelOptions = hasAgentConfigurationOptions(a);
               const hasError = !a.available && !!a.error;
               const isSelected = a.name === agent;
               const isExpanded = submenuAgent === a.name;
