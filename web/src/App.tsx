@@ -1933,6 +1933,21 @@ export function App({ onGoHome }: AppProps) {
         return { ...(prev as any), pending: false } as SessionItem;
       });
 
+      setCurrentSession((prev) => {
+        const prevKey = prev?.key || prev?.session_key;
+        const prevRoot =
+          (prev?.root_id as string | undefined) || currentRootIdRef.current;
+        if (
+          !prev ||
+          prevKey !== resolvedKey ||
+          prevRoot !== resolvedRoot ||
+          !(prev as any).pending
+        ) {
+          return prev;
+        }
+        return { ...(prev as any), pending: false } as SessionItem;
+      });
+
       const drawer = drawerSessionByRootRef.current[resolvedRoot];
       if (drawer && (drawer.key || drawer.session_key) === resolvedKey && drawer.pending) {
         setDrawerSessionForRoot(resolvedRoot, {
@@ -6248,32 +6263,7 @@ export function App({ onGoHome }: AppProps) {
       if (wasCanceled) {
         delete cancelRequestedBySessionRef.current[cacheKey];
       }
-      delete pendingBySessionRef.current[cacheKey];
-      const cached = sessionCacheRef.current[cacheKey];
-      if (cached && cached.key === sessionKey) {
-        sessionCacheRef.current[cacheKey] = {
-          ...(cached as any),
-          pending: false,
-        } as Session;
-      }
-      setSelectedPendingByKey(sessionKey, false);
-      setSelectedSession((prev) => {
-        const prevKey = prev?.key || prev?.session_key;
-        const prevRoot =
-          (prev?.root_id as string | undefined) || currentRootIdRef.current;
-        if (
-          !prev ||
-          prevKey !== sessionKey ||
-          prevRoot !== rootID ||
-          !(prev as any).pending
-        ) {
-          return prev;
-        }
-        return {
-          ...(prev as any),
-          pending: false,
-        } as SessionItem;
-      });
+      clearLocalPendingForSession(rootID, sessionKey);
       const drawer = drawerSessionByRootRef.current[rootID];
       if (drawer && drawer.key === sessionKey) {
         const latest = wasCanceled
@@ -7199,6 +7189,7 @@ export function App({ onGoHome }: AppProps) {
     appendThoughtChunkForSession,
     appendToolCallForSession,
     appendTodoUpdateForSession,
+    clearLocalPendingForSession,
     clearSessionStale,
     markSessionStale,
     resolvePendingForSession,
