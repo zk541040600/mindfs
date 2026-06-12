@@ -34,6 +34,8 @@ const MAX_RESOURCE_ITEMS = 50;
 const MAX_SESSION_ITEMS = 50;
 const DEFAULT_IMPORT_MAX_MESSAGES = 200;
 const DEFAULT_IMPORT_MAX_BYTES = 256 * 1024;
+const SDK_PROMPT_IDLE_POLL_MS = 250;
+const SDK_PROMPT_IDLE_FALLBACK_MS = 1500;
 
 for (const method of ["log", "info", "warn", "error", "debug"]) {
   console[method] = (...args) => process.stderr.write(`${args.map(String).join(" ")}\n`);
@@ -1575,7 +1577,84 @@ async function createJsonlSDKRuntime(options) {
   const pendingUI = new Map();
   const extensionErrors = [];
   await bindProbeExtensions(session, createJsonlBridgeUI(pendingUI), extensionErrors);
+  let activePrompt = undefined;
+  const clearPromptWatchdog = (state) => {
+    if (state?.timer) {
+      clearInterval(state.timer);
+      state.timer = undefined;
+    }
+    if (activePrompt === state) {
+      activePrompt = undefined;
+    }
+  };
+  const messagesForSession = () => {
+    if (Array.isArray(session.messages)) {
+      return session.messages;
+    }
+    if (Array.isArray(session.state?.messages)) {
+      return session.state.messages;
+    }
+    return [];
+  };
+  const latestAssistantAfter = (state) => {
+    const messages = messagesForSession();
+    for (let index = messages.length - 1; index >= Math.max(0, state.baselineMessageCount); index--) {
+      if (messages[index]?.role === "assistant") {
+        return messages[index];
+      }
+    }
+    return undefined;
+  };
+  const writePromptTerminalFallback = (state, reason) => {
+    if (!state || state.done) {
+      return false;
+    }
+    const assistant = latestAssistantAfter(state);
+    if (!state.sawAssistantActivity && !assistant) {
+      return false;
+    }
+    if (!state.seenMessageEnd && assistant) {
+      writeJsonl({ type: "message_end", message: assistant, synthetic: true, reason });
+      state.seenMessageEnd = true;
+    }
+    writeJsonl(contextWindowEnvelope(session));
+    writeJsonl({ type: "agent_end", willRetry: false, synthetic: true, reason });
+    state.done = true;
+    state.seenAgentEnd = true;
+    clearPromptWatchdog(state);
+    return true;
+  };
+  const startPromptWatchdog = (state) => {
+    state.timer = setInterval(() => {
+      if (state.done || state.seenAgentEnd) {
+        clearPromptWatchdog(state);
+        return;
+      }
+      const elapsed = Date.now() - state.startedAt;
+      if (elapsed < SDK_PROMPT_IDLE_FALLBACK_MS) {
+        return;
+      }
+      if (session.isStreaming === false) {
+        writePromptTerminalFallback(state, "sdk_idle_without_terminal_event");
+      }
+    }, SDK_PROMPT_IDLE_POLL_MS);
+  };
   let unsubscribe = session.subscribe((event) => {
+    const state = activePrompt;
+    if (state && !state.done) {
+      if (event.type === "message_update") {
+        state.sawAssistantActivity = true;
+      } else if (event.type === "message_end") {
+        state.seenMessageEnd = true;
+        if (event.message?.role === "assistant") {
+          state.sawAssistantActivity = true;
+        }
+      } else if (event.type === "agent_end") {
+        state.seenAgentEnd = true;
+        state.done = true;
+        clearPromptWatchdog(state);
+      }
+    }
     if (event.type === "agent_end") {
       writeJsonl(contextWindowEnvelope(session));
     }
@@ -1593,6 +1672,18 @@ async function createJsonlSDKRuntime(options) {
     responses: [],
     prompt: async function (request) {
       let preflightSucceeded = false;
+      const state = {
+        requestId: request.id,
+        startedAt: Date.now(),
+        baselineMessageCount: messagesForSession().length,
+        sawAssistantActivity: false,
+        seenMessageEnd: false,
+        seenAgentEnd: false,
+        done: false,
+        timer: undefined,
+      };
+      activePrompt = state;
+      startPromptWatchdog(state);
       void session
         .prompt(String(request.message ?? ""), {
           source: "rpc",
@@ -1608,10 +1699,15 @@ async function createJsonlSDKRuntime(options) {
             preflightSucceeded = true;
             writeJsonl(successResponse("prompt", { runtime: "sdk" }, request.id));
           }
-          writeJsonl(contextWindowEnvelope(session));
-          writeJsonl({ type: "agent_end", willRetry: false });
+          if (!state.done && !state.seenAgentEnd) {
+            writeJsonl(contextWindowEnvelope(session));
+            writeJsonl({ type: "agent_end", willRetry: false });
+            state.done = true;
+          }
+          clearPromptWatchdog(state);
         })
         .catch((error) => {
+          clearPromptWatchdog(state);
           if (!preflightSucceeded) {
             writeJsonl(errorResponse("prompt", error, request.id));
             return;
@@ -1619,6 +1715,7 @@ async function createJsonlSDKRuntime(options) {
           writeJsonl({ type: "recovery", message: error instanceof Error ? error.message : String(error) });
           writeJsonl(contextWindowEnvelope(session));
           writeJsonl({ type: "agent_end", willRetry: false });
+          state.done = true;
         });
     },
     answerExtensionUI: async function (request) {
