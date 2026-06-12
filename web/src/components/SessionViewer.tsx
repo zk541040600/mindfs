@@ -1505,14 +1505,19 @@ if (useInnerScrollContainer && !container) {
               <span
                 style={{
                   alignSelf: "flex-start",
-                  display: "inline-flex",
+                  display: "flex",
                   alignItems: "center",
+                  flexWrap: "wrap",
                   gap: "6px",
+                  rowGap: "2px",
                   fontSize: "10px",
+                  lineHeight: 1.35,
                   color: "var(--text-secondary)",
                   opacity: 0.5,
-                  marginTop: "-10px",
+                  marginTop: "4px",
                   marginBottom: "4px",
+                  maxWidth: "100%",
+                  minWidth: 0,
                 }}
               >
                 <button
@@ -1592,7 +1597,15 @@ if (useInnerScrollContainer && !container) {
                   style={{ width: "12px", height: "12px" }}
                 />
                 {assistantExchangeMeta ? (
-                  <span>{assistantExchangeMeta}</span>
+                  <span
+                    style={{
+                      minWidth: 0,
+                      overflowWrap: "anywhere",
+                      wordBreak: "break-word",
+                    }}
+                  >
+                    {assistantExchangeMeta}
+                  </span>
                 ) : null}
                 <span>{time}</span>
                 <ContextWindowBadge contextWindow={item.contextWindow} />
