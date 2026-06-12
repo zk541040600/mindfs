@@ -8575,6 +8575,113 @@ export function App({ onGoHome }: AppProps) {
 
   const extensionUIStatusEntries = Object.entries(extensionUIChrome.statuses);
   const extensionUIWidgetEntries = Object.entries(extensionUIChrome.widgets);
+  const hasExtensionUIChrome =
+    extensionUIStatusEntries.length > 0 || extensionUIWidgetEntries.length > 0;
+  const renderExtensionUIChrome = (variant: "mobile" | "desktop") => {
+    const mobileChrome = variant === "mobile";
+    const chromeContainerStyle: React.CSSProperties = mobileChrome
+      ? {
+          width: "100%",
+          minWidth: 0,
+          maxWidth: "100%",
+          boxSizing: "border-box",
+          padding: "0 6px 4px",
+          display: "flex",
+          flexDirection: "column",
+          gap: "6px",
+          maxHeight: "min(24vh, 156px)",
+          overflowY: "auto",
+          overscrollBehavior: "contain",
+          WebkitOverflowScrolling: "touch",
+        }
+      : {
+          position: "fixed",
+          right: "18px",
+          bottom: "88px",
+          zIndex: 950,
+          width: "min(360px, calc(100vw - 36px))",
+          display: "flex",
+          flexDirection: "column",
+          gap: "8px",
+          pointerEvents: "none",
+        };
+    const sharedCardStyle: React.CSSProperties = {
+      boxSizing: "border-box",
+      maxWidth: "100%",
+      minWidth: 0,
+      overflowWrap: "anywhere",
+      wordBreak: "break-word",
+      whiteSpace: "normal",
+      lineHeight: mobileChrome ? 1.35 : 1.4,
+      boxShadow: mobileChrome
+        ? "none"
+        : "0 10px 24px rgba(15, 23, 42, 0.12)",
+    };
+    return (
+      <div
+        data-mindfs-extension-ui-chrome={variant}
+        style={chromeContainerStyle}
+      >
+        {extensionUIStatusEntries.map(([key, text]) => (
+          <div
+            key={`status-${key}`}
+            data-mindfs-extension-ui-status={key}
+            style={{
+              ...sharedCardStyle,
+              border: "1px solid var(--border-color)",
+              background: "var(--surface-color, #fff)",
+              borderRadius: mobileChrome ? "8px" : "10px",
+              padding: mobileChrome ? "6px 8px" : "8px 10px",
+              fontSize: mobileChrome ? "11px" : "12px",
+              color: "var(--text-secondary)",
+            }}
+          >
+            <strong style={{ color: "var(--text-primary)" }}>{key}</strong>：
+            {text}
+          </div>
+        ))}
+        {extensionUIWidgetEntries.map(([key, widget]) => (
+          <div
+            key={`widget-${key}`}
+            data-mindfs-extension-ui-widget={key}
+            style={{
+              ...sharedCardStyle,
+              border: "1px solid rgba(59, 130, 246, 0.28)",
+              background: "rgba(59, 130, 246, 0.08)",
+              borderRadius: mobileChrome ? "8px" : "10px",
+              padding: mobileChrome ? "7px 8px" : "10px",
+              fontSize: mobileChrome ? "11px" : "12px",
+              color: "var(--text-primary)",
+            }}
+          >
+            <div
+              style={{
+                fontWeight: 700,
+                marginBottom: 4,
+                minWidth: 0,
+                overflowWrap: "anywhere",
+                wordBreak: "break-word",
+              }}
+            >
+              {key}
+            </div>
+            {widget.lines.map((line, index) => (
+              <div
+                key={`${key}-${index}`}
+                style={{
+                  minWidth: 0,
+                  overflowWrap: "anywhere",
+                  wordBreak: "break-word",
+                }}
+              >
+                {line}
+              </div>
+            ))}
+          </div>
+        ))}
+      </div>
+    );
+  };
   return (
     <>
       <AppShell
@@ -8746,45 +8853,59 @@ export function App({ onGoHome }: AppProps) {
           </div>
         }
         footer={
-          <ActionBar
-            status={status}
-            agentsVersion={agentsVersion}
-            currentRootId={currentRootId}
-            currentSession={actionBarSession}
-            attachedFileContext={attachedFileContext}
-            canOpenSessionDrawer={canOpenSessionDrawer}
-            sessionDrawerOpen={isDrawerOpen}
-            detachedBoundSession={detachedBoundSession}
-            editDraftRequest={editDraftRequest}
-            onSendMessage={handleSendMessage}
-            onCancelCurrentTurn={handleCancelCurrentTurn}
-            mobileEnterKeySends={mobileEnterKeySends}
-            onNewSession={handleNewSession}
-            onRequestFileContext={handleRequestFileContext}
-            onClearFileContext={handleClearFileContext}
-            onToggleLeftSidebar={() => setIsLeftOpen((v) => !v)}
-            onToggleRightSidebar={() => setIsRightOpen((v) => !v)}
-            onSessionClick={() => {
-              const rootID = currentRootIdRef.current;
-              if (!activeBoundSessionKey) return;
-              const selectedKey =
-                selectedSession?.key || selectedSession?.session_key;
-              const isBoundSessionInMain =
-                selectedKey === activeBoundSessionKey &&
-                interactionMode !== "drawer";
-              if (isBoundSessionInMain) return;
-              const isDrawerCurrentlyOpen =
-                !!drawerOpenByRootRef.current[rootID || ""];
-              if (isDrawerCurrentlyOpen) {
-                interactionModeRef.current = "main";
-                setInteractionMode("main");
-                setDrawerOpenForRoot(rootID, false);
-                return;
-              }
-              setInteractionMode("drawer");
-              setDrawerOpenForRoot(rootID, true);
+          <div
+            style={{
+              width: "100%",
+              minWidth: 0,
+              display: "flex",
+              flexDirection: "column",
+              alignItems: "stretch",
+              background: "var(--content-bg)",
             }}
-          />
+          >
+            {isMobile && hasExtensionUIChrome
+              ? renderExtensionUIChrome("mobile")
+              : null}
+            <ActionBar
+              status={status}
+              agentsVersion={agentsVersion}
+              currentRootId={currentRootId}
+              currentSession={actionBarSession}
+              attachedFileContext={attachedFileContext}
+              canOpenSessionDrawer={canOpenSessionDrawer}
+              sessionDrawerOpen={isDrawerOpen}
+              detachedBoundSession={detachedBoundSession}
+              editDraftRequest={editDraftRequest}
+              onSendMessage={handleSendMessage}
+              onCancelCurrentTurn={handleCancelCurrentTurn}
+              mobileEnterKeySends={mobileEnterKeySends}
+              onNewSession={handleNewSession}
+              onRequestFileContext={handleRequestFileContext}
+              onClearFileContext={handleClearFileContext}
+              onToggleLeftSidebar={() => setIsLeftOpen((v) => !v)}
+              onToggleRightSidebar={() => setIsRightOpen((v) => !v)}
+              onSessionClick={() => {
+                const rootID = currentRootIdRef.current;
+                if (!activeBoundSessionKey) return;
+                const selectedKey =
+                  selectedSession?.key || selectedSession?.session_key;
+                const isBoundSessionInMain =
+                  selectedKey === activeBoundSessionKey &&
+                  interactionMode !== "drawer";
+                if (isBoundSessionInMain) return;
+                const isDrawerCurrentlyOpen =
+                  !!drawerOpenByRootRef.current[rootID || ""];
+                if (isDrawerCurrentlyOpen) {
+                  interactionModeRef.current = "main";
+                  setInteractionMode("main");
+                  setDrawerOpenForRoot(rootID, false);
+                  return;
+                }
+                setInteractionMode("drawer");
+                setDrawerOpenForRoot(rootID, true);
+              }}
+            />
+          </div>
         }
         drawer={
           <BottomSheet
@@ -8938,57 +9059,7 @@ export function App({ onGoHome }: AppProps) {
           </div>
         </div>
       ) : null}
-      {extensionUIStatusEntries.length > 0 || extensionUIWidgetEntries.length > 0 ? (
-        <div
-          style={{
-            position: "fixed",
-            right: "18px",
-            bottom: "88px",
-            zIndex: 950,
-            width: "min(360px, calc(100vw - 36px))",
-            display: "flex",
-            flexDirection: "column",
-            gap: "8px",
-            pointerEvents: "none",
-          }}
-        >
-          {extensionUIStatusEntries.map(([key, text]) => (
-            <div
-              key={`status-${key}`}
-              style={{
-                border: "1px solid var(--border-color)",
-                background: "var(--surface-color, #fff)",
-                borderRadius: "10px",
-                padding: "8px 10px",
-                fontSize: "12px",
-                color: "var(--text-secondary)",
-                boxShadow: "0 10px 24px rgba(15, 23, 42, 0.12)",
-              }}
-            >
-              <strong style={{ color: "var(--text-primary)" }}>{key}</strong>：{text}
-            </div>
-          ))}
-          {extensionUIWidgetEntries.map(([key, widget]) => (
-            <div
-              key={`widget-${key}`}
-              style={{
-                border: "1px solid rgba(59, 130, 246, 0.28)",
-                background: "rgba(59, 130, 246, 0.08)",
-                borderRadius: "10px",
-                padding: "10px",
-                fontSize: "12px",
-                color: "var(--text-primary)",
-                boxShadow: "0 10px 24px rgba(15, 23, 42, 0.12)",
-              }}
-            >
-              <div style={{ fontWeight: 700, marginBottom: 4 }}>{key}</div>
-              {widget.lines.map((line, index) => (
-                <div key={`${key}-${index}`}>{line}</div>
-              ))}
-            </div>
-          ))}
-        </div>
-      ) : null}
+      {!isMobile && hasExtensionUIChrome ? renderExtensionUIChrome("desktop") : null}
       {pendingExtensionUI ? (
         <ExtensionUIDialog
           request={pendingExtensionUI}
