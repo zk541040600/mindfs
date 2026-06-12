@@ -34,6 +34,16 @@ function hasAgentConfigurationOptions(entry: AgentStatus): boolean {
   );
 }
 
+function shouldDeferAgentSelectionForRefresh(
+  entry: AgentStatus,
+  canRefresh: boolean,
+): boolean {
+  return (
+    canRefresh &&
+    (!entry.available || !!entry.error || !!entry.models_error || !!entry.modes_error)
+  );
+}
+
 function parseAgentErrorMessage(error?: string): string {
   const raw = String(error || "").trim();
   if (!raw) {
@@ -117,6 +127,7 @@ export function AgentSelector({
   const [isOpen, setIsOpen] = useState(false);
   const [submenuAgent, setSubmenuAgent] = useState<string | null>(null);
   const [errorAgent, setErrorAgent] = useState<string | null>(null);
+  const [pendingSubmenuAgent, setPendingSubmenuAgent] = useState<string | null>(null);
   const [modelSectionExpanded, setModelSectionExpanded] = useState(true);
   const [modeSectionExpanded, setModeSectionExpanded] = useState(false);
   const [effortSectionExpanded, setEffortSectionExpanded] = useState(false);
@@ -176,6 +187,18 @@ export function AgentSelector({
   const fallbackFastService = submenuAgentStatus?.default_fast_service || "";
   const fastModeEnabled =
     (submenuAgentStatus?.name === agent ? fastService : fallbackFastService) === "on";
+  const updateMenuBodyHeight = useCallback(() => {
+    const node = agentColumnRef.current;
+    if (!node) {
+      return;
+    }
+    setMenuBodyHeight(
+      Math.min(
+        AGENT_MENU_MAX_BODY_HEIGHT,
+        Math.max(node.scrollHeight, AGENT_MENU_MIN_BODY_HEIGHT),
+      ),
+    );
+  }, []);
   const buttonTitle = useMemo(() => {
     if (warnUnavailable) {
       return `当前会话的 Agent（${agent}）不可用`;
@@ -189,6 +212,7 @@ export function AgentSelector({
   useEffect(() => {
     if (!isOpen) {
       refreshRequestedRef.current.clear();
+      setPendingSubmenuAgent(null);
     }
   }, [isOpen]);
 
@@ -241,17 +265,8 @@ export function AgentSelector({
     if (!isOpen || submenuAgent) {
       return;
     }
-    const node = agentColumnRef.current;
-    if (!node) {
-      return;
-    }
-    setMenuBodyHeight(
-      Math.min(
-        AGENT_MENU_MAX_BODY_HEIGHT,
-        Math.max(node.scrollHeight, AGENT_MENU_MIN_BODY_HEIGHT),
-      ),
-    );
-  }, [isOpen, submenuAgent, agents.length]);
+    updateMenuBodyHeight();
+  }, [isOpen, submenuAgent, agents.length, updateMenuBodyHeight]);
 
   const handleAgentSelect = useCallback(
     (newAgent: string, nextModel?: string) => {
@@ -259,6 +274,7 @@ export function AgentSelector({
       setIsOpen(false);
       setSubmenuAgent(null);
       setErrorAgent(null);
+      setPendingSubmenuAgent(null);
       setModelSectionExpanded(true);
       setModeSectionExpanded(false);
       setEffortSectionExpanded(false);
@@ -267,6 +283,36 @@ export function AgentSelector({
     [onAgentChange]
   );
 
+  useEffect(() => {
+    if (!isOpen || !pendingSubmenuAgent) {
+      return;
+    }
+    const entry = agents.find((item) => item.name === pendingSubmenuAgent);
+    if (!entry) {
+      return;
+    }
+    if (hasAgentConfigurationOptions(entry)) {
+      setErrorAgent(null);
+      setModelSectionExpanded(true);
+      setModeSectionExpanded(false);
+      setEffortSectionExpanded(false);
+      setServiceTierSectionExpanded(false);
+      updateMenuBodyHeight();
+      setSubmenuAgent(entry.name);
+      setPendingSubmenuAgent(null);
+      return;
+    }
+    if (entry.available && !entry.error && !entry.models_error && !entry.modes_error) {
+      handleAgentSelect(entry.name, "");
+    }
+  }, [
+    agents,
+    handleAgentSelect,
+    isOpen,
+    pendingSubmenuAgent,
+    updateMenuBodyHeight,
+  ]);
+
   const handleSubmenuToggle = useCallback(
     (entry: AgentStatus) => {
       requestAgentRefresh(entry);
@@ -274,22 +320,15 @@ export function AgentSelector({
         return;
       }
       setErrorAgent(null);
+      setPendingSubmenuAgent(null);
       setModelSectionExpanded(true);
       setModeSectionExpanded(false);
       setEffortSectionExpanded(false);
       setServiceTierSectionExpanded(false);
-      const node = agentColumnRef.current;
-      if (node) {
-        setMenuBodyHeight(
-          Math.min(
-            AGENT_MENU_MAX_BODY_HEIGHT,
-            Math.max(node.scrollHeight, AGENT_MENU_MIN_BODY_HEIGHT),
-          ),
-        );
-      }
+      updateMenuBodyHeight();
       setSubmenuAgent((prev) => (prev === entry.name ? null : entry.name));
     },
-    [requestAgentRefresh]
+    [requestAgentRefresh, updateMenuBodyHeight]
   );
 
   const handleAgentRowClick = useCallback(
@@ -299,9 +338,15 @@ export function AgentSelector({
         return;
       }
       requestAgentRefresh(entry);
+      if (shouldDeferAgentSelectionForRefresh(entry, !!onAgentRefresh)) {
+        setPendingSubmenuAgent(entry.name);
+        setSubmenuAgent(null);
+        setErrorAgent(entry.error ? entry.name : null);
+        return;
+      }
       handleAgentSelect(entry.name, "");
     },
-    [handleAgentSelect, handleSubmenuToggle, requestAgentRefresh]
+    [handleAgentSelect, handleSubmenuToggle, onAgentRefresh, requestAgentRefresh]
   );
 
   const handleEffortSelect = useCallback(

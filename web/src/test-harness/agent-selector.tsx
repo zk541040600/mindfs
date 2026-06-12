@@ -8,59 +8,100 @@ type AgentSelectorSnapshot = {
   agent: string;
   model: string;
   mode: string;
+  refreshes: string[];
 };
 
 declare global {
   interface Window {
     __agentSelectorTest: AgentSelectorSnapshot;
+    __agentSelectorResolvePiRefresh?: () => void;
   }
 }
 
-const agents: AgentStatus[] = [
+const healthyPi: AgentStatus = {
+  name: "pi",
+  installed: true,
+  available: true,
+  current_model_id: "cch-responses/gpt-5.5",
+  default_model_id: "cch-responses/gpt-5.5",
+  models: [
+    {
+      id: "cch-responses/gpt-5.5",
+      name: "cch-responses/GPT 5.5",
+    },
+    {
+      id: "cch-responses/gpt-5.4-mini",
+      name: "cch-responses/GPT 5.4 Mini",
+    },
+  ],
+  current_mode_id: "xhigh",
+  modes: [
+    {
+      id: "xhigh",
+      name: "Thinking: xhigh",
+    },
+  ],
+};
+
+const baseAgents: AgentStatus[] = [
   {
     name: "opencode",
     installed: true,
     available: true,
     models: [],
   },
-  {
-    name: "pi",
-    installed: true,
-    available: true,
-    current_model_id: "cch-responses/gpt-5.5",
-    default_model_id: "cch-responses/gpt-5.5",
-    models: [
-      {
-        id: "cch-responses/gpt-5.5",
-        name: "cch-responses/GPT 5.5",
-      },
-      {
-        id: "cch-responses/gpt-5.4-mini",
-        name: "cch-responses/GPT 5.4 Mini",
-      },
-    ],
-    current_mode_id: "xhigh",
-    modes: [
-      {
-        id: "xhigh",
-        name: "Thinking: xhigh",
-      },
-    ],
-  },
+  healthyPi,
 ];
 
 function publishSnapshot(next: AgentSelectorSnapshot) {
   window.__agentSelectorTest = next;
 }
 
+function getInitialAgents(): AgentStatus[] {
+  const scenario = new URLSearchParams(window.location.search).get("scenario");
+  if (scenario !== "stale-pi") {
+    return baseAgents;
+  }
+  return baseAgents.map((entry) =>
+    entry.name === "pi"
+      ? {
+          name: "pi",
+          installed: true,
+          available: false,
+          error: "Pi probe is still warming up",
+          models: [],
+          modes: [],
+        }
+      : entry,
+  );
+}
+
 function AgentSelectorHarness() {
+  const scenario = new URLSearchParams(window.location.search).get("scenario");
+  const [agents, setAgents] = useState<AgentStatus[]>(() => getInitialAgents());
   const [agent, setAgent] = useState("opencode");
   const [model, setModel] = useState("");
   const [mode, setMode] = useState("");
+  const [refreshes, setRefreshes] = useState<string[]>([]);
 
   useEffect(() => {
-    publishSnapshot({ agent, model, mode });
-  }, [agent, model, mode]);
+    publishSnapshot({ agent, model, mode, refreshes });
+  }, [agent, model, mode, refreshes]);
+
+  useEffect(() => {
+    if (scenario !== "stale-pi") {
+      delete window.__agentSelectorResolvePiRefresh;
+      return;
+    }
+    window.__agentSelectorResolvePiRefresh = () => {
+      setAgents((current) =>
+        current.map((entry) => (entry.name === "pi" ? healthyPi : entry)),
+      );
+    };
+    return () => {
+      delete window.__agentSelectorResolvePiRefresh;
+    };
+  }, [scenario]);
 
   return (
     <main
@@ -101,6 +142,9 @@ function AgentSelectorHarness() {
             setModel(nextModel || "");
           }}
           onModeChange={(nextMode) => setMode(nextMode || "")}
+          onAgentRefresh={(name) => {
+            setRefreshes((current) => [...current, name]);
+          }}
           compact
         />
       </div>
@@ -108,7 +152,7 @@ function AgentSelectorHarness() {
   );
 }
 
-publishSnapshot({ agent: "opencode", model: "", mode: "" });
+publishSnapshot({ agent: "opencode", model: "", mode: "", refreshes: [] });
 
 const root = document.getElementById("root");
 if (!root) {
