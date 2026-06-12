@@ -975,6 +975,8 @@ type AppProps = {
 };
 
 const MOBILE_ENTER_KEY_SEND_STORAGE_KEY = "mindfs-mobile-enter-key-sends";
+const PENDING_RECONCILE_INTERVAL_MS = 4000;
+const PENDING_RECONCILE_MIN_AGE_MS = 5000;
 
 type PendingExtensionUIRequest = ExtensionUIRequest & {
   rootId: string;
@@ -1867,6 +1869,83 @@ export function App({ onGoHome }: AppProps) {
     [rootSessionKey],
   );
 
+  const resolveFreshSessionPending = useCallback(
+    (
+      rootID: string | null | undefined,
+      sessionKey: string | null | undefined,
+      serverPending?: boolean,
+    ): boolean => {
+      const resolvedRoot = String(rootID || "");
+      const resolvedKey = String(sessionKey || "");
+      if (!resolvedRoot || !resolvedKey) {
+        return !!serverPending;
+      }
+      return (
+        !!serverPending ||
+        !!pendingBySessionRef.current[rootSessionKey(resolvedRoot, resolvedKey)]
+      );
+    },
+    [rootSessionKey],
+  );
+
+  const clearLocalPendingForSession = useCallback(
+    (rootID: string | null | undefined, sessionKey: string | null | undefined) => {
+      const resolvedRoot = String(rootID || "");
+      const resolvedKey = String(sessionKey || "");
+      if (!resolvedRoot || !resolvedKey || resolvedKey.startsWith("pending-")) {
+        return;
+      }
+      const cacheKey = rootSessionKey(resolvedRoot, resolvedKey);
+      delete pendingBySessionRef.current[cacheKey];
+      delete cancelRequestedBySessionRef.current[cacheKey];
+
+      const cached = sessionCacheRef.current[cacheKey];
+      if (cached && cached.key === resolvedKey && (cached as any).pending) {
+        sessionCacheRef.current[cacheKey] = {
+          ...(cached as any),
+          pending: false,
+        } as Session;
+      }
+
+      setSessions((prev) =>
+        prev.map((item) => {
+          const itemKey = item.key || item.session_key;
+          const itemRoot = item.root_id || resolvedRoot;
+          if (itemKey !== resolvedKey || itemRoot !== resolvedRoot || !item.pending) {
+            return item;
+          }
+          return { ...item, pending: false };
+        }),
+      );
+
+      setSelectedSession((prev) => {
+        const prevKey = prev?.key || prev?.session_key;
+        const prevRoot =
+          (prev?.root_id as string | undefined) || currentRootIdRef.current;
+        if (
+          !prev ||
+          prevKey !== resolvedKey ||
+          prevRoot !== resolvedRoot ||
+          !(prev as any).pending
+        ) {
+          return prev;
+        }
+        return { ...(prev as any), pending: false } as SessionItem;
+      });
+
+      const drawer = drawerSessionByRootRef.current[resolvedRoot];
+      if (drawer && (drawer.key || drawer.session_key) === resolvedKey && drawer.pending) {
+        setDrawerSessionForRoot(resolvedRoot, {
+          ...(drawer as any),
+          pending: false,
+        } as SessionItem);
+      }
+
+      bumpCacheVersion();
+    },
+    [bumpCacheVersion, rootSessionKey, setDrawerSessionForRoot],
+  );
+
   const markSessionStale = useCallback(
     (rootID: string | null | undefined, sessionKey: string | null | undefined) => {
       const resolvedRoot = String(rootID || "");
@@ -1928,7 +2007,7 @@ export function App({ onGoHome }: AppProps) {
       if (!fullSession) {
         return null;
       }
-      const pending = resolvePendingForSession(
+      const pending = resolveFreshSessionPending(
         resolvedRoot,
         resolvedKey,
         !!(fullSession as any)?.pending,
@@ -1946,7 +2025,7 @@ export function App({ onGoHome }: AppProps) {
         pending,
       } as Session;
     },
-    [bumpCacheVersion, resolvePendingForSession, rootSessionKey],
+    [bumpCacheVersion, resolveFreshSessionPending, rootSessionKey],
   );
 
   const updateSessionRelatedFilesForKey = useCallback(
@@ -3114,11 +3193,8 @@ export function App({ onGoHome }: AppProps) {
         (session?.root_id as string | undefined) || currentRootIdRef.current;
       if (!targetRoot || !key) return;
       setMainViewPreferenceForRoot(targetRoot, "session");
-      const currentDrawer = drawerSessionByRootRef.current[targetRoot];
-      const preservePending =
-        currentDrawer?.key === key
-          ? !!(currentDrawer as any)?.pending
-          : !!(session as any)?.pending;
+      const cacheKey = rootSessionKey(targetRoot, key);
+      const preservePending = !!pendingBySessionRef.current[cacheKey];
       const searchTargetId =
         typeof session?.search_seq === "number"
           ? `${key}:${session.search_seq}:${++sessionSearchTargetCounterRef.current}`
@@ -3131,7 +3207,6 @@ export function App({ onGoHome }: AppProps) {
         pluginQuery: {},
       });
       selectedSessionByRootRef.current[targetRoot] = key;
-      const cacheKey = rootSessionKey(targetRoot, key);
       const wasStale = isSessionStale(targetRoot, key);
       const hadInMemoryState =
         !!pendingBySessionRef.current[cacheKey] ||
@@ -3154,10 +3229,10 @@ export function App({ onGoHome }: AppProps) {
         options?: { writeCache?: boolean },
       ) => {
         const shouldWriteCache = options?.writeCache !== false;
-        const pending = resolvePendingForSession(
+        const pending = resolveFreshSessionPending(
           targetRoot,
           key,
-          !!(fullSession as any)?.pending || preservePending,
+          !!(fullSession as any)?.pending,
         );
         const normalized = {
           ...(fullSession as any),
@@ -3231,7 +3306,7 @@ export function App({ onGoHome }: AppProps) {
       bumpCacheVersion,
       clearSessionStale,
       isSessionStale,
-      resolvePendingForSession,
+      resolveFreshSessionPending,
       restoreActiveSession,
       setDrawerOpenForRoot,
       setDrawerSessionForRoot,
@@ -5882,6 +5957,136 @@ export function App({ onGoHome }: AppProps) {
     sessionService.connect(currentRootId);
     setStatus("Connected");
   }, [currentRootId]);
+
+  useEffect(() => {
+    if (!currentRootId) {
+      return;
+    }
+    let cancelled = false;
+    let timer: number | null = null;
+    let running = false;
+
+    type PendingCandidate = {
+      rootID: string;
+      sessionKey: string;
+      canClear: boolean;
+    };
+
+    const addCandidate = (
+      candidates: Map<string, PendingCandidate>,
+      rootID: string | null | undefined,
+      sessionKey: string | null | undefined,
+    ) => {
+      const resolvedRoot = String(rootID || "");
+      const resolvedKey = String(sessionKey || "");
+      if (!resolvedRoot || !resolvedKey || resolvedKey.startsWith("pending-")) {
+        return;
+      }
+      const cacheKey = rootSessionKey(resolvedRoot, resolvedKey);
+      const pending = pendingBySessionRef.current[cacheKey];
+      const pendingAt = pending?.timestamp ? Date.parse(pending.timestamp) : Number.NaN;
+      const pendingAge = Number.isFinite(pendingAt)
+        ? Date.now() - pendingAt
+        : Number.POSITIVE_INFINITY;
+      candidates.set(cacheKey, {
+        rootID: resolvedRoot,
+        sessionKey: resolvedKey,
+        canClear: !pending || pendingAge >= PENDING_RECONCILE_MIN_AGE_MS,
+      });
+    };
+
+    const collectPendingCandidates = () => {
+      const candidates = new Map<string, PendingCandidate>();
+      for (const [cacheKey, pending] of Object.entries(pendingBySessionRef.current)) {
+        const separator = cacheKey.indexOf("::");
+        const rootID = separator > 0 ? cacheKey.slice(0, separator) : pending.rootId;
+        const sessionKey = separator > 0 ? cacheKey.slice(separator + 2) : pending.sessionKey;
+        addCandidate(candidates, rootID, sessionKey);
+      }
+      for (const item of sessionsRef.current) {
+        if (item?.pending) {
+          addCandidate(candidates, item.root_id || currentRootIdRef.current, item.key || item.session_key);
+        }
+      }
+      const selected = selectedSessionRef.current;
+      if (selected?.pending) {
+        addCandidate(candidates, selected.root_id || currentRootIdRef.current, selected.key || selected.session_key);
+      }
+      const current = currentSessionRef.current;
+      if (current?.pending) {
+        addCandidate(candidates, current.root_id || currentRootIdRef.current, current.key || current.session_key);
+      }
+      for (const [rootID, drawer] of Object.entries(drawerSessionByRootRef.current)) {
+        if (drawer?.pending) {
+          addCandidate(candidates, drawer.root_id || rootID, drawer.key || drawer.session_key);
+        }
+      }
+      for (const [cacheKey, cached] of Object.entries(sessionCacheRef.current)) {
+        if (!(cached as any)?.pending) {
+          continue;
+        }
+        const separator = cacheKey.indexOf("::");
+        addCandidate(
+          candidates,
+          separator > 0 ? cacheKey.slice(0, separator) : currentRootIdRef.current,
+          separator > 0 ? cacheKey.slice(separator + 2) : cached.key,
+        );
+      }
+      return Array.from(candidates.values());
+    };
+
+    const schedule = () => {
+      if (cancelled) {
+        return;
+      }
+      timer = window.setTimeout(reconcile, PENDING_RECONCILE_INTERVAL_MS);
+    };
+
+    const reconcile = async () => {
+      if (running || cancelled) {
+        schedule();
+        return;
+      }
+      const candidates = collectPendingCandidates();
+      if (candidates.length === 0) {
+        schedule();
+        return;
+      }
+      running = true;
+      try {
+        const replying = await sessionService.getReplyingSessions();
+        if (cancelled) {
+          return;
+        }
+        if (!replying) {
+          return;
+        }
+        const active = new Set(
+          replying
+            .filter((item) => item.root_id && item.session_key)
+            .map((item) => rootSessionKey(item.root_id, item.session_key)),
+        );
+        for (const candidate of candidates) {
+          const cacheKey = rootSessionKey(candidate.rootID, candidate.sessionKey);
+          if (!candidate.canClear || active.has(cacheKey)) {
+            continue;
+          }
+          clearLocalPendingForSession(candidate.rootID, candidate.sessionKey);
+        }
+      } finally {
+        running = false;
+        schedule();
+      }
+    };
+
+    void reconcile();
+    return () => {
+      cancelled = true;
+      if (timer !== null) {
+        window.clearTimeout(timer);
+      }
+    };
+  }, [clearLocalPendingForSession, currentRootId, rootSessionKey]);
 
   useEffect(() => {
     if (sessionListMode !== "import") return;

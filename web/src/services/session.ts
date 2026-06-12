@@ -120,6 +120,15 @@ export type SessionSearchHit = {
   snippet?: string;
 };
 
+export type ReplyingSessionState = {
+  root_id: string;
+  session_key: string;
+  session_title?: string;
+  status?: string;
+  summary?: string;
+  updated_at?: string;
+};
+
 export type ToolCallLocation = {
   path: string;
   line?: number;
@@ -871,6 +880,18 @@ class SessionService {
       return data as Session;
     } catch (err) {
       console.error("[Session] Failed to get session:", err);
+      return null;
+    }
+  }
+
+  async getReplyingSessions(): Promise<ReplyingSessionState[] | null> {
+    try {
+      const data = await protectedJSON<{ sessions?: ReplyingSessionState[] }>(
+        appURL("/api/replying-sessions"),
+      );
+      return Array.isArray(data?.sessions) ? data.sessions : [];
+    } catch (err) {
+      console.error("[Session] Failed to get replying sessions:", err);
       return null;
     }
   }
