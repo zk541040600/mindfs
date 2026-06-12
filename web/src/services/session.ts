@@ -657,6 +657,19 @@ class SessionService {
     };
   }
 
+  emitTestStreamEvent(sessionKey: string, event: StreamEvent) {
+    if (!import.meta.env.DEV) {
+      return;
+    }
+    const handlers = this.handlers.get(sessionKey);
+    if (!handlers || handlers.size === 0) {
+      return;
+    }
+    for (const handler of handlers) {
+      handler.onStream?.(event);
+    }
+  }
+
   async sendMessage(
     rootId: string,
     sessionKey: string | undefined,

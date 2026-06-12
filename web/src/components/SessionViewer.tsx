@@ -810,13 +810,15 @@ function SessionViewerInner({
   const relatedFilesDefaultStateRef = useRef<string>("");
   const sessionKey = session?.key || session?.session_key || null;
   const exchanges = Array.isArray(session?.exchanges) ? session.exchanges : [];
+  const isAwaiting = !!(session as any)?.pending;
   const { timeline, isStreaming, streamVersion, streamStatusText } = useSessionStream(
     sessionKey,
     exchanges,
     session?.exchange_aux || {},
     session?.context_window,
+    isAwaiting,
   );
-  const isAwaiting = !!(session as any)?.pending;
+  const isLiveStreaming = isAwaiting && isStreaming;
   const shouldStickToBottomRef = useRef(true);
   const lastSessionKeyRef = useRef<string | null>(null);
   const targetSeqScrollKeyRef = useRef("");
@@ -879,7 +881,7 @@ function SessionViewerInner({
 
   useEffect(() => {
     const container = scrollRef.current;
-if (useInnerScrollContainer && !container) {
+    if (useInnerScrollContainer && !container) {
       return;
     }
     if (!scrollEndRef.current) {
@@ -894,7 +896,7 @@ if (useInnerScrollContainer && !container) {
     if (shouldStickToBottomRef.current) {
       scrollEndRef.current.scrollIntoView({ behavior: "auto", block: "end" });
     }
-  }, [sessionKey, timeline, isStreaming, streamVersion, useInnerScrollContainer]);
+  }, [sessionKey, timeline, isLiveStreaming, streamVersion, useInnerScrollContainer]);
 
   useEffect(() => {
     const el = scrollRef.current;
@@ -1164,7 +1166,7 @@ if (useInnerScrollContainer && !container) {
     const hideAssistantMeta =
       !isUser &&
       (hasFollowingAssistantFlow ||
-        (isStreaming && idx === timeline.length - 1));
+        (isLiveStreaming && idx === timeline.length - 1));
     const time = formatTime(item.timestamp);
     const uploadAttachments = isUser
       ? extractUploadAttachments(item.content || "")
@@ -1731,7 +1733,7 @@ if (useInnerScrollContainer && !container) {
                 timelineItemSpacing(idx > 0 ? timeline[idx - 1] : null, item),
               ),
             )}
-            {(isAwaiting || isStreaming) && (
+            {isAwaiting && (
               <div
                 style={{
                   marginTop: "16px",
@@ -1751,7 +1753,7 @@ if (useInnerScrollContainer && !container) {
                     animation: "pulse 1s infinite",
                   }}
                 />
-                {isStreaming
+                {isLiveStreaming
                   ? streamStatusText || "正在生成..."
                   : "已发送，等待响应..."}
               </div>

@@ -372,6 +372,7 @@ export function useSessionStream(
   exchanges: ExchangeLike[] = [],
   exchangeAux: ExchangeAuxMapLike = {},
   sessionContextWindow?: ContextWindowLike,
+  active = true,
 ): UseSessionStreamResult {
   const [isStreaming, setIsStreaming] = useState(false);
   const [streamVersion, setStreamVersion] = useState(0);
@@ -390,7 +391,7 @@ export function useSessionStream(
     setIsStreaming(false);
     setStreamVersion(0);
     setStreamStatusText("");
-    if (!sessionKey) return;
+    if (!sessionKey || !active) return;
 
     const unsubscribe = sessionService.subscribe(sessionKey, {
       onStream: (event) => {
@@ -423,7 +424,7 @@ export function useSessionStream(
     return () => {
       unsubscribe();
     };
-  }, [sessionKey]);
+  }, [sessionKey, active]);
 
   return {
     timeline: settleRunningTools(baseTimeline),
