@@ -190,7 +190,7 @@ export type StreamEvent =
         };
       };
     }
-  | { type: "error"; data: { message: string } };
+  | { type: "error"; data: { message: string; request_id?: string } };
 
 export type SyncSessionResult = {
   session: Session | null;
@@ -515,6 +515,8 @@ class SessionService {
       if (requestId) {
         this.pendingMessages.delete(requestId);
       }
+    } else if (type === "session.done" && typeof msg.id === "string") {
+      payload.request_id = msg.id;
     } else if (type === "session.error" && typeof msg.id === "string") {
       this.pendingMessages.delete(msg.id);
       payload.request_id = msg.id;

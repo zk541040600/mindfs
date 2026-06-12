@@ -755,6 +755,7 @@ func isStaleAgentSessionError(err error) bool {
 	return strings.Contains(compact, "unknownsessionid") ||
 		strings.Contains(compact, "unknownsession") ||
 		strings.Contains(compact, "sessionnotfound") ||
+		strings.Contains(compact, "agentisalreadyprocessing") ||
 		(strings.Contains(compact, "invalidparams") && strings.Contains(compact, "sessionid"))
 }
 
@@ -1217,12 +1218,12 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 	if err := s.ensureRegistry(); err != nil {
 		return err
 	}
-	turnCtx, turnCancel := context.WithCancel(ctx)
-	registerActiveTurn(in.RootID, in.Key, turnCancel)
-	defer unregisterActiveTurn(in.RootID, in.Key)
 	sendLock := getSessionSendLock(in.Key)
 	sendLock.Lock()
 	defer sendLock.Unlock()
+	turnCtx, turnCancel := context.WithCancel(ctx)
+	registerActiveTurn(in.RootID, in.Key, turnCancel)
+	defer unregisterActiveTurn(in.RootID, in.Key)
 	if in.OnStart != nil {
 		in.OnStart()
 	}

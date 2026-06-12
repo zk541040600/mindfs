@@ -3965,6 +3965,8 @@ export function App({ onGoHome }: AppProps) {
         tempKey,
       };
       if (sendSessionKey) {
+        pendingBySessionRef.current[rootSessionKey(activeRoot, sendSessionKey)] =
+          pendingRequestRef.current[requestId];
         const ck = rootSessionKey(activeRoot, sendSessionKey);
         const cached =
           sessionCacheRef.current[ck] || ({ ...(session as any) } as Session);
@@ -4082,6 +4084,9 @@ export function App({ onGoHome }: AppProps) {
       }
       if (!sent && sendSessionKey) {
         const failedSessionKey = sendSessionKey;
+        delete pendingBySessionRef.current[
+          rootSessionKey(activeRoot, failedSessionKey)
+        ];
         setSelectedPendingByKey(failedSessionKey, false);
         const latest = drawerSessionByRootRef.current[activeRoot];
         if (latest && latest.key === failedSessionKey) {
@@ -6018,8 +6023,22 @@ export function App({ onGoHome }: AppProps) {
       await setCachedSessionRelatedFiles(rootID, sessionKey, relatedFiles);
       updateSessionRelatedFilesForKey(rootID, sessionKey, relatedFiles);
     };
-    const handleSessionStreamDone = (rootID: string, sessionKey: string) => {
+    const handleSessionStreamDone = (
+      rootID: string,
+      sessionKey: string,
+      requestId?: string,
+    ) => {
       const cacheKey = rootSessionKey(rootID, sessionKey);
+      const pending = pendingBySessionRef.current[cacheKey];
+      if (requestId && pending?.requestId && pending.requestId !== requestId) {
+        console.info("[session/stream] ignore_stale_done", {
+          rootId: rootID,
+          sessionKey,
+          requestId,
+          pendingRequestId: pending.requestId,
+        });
+        return;
+      }
       const wasCanceled = !!cancelRequestedBySessionRef.current[cacheKey];
       if (wasCanceled) {
         delete cancelRequestedBySessionRef.current[cacheKey];
@@ -6347,7 +6366,11 @@ export function App({ onGoHome }: AppProps) {
           playCompletionSound();
           handleSessionStreamDone(activeRoot, streamKey);
           break;
-        case "error":
+        case "error": {
+          const errorRequestId =
+            typeof event.data?.request_id === "string"
+              ? event.data.request_id
+              : "";
           reportError(
             "session.resume_failed",
             event.data?.message || "会话处理失败，请稍后重试",
@@ -6359,8 +6382,9 @@ export function App({ onGoHome }: AppProps) {
               },
             },
           );
-          handleSessionStreamDone(activeRoot, streamKey);
+          handleSessionStreamDone(activeRoot, streamKey, errorRequestId);
           break;
+        }
       }
     };
     const dirname = (path: string): string => {
@@ -6671,6 +6695,8 @@ export function App({ onGoHome }: AppProps) {
         case "session.done": {
           const sessionKey =
             typeof payload?.session_key === "string" ? payload.session_key : "";
+          const requestId =
+            typeof payload?.request_id === "string" ? payload.request_id : "";
           console.info("[session/ws] done", { rootId: typeof payload?.root_id === "string" ? payload.root_id : null, sessionKey: sessionKey || null });
           const rootID =
             typeof payload?.root_id === "string" && payload.root_id
@@ -6679,7 +6705,7 @@ export function App({ onGoHome }: AppProps) {
                 currentRootIdRef.current ||
                 "";
           if (rootID && sessionKey) {
-            handleSessionStreamDone(rootID, sessionKey);
+            handleSessionStreamDone(rootID, sessionKey, requestId);
             const newest = sessionsRef.current[0]?.updated_at || "";
             void loadSessionsForRoot(
               rootID,

@@ -98,6 +98,21 @@ let lastFetch = 0;
 let inFlightAgents: Promise<{ agents: AgentStatus[]; shells: ShellStatus[] }> | null = null;
 const CACHE_TTL = 30000; // 30 seconds
 
+type FetchAgentsOptions = {
+  force?: boolean;
+  refreshAgent?: string;
+};
+
+function normalizeFetchOptions(options: boolean | FetchAgentsOptions = false): Required<FetchAgentsOptions> {
+  if (typeof options === "boolean") {
+    return { force: options, refreshAgent: "" };
+  }
+  return {
+    force: !!options.force,
+    refreshAgent: String(options.refreshAgent || "").trim(),
+  };
+}
+
 function normalizeShellStatus(input: unknown): ShellStatus | null {
   if (!input || typeof input !== "object") {
     return null;
@@ -119,20 +134,24 @@ function normalizeShellStatus(input: unknown): ShellStatus | null {
   };
 }
 
-async function fetchAgentRuntime(force = false): Promise<{ agents: AgentStatus[]; shells: ShellStatus[] }> {
+async function fetchAgentRuntime(options: boolean | FetchAgentsOptions = false): Promise<{ agents: AgentStatus[]; shells: ShellStatus[] }> {
+  const { force, refreshAgent } = normalizeFetchOptions(options);
   const now = Date.now();
-  if (!force && cachedAgents.length > 0 && now - lastFetch < CACHE_TTL) {
+  if (!force && !refreshAgent && cachedAgents.length > 0 && now - lastFetch < CACHE_TTL) {
     return { agents: cachedAgents, shells: cachedShells };
   }
-  if (inFlightAgents) {
+  if (!refreshAgent && inFlightAgents) {
     return inFlightAgents;
   }
   if (!protectedAPIReady()) {
     return { agents: cachedAgents, shells: cachedShells };
   }
 
-  inFlightAgents = (async () => {
-    const data = await protectedJSON<any>(appPath("/api/agents"));
+  const request = async () => {
+    const path = refreshAgent
+      ? `/api/agents?refresh_agent=${encodeURIComponent(refreshAgent)}`
+      : "/api/agents";
+    const data = await protectedJSON<any>(appPath(path));
     const agentItems: unknown[] = Array.isArray(data)
       ? data
       : Array.isArray(data?.agents)
@@ -145,7 +164,19 @@ async function fetchAgentRuntime(force = false): Promise<{ agents: AgentStatus[]
     cachedShells = shellItems.map(normalizeShellStatus).filter((item): item is ShellStatus => item !== null);
     lastFetch = now;
     return { agents: cachedAgents, shells: cachedShells };
-  })();
+  };
+
+  const pending = request();
+  if (refreshAgent) {
+    try {
+      return await pending;
+    } catch (err) {
+      console.error("Failed to refresh agent:", err);
+      return { agents: cachedAgents, shells: cachedShells };
+    }
+  }
+
+  inFlightAgents = pending;
   try {
     return await inFlightAgents;
   } catch (err) {
@@ -156,8 +187,8 @@ async function fetchAgentRuntime(force = false): Promise<{ agents: AgentStatus[]
   }
 }
 
-export async function fetchAgents(force = false): Promise<AgentStatus[]> {
-  const data = await fetchAgentRuntime(force);
+export async function fetchAgents(options: boolean | FetchAgentsOptions = false): Promise<AgentStatus[]> {
+  const data = await fetchAgentRuntime(options);
   return data.agents;
 }
 

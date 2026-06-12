@@ -494,12 +494,6 @@ func probeInstalledAgentWithPool(ctx context.Context, name string, def Definitio
 
 	sessionKey := fmt.Sprintf("probe-%s", name)
 	defer pool.Close(sessionKey)
-	openCtx := ctx
-	sessionCancel := func() {}
-	if timeout, ok := probeSessionTimeoutForPhase(phase); ok {
-		openCtx, sessionCancel = context.WithTimeout(ctx, timeout)
-	}
-	defer sessionCancel()
 	openInput := agenttypes.OpenSessionInput{
 		SessionKey: sessionKey,
 		AgentName:  name,
@@ -526,7 +520,7 @@ func probeInstalledAgentWithPool(ctx context.Context, name string, def Definitio
 		log.Printf("[agent/probe] open agent=%s phase=%s action=open_new_runtime_session", name, phase)
 	}
 
-	sess, err := pool.GetOrCreate(openCtx, openInput)
+	sess, err := openProbeSession(ctx, phase, pool, openInput)
 	if err != nil && strings.TrimSpace(openInput.AgentSessionID) != "" {
 		log.Printf("[agent/probe] resume.error agent=%s phase=%s agent_session_id=%s err=%v fallback=open_new_runtime_session", name, phase, openInput.AgentSessionID, err)
 		if clearErr := clearProbeSessionBinding(probeSessions, name); clearErr != nil {
@@ -535,7 +529,7 @@ func probeInstalledAgentWithPool(ctx context.Context, name string, def Definitio
 		openInput.AgentSessionID = ""
 		resumed = false
 		resumedBinding = ProbeSessionBinding{}
-		sess, err = pool.GetOrCreate(openCtx, openInput)
+		sess, err = openProbeSession(ctx, phase, pool, openInput)
 	}
 	if err != nil {
 		status.ProbeError = err.Error()
@@ -548,8 +542,36 @@ func probeInstalledAgentWithPool(ctx context.Context, name string, def Definitio
 	if err := storeProbeSessionBinding(probeSessions, name, sess.SessionID(), resumedBinding, resumed); err != nil {
 		log.Printf("[agent/probe] store_session.error agent=%s phase=%s err=%v", name, phase, err)
 	}
-	populateProbeModels(ctx, sess, &status)
-	populateProbeCommands(ctx, sess, &status)
+	if err := populateProbeCapabilities(ctx, sess, &status); isClosedProbeError(err) {
+		log.Printf("[agent/probe] capability.closed agent=%s phase=%s err=%v fallback=open_new_runtime_session", name, phase, err)
+		pool.Close(sessionKey)
+		if clearErr := clearProbeSessionBinding(probeSessions, name); clearErr != nil {
+			log.Printf("[agent/probe] capability.clear_failed agent=%s phase=%s err=%v", name, phase, clearErr)
+		}
+		openInput.AgentSessionID = ""
+		resumed = false
+		resumedBinding = ProbeSessionBinding{}
+		resetProbeCapabilities(&status)
+		sess, err = openProbeSession(ctx, phase, pool, openInput)
+		if err != nil {
+			status.Available = false
+			status.ProbeError = err.Error()
+			return status
+		}
+		status.Available = true
+		status.Error = ""
+		status.ProbeError = ""
+		if err := storeProbeSessionBinding(probeSessions, name, sess.SessionID(), resumedBinding, resumed); err != nil {
+			log.Printf("[agent/probe] store_session.retry_error agent=%s phase=%s err=%v", name, phase, err)
+		}
+		if retryErr := populateProbeCapabilities(ctx, sess, &status); isClosedProbeError(retryErr) {
+			status.Available = false
+			status.ProbeError = retryErr.Error()
+			if clearErr := clearProbeSessionBinding(probeSessions, name); clearErr != nil {
+				log.Printf("[agent/probe] capability.retry_clear_failed agent=%s phase=%s err=%v", name, phase, clearErr)
+			}
+		}
+	}
 	return status
 }
 
@@ -747,23 +769,96 @@ func probeInteractionTimeoutForPhase(phase probePhase) (time.Duration, bool) {
 	}
 }
 
-func populateProbeModels(ctx context.Context, sess agenttypes.Session, status *Status) {
+func openProbeSession(ctx context.Context, phase probePhase, pool *Pool, in agenttypes.OpenSessionInput) (agenttypes.Session, error) {
+	openCtx := ctx
+	cancel := func() {}
+	if timeout, ok := probeSessionTimeoutForPhase(phase); ok {
+		openCtx, cancel = context.WithTimeout(ctx, timeout)
+	}
+	defer cancel()
+	return pool.GetOrCreate(openCtx, in)
+}
+
+func populateProbeCapabilities(ctx context.Context, sess agenttypes.Session, status *Status) error {
+	var firstErr error
+	if err := populateProbeModels(ctx, sess, status); err != nil {
+		if isClosedProbeError(err) {
+			return err
+		}
+		firstErr = err
+	}
+	if err := populateProbeCommands(ctx, sess, status); err != nil {
+		if isClosedProbeError(err) {
+			return err
+		}
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+func resetProbeCapabilities(status *Status) {
+	status.CurrentModelID = ""
+	status.CurrentModeID = ""
+	status.Models = nil
+	status.Modes = nil
+	status.Efforts = nil
+	status.Commands = nil
+	status.ModelsError = ""
+	status.ModesError = ""
+	status.CommandsError = ""
+	status.RuntimeError = ""
+	status.ProbeError = ""
+	status.Error = ""
+}
+
+func isClosedProbeError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(strings.TrimSpace(err.Error()))
+	if msg == "" {
+		return false
+	}
+	closedMarkers := []string{
+		"e_closed",
+		"eof",
+		"closed pipe",
+		"broken pipe",
+		"session closed",
+		"runtime session closed",
+		"use of closed",
+		"process already finished",
+		"process exited",
+	}
+	for _, marker := range closedMarkers {
+		if strings.Contains(msg, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func populateProbeModels(ctx context.Context, sess agenttypes.Session, status *Status) error {
 	modelsCtx, modelsCancel := context.WithTimeout(ctx, probeModelListTimeout)
 	defer modelsCancel()
 
 	models, err := sess.ListModels(modelsCtx)
 	if err != nil {
 		status.ModelsError = err.Error()
-		return
+		return err
 	}
 	status.CurrentModelID = models.CurrentModelID
 	status.Models = models.Models
 	status.Efforts = inferAgentEfforts(models.Models)
 	status.SupportsFastService = supportsAgentFastService(status.Name)
 
+	var firstErr error
 	modes, err := sess.ListModes(modelsCtx)
 	if err != nil {
 		status.ModesError = err.Error()
+		firstErr = err
 	} else {
 		status.CurrentModeID = modes.CurrentModeID
 		status.Modes = modes.Modes
@@ -782,18 +877,20 @@ func populateProbeModels(ctx context.Context, sess agenttypes.Session, status *S
 		}
 		status.DefaultFastService = defaults.FastService
 	}
+	return firstErr
 }
 
-func populateProbeCommands(ctx context.Context, sess agenttypes.Session, status *Status) {
+func populateProbeCommands(ctx context.Context, sess agenttypes.Session, status *Status) error {
 	commandsCtx, commandsCancel := context.WithTimeout(ctx, probeCommandListTimeout)
 	defer commandsCancel()
 
 	commands, err := sess.ListCommands(commandsCtx)
 	if err != nil {
 		status.CommandsError = err.Error()
-		return
+		return err
 	}
 	status.Commands = commands.Commands
+	return nil
 }
 
 func normalizeStatus(status Status) Status {

@@ -869,7 +869,14 @@ func (h *HTTPHandler) handleAgentsList(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	statuses := h.AppContext.GetProber().GetInstalledStatuses()
+	prober := h.AppContext.GetProber()
+	if refreshAgent := strings.TrimSpace(r.URL.Query().Get("refresh_agent")); refreshAgent != "" {
+		if err := prober.ClearProbeSession(refreshAgent); err != nil {
+			log.Printf("[http] agents.refresh.clear_probe_session.error agent=%s err=%v", refreshAgent, err)
+		}
+		prober.ProbeOne(r.Context(), refreshAgent)
+	}
+	statuses := prober.GetInstalledStatuses()
 	if prefs := h.AppContext.GetPreferences(); prefs != nil {
 		statuses = prefs.ApplyAgentDefaults(statuses)
 	}

@@ -527,7 +527,10 @@ func (h *WSHandler) handleSessionMessage(ctx context.Context, conn *websocket.Co
 			errorMessage := normalizeAgentErrorMessage(err)
 			event := &StreamEvent{
 				Type: "error",
-				Data: map[string]string{"message": errorMessage},
+				Data: map[string]string{
+					"message":    errorMessage,
+					"request_id": req.ID,
+				},
 			}
 			streamHub.BroadcastSessionStream(rootID, key, event)
 		}

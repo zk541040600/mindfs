@@ -353,6 +353,7 @@ export function ActionBar({
   const candidateItemRefs = useRef<Array<HTMLDivElement | null>>([]);
   const suppressedCommandCandidateTextRef = useRef("");
   const attachmentInputRef = useRef<HTMLInputElement>(null);
+  const refreshingAgentsRef = useRef<Set<string>>(new Set());
   const isComposingRef = useRef(false);
   const compositionGuardUntilRef = useRef(0);
   const { isMobile } = useResponsive();
@@ -452,6 +453,23 @@ export function ActionBar({
       setModel("");
     }
   }, [agent, model, agents]);
+
+  useEffect(() => {
+    if (currentSession || !agent || model) {
+      return;
+    }
+    const selected = agents.find((item) => item.name === agent);
+    if (!selected) {
+      return;
+    }
+    const defaults = getAgentDefaults(selected);
+    if (!defaults.model) {
+      return;
+    }
+    setModel(defaults.model);
+    setEffort(defaults.effort);
+    setFastService(defaults.fastService);
+  }, [agent, agents, currentSession, model]);
 
   const selectedAgent = agents.find((item) => item.name === agent);
   const selectedModelInfo =
@@ -647,7 +665,13 @@ export function ActionBar({
 
   const handleSend = useCallback(async () => {
     const messageText = serializedInput.trim();
-    if ((!messageText && pendingAttachments.length === 0) || !isConnected || sending || (mode !== "command" && !agent)) return;
+    if (
+      (!messageText && pendingAttachments.length === 0) ||
+      !isConnected ||
+      sending ||
+      currentSession?.pending ||
+      (mode !== "command" && !agent)
+    ) return;
     setSending(true);
     setCandidates([]);
     setActiveCandidateIndex(0);
@@ -705,7 +729,7 @@ export function ActionBar({
         requestAnimationFrame(() => editorRef.current?.focus());
       }
     }
-  }, [serializedInput, pendingAttachments, isConnected, sending, agent, model, agentMode, onSendMessage, mode, currentRootId, supportsEffort, effort, supportsServiceTier, fastService, isMobile]);
+  }, [serializedInput, pendingAttachments, isConnected, sending, currentSession?.pending, agent, model, agentMode, onSendMessage, mode, currentRootId, supportsEffort, effort, supportsServiceTier, fastService, isMobile]);
 
   const handleCancel = useCallback(async () => {
     const sessionKey = currentSession?.key;
@@ -717,6 +741,20 @@ export function ActionBar({
       setCancelling(false);
     }
   }, [currentSession?.key, cancelling, onCancelCurrentTurn]);
+
+  const handleAgentRefresh = useCallback((agentName: string) => {
+    const name = agentName.trim();
+    if (!name || refreshingAgentsRef.current.has(name)) {
+      return;
+    }
+    refreshingAgentsRef.current.add(name);
+    fetchAgents({ force: true, refreshAgent: name })
+      .then((nextAgents) => setAgents(nextAgents))
+      .catch((err) => console.error("Failed to refresh agent:", err))
+      .finally(() => {
+        refreshingAgentsRef.current.delete(name);
+      });
+  }, []);
 
   const isCompositionActive = useCallback((event?: KeyboardEvent | null) => {
     const nativeEvent = event as (KeyboardEvent & { isComposing?: boolean; keyCode?: number }) | null | undefined;
@@ -855,7 +893,7 @@ export function ActionBar({
   }, [isDragging, handleDragEnd]);
 
   const isSelectedAgentUnavailable = agents.length > 0 ? agents.find((a) => a.name === agent)?.available === false : false;
-  const canSend = (!!serializedInput.trim() || pendingAttachments.length > 0) && isConnected && !sending && (mode === "command" || !!agent);
+  const canSend = (!!serializedInput.trim() || pendingAttachments.length > 0) && isConnected && !sending && !currentSession?.pending && (mode === "command" || !!agent);
   const hasBoundSession = !!currentSession;
   const showCancel = !!currentSession?.pending && !!currentSession?.key;
   const isModeLocked = !!currentSession;
@@ -1136,6 +1174,7 @@ export function ActionBar({
                   onEffortChange={(nextEffort) => setEffort(nextEffort || "")}
                   fastService={fastService}
                   onFastServiceChange={(nextFastService) => setFastService(nextFastService || "")}
+                  onAgentRefresh={handleAgentRefresh}
                   compact={true}
                   warnUnavailable={isSelectedAgentUnavailable}
                 />

@@ -13,6 +13,7 @@ type AgentSelectorProps = {
   onModeChange?: (mode?: string) => void;
   onEffortChange?: (effort?: string) => void;
   onFastServiceChange?: (fastService?: "" | "on" | "off") => void;
+  onAgentRefresh?: (agent: string) => void;
   compact?: boolean;
   warnUnavailable?: boolean;
 };
@@ -100,6 +101,7 @@ export function AgentSelector({
   onModeChange,
   onEffortChange,
   onFastServiceChange,
+  onAgentRefresh,
   compact = false,
   warnUnavailable = false,
 }: AgentSelectorProps) {
@@ -114,6 +116,7 @@ export function AgentSelector({
   const [menuBodyHeight, setMenuBodyHeight] = useState<number | null>(null);
   const dropdownRef = useRef<HTMLDivElement>(null);
   const agentColumnRef = useRef<HTMLDivElement>(null);
+  const refreshRequestedRef = useRef<Set<string>>(new Set());
   const submenuAgentStatus = useMemo(
     () => agents.find((item) => item.name === submenuAgent) ?? null,
     [agents, submenuAgent]
@@ -175,6 +178,42 @@ export function AgentSelector({
   }, [agent, model, warnUnavailable]);
 
   useEffect(() => {
+    if (!isOpen) {
+      refreshRequestedRef.current.clear();
+    }
+  }, [isOpen]);
+
+  const requestAgentRefresh = useCallback(
+    (entry: AgentStatus) => {
+      const name = String(entry.name || "").trim();
+      if (!name || !onAgentRefresh) {
+        return;
+      }
+      const hasOptions =
+        (entry.models?.length ?? 0) > 0 ||
+        (entry.modes?.length ?? 0) > 0 ||
+        (entry.efforts?.length ?? 0) > 0 ||
+        !!entry.supports_fast_service;
+      if (entry.available && hasOptions && !entry.models_error && !entry.modes_error) {
+        return;
+      }
+      if (refreshRequestedRef.current.has(name)) {
+        return;
+      }
+      refreshRequestedRef.current.add(name);
+      onAgentRefresh(name);
+    },
+    [onAgentRefresh]
+  );
+
+  useEffect(() => {
+    if (!isOpen) {
+      return;
+    }
+    agents.forEach((entry) => requestAgentRefresh(entry));
+  }, [agents, isOpen, requestAgentRefresh]);
+
+  useEffect(() => {
     const handlePointerOutside = (e: PointerEvent) => {
       if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node)) {
         setIsOpen(false);
@@ -225,13 +264,15 @@ export function AgentSelector({
 
   const handleAgentRowClick = useCallback(
     (entry: AgentStatus) => {
+      requestAgentRefresh(entry);
       handleAgentSelect(entry.name, "");
     },
-    [handleAgentSelect]
+    [handleAgentSelect, requestAgentRefresh]
   );
 
   const handleSubmenuToggle = useCallback(
     (entry: AgentStatus) => {
+      requestAgentRefresh(entry);
       if (
         (entry.models?.length ?? 0) === 0 &&
         (entry.modes?.length ?? 0) === 0 &&
@@ -256,7 +297,7 @@ export function AgentSelector({
       }
       setSubmenuAgent((prev) => (prev === entry.name ? null : entry.name));
     },
-    []
+    [requestAgentRefresh]
   );
 
   const handleEffortSelect = useCallback(
