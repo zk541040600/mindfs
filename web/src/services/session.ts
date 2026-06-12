@@ -209,6 +209,14 @@ type SessionServiceEvent = {
   payload?: Record<string, unknown>;
 };
 
+function isSessionTerminalEvent(type: string): boolean {
+  return (
+    type === "session.done" ||
+    type === "session.error" ||
+    type === "session.cancelled"
+  );
+}
+
 type FetchSessionsOptions = {
   beforeTime?: string;
   afterTime?: string;
@@ -535,6 +543,10 @@ class SessionService {
 
     if (!sessionKey) return;
 
+    if (isSessionTerminalEvent(type)) {
+      this.pendingStreams.delete(sessionKey);
+    }
+
     const handlers = this.handlers.get(sessionKey);
     if ((!handlers || handlers.size === 0) && type === "session.stream") {
       const event = nextPayload.event as StreamEvent;
@@ -561,6 +573,11 @@ class SessionService {
       case "session.error":
         for (const handler of handlers) {
           handler.onError?.(msg.error?.message || "Unknown error");
+        }
+        break;
+      case "session.cancelled":
+        for (const handler of handlers) {
+          handler.onDone?.();
         }
         break;
     }
