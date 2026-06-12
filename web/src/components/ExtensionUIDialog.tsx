@@ -17,6 +17,13 @@ type ExtensionUIDialogProps = {
   onCancel: () => void;
 };
 
+type ExtensionUISelectOption = {
+  label: string;
+  value: string;
+  description?: string;
+  disabled?: boolean;
+};
+
 export function extensionUIPayloadString(
   payload: Record<string, unknown> | undefined,
   key: string,
@@ -32,6 +39,60 @@ export function extensionUIPayloadStringArray(
   const value = payload?.[key];
   if (!Array.isArray(value)) return [];
   return value.filter((item): item is string => typeof item === "string");
+}
+
+function objectStringValue(value: Record<string, unknown>, keys: string[]): string {
+  for (const key of keys) {
+    const item = value[key];
+    if (typeof item === "string" && item.trim() !== "") {
+      return item;
+    }
+    if (typeof item === "number" || typeof item === "boolean") {
+      return String(item);
+    }
+  }
+  return "";
+}
+
+export function extensionUIPayloadSelectOptions(
+  payload: Record<string, unknown> | undefined,
+  key: string,
+): ExtensionUISelectOption[] {
+  const value = payload?.[key];
+  if (!Array.isArray(value)) return [];
+  const options: ExtensionUISelectOption[] = [];
+  for (const item of value) {
+    if (typeof item === "string") {
+      options.push({ label: item, value: item });
+      continue;
+    }
+    if (typeof item === "number" || typeof item === "boolean") {
+      const text = String(item);
+      options.push({ label: text, value: text });
+      continue;
+    }
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      continue;
+    }
+    const raw = item as Record<string, unknown>;
+    const label =
+      objectStringValue(raw, ["label", "name", "title", "text", "id", "key", "value"]) ||
+      "";
+    const optionValue =
+      objectStringValue(raw, ["value", "id", "key", "name", "label", "title", "text"]) ||
+      label;
+    if (!label || !optionValue) {
+      continue;
+    }
+    const description = objectStringValue(raw, ["description", "detail", "subtitle"]);
+    options.push({
+      label,
+      value: optionValue,
+      description: description || undefined,
+      disabled: raw.disabled === true,
+    });
+  }
+  return options;
 }
 
 export function extensionUIPayloadLines(
@@ -68,7 +129,7 @@ export function ExtensionUIDialog({
 }: ExtensionUIDialogProps) {
   const title = extensionUITitle(request);
   const message = extensionUIPayloadString(request.payload, "message");
-  const options = extensionUIPayloadStringArray(request.payload, "options");
+  const options = extensionUIPayloadSelectOptions(request.payload, "options");
   const placeholder = extensionUIPayloadString(request.payload, "placeholder");
   const disabledCursor = submitting ? "not-allowed" : "pointer";
 
@@ -128,21 +189,34 @@ export function ExtensionUIDialog({
           <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
             {options.map((option, index) => (
               <button
-                key={`${option}-${index}`}
+                key={`${option.value}-${index}`}
                 data-testid="extension-ui-option"
                 type="button"
-                disabled={submitting}
-                onClick={() => void onSubmit({ value: option })}
+                disabled={submitting || option.disabled}
+                onClick={() => void onSubmit({ value: option.value })}
                 style={{
                   border: "1px solid rgba(148, 163, 184, 0.5)",
                   background: "#f8fafc",
                   borderRadius: "10px",
                   padding: "10px 12px",
                   textAlign: "left",
-                  cursor: disabledCursor,
+                  cursor: submitting || option.disabled ? "not-allowed" : disabledCursor,
                 }}
               >
-                {option}
+                <span style={{ display: "block" }}>{option.label}</span>
+                {option.description ? (
+                  <span
+                    style={{
+                      display: "block",
+                      color: "#64748b",
+                      fontSize: "12px",
+                      lineHeight: 1.4,
+                      marginTop: 3,
+                    }}
+                  >
+                    {option.description}
+                  </span>
+                ) : null}
               </button>
             ))}
           </div>

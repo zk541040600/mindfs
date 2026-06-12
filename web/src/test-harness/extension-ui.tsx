@@ -59,6 +59,25 @@ const dialogRequests: Record<string, ExtensionUIRequest> = {
       options: ["rpc-first", "sdk-bridge"],
     },
   },
+  selectObject: {
+    id: "select-object-1",
+    method: "select",
+    payload: {
+      title: "Choose object route",
+      options: [
+        {
+          label: "RPC First",
+          value: "rpc-first-object",
+          description: "Use legacy RPC bridge first",
+        },
+        {
+          label: "SDK Bridge",
+          value: "sdk-bridge-object",
+          description: "Use Pi SDK bridge runtime",
+        },
+      ],
+    },
+  },
   confirm: {
     id: "confirm-1",
     method: "confirm",

@@ -109,6 +109,33 @@ test("submits extension UI dialog responses through the mocked WS path", async (
   ]);
 });
 
+test("submits select object option values while displaying labels", async ({ page }) => {
+  const dialog = page.getByTestId("extension-ui-dialog");
+
+  await page.getByTestId("request-selectObject").click();
+  await expect(dialog).toBeVisible();
+  await expect(page.getByTestId("extension-ui-title")).toHaveText("Choose object route");
+  await expect(page.getByTestId("extension-ui-option").filter({ hasText: "SDK Bridge" })).toBeVisible();
+  await expect(page.getByTestId("extension-ui-option").filter({ hasText: "Use Pi SDK bridge runtime" })).toBeVisible();
+  await page.getByTestId("extension-ui-option").filter({ hasText: "SDK Bridge" }).click();
+  await expect(dialog).toHaveCount(0);
+
+  await expect.poll(() => capturedResponses(page)).toEqual([
+    {
+      type: "session.extension_ui_response",
+      payload: {
+        root_id: "harness-root",
+        session_key: "harness-session",
+        agent: "pi",
+        request_id: "select-object-1",
+        method: "select",
+        value: "sdk-bridge-object",
+        cancelled: false,
+      },
+    },
+  ]);
+});
+
 test("keeps fire-and-forget extension UI events non-blocking", async ({ page }) => {
   const dialog = page.getByTestId("extension-ui-dialog");
 
