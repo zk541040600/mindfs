@@ -33,6 +33,7 @@ type OpenOptions struct {
 	Model           string
 	Mode            string
 	RootPath        string
+	AgentDir        string
 	Command         string
 	Env             map[string]string
 	ResumeSessionID string
@@ -125,6 +126,9 @@ func startPayloadForOptions(opts OpenOptions) map[string]any {
 		return map[string]any{"type": "start_test_runtime", "scenario": scenario}
 	}
 	payload := map[string]any{"type": "start_sdk_runtime"}
+	if agentDir := strings.TrimSpace(opts.AgentDir); agentDir != "" {
+		payload["agentDir"] = agentDir
+	}
 	if model := strings.TrimSpace(opts.Model); model != "" {
 		payload["model"] = model
 	}

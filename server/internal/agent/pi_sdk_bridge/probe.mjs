@@ -13,7 +13,7 @@ import { createRequire } from "node:module";
 import { createInterface } from "node:readline";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 let AuthStorage;
@@ -70,6 +70,8 @@ async function loadPiSDK() {
   } catch {
     // MindFS does not have to vendor Pi SDK; the global Pi install is a valid deployment source.
   }
+  addCandidate(candidates, join(dirname(process.execPath), "..", "lib", "node_modules", packagePath));
+  addCandidate(candidates, join(DEFAULT_AGENT_DIR, "npm", "node_modules", packagePath));
 
   try {
     const globalRoot = execFileSync("npm", ["root", "-g"], {
@@ -127,12 +129,19 @@ async function main() {
   }
 
   try {
-    await ensurePiSDK();
-
     if (command === "jsonl") {
+      try {
+        await ensurePiSDK();
+      } catch (error) {
+        writeJsonl(errorResponse("jsonl", error));
+        process.exitCode = 1;
+        return;
+      }
       await runJsonl(argv);
       return;
     }
+
+    await ensurePiSDK();
 
     const options = parseArgs(argv);
     let data;
@@ -956,7 +965,7 @@ function createRecordingUI(events) {
     addAutocompleteProvider: () => {},
     setEditorComponent: () => {},
     getEditorComponent: () => undefined,
-    theme: {},
+    theme: noopTheme(),
     getAllThemes: () => [],
     getTheme: () => undefined,
     setTheme: () => ({ success: false, error: "theme switching not implemented in probe UI" }),
@@ -1563,6 +1572,9 @@ async function createJsonlSDKRuntime(options) {
     model,
     thinkingLevel,
   });
+  const pendingUI = new Map();
+  const extensionErrors = [];
+  await bindProbeExtensions(session, createJsonlBridgeUI(pendingUI), extensionErrors);
   let unsubscribe = session.subscribe((event) => {
     if (event.type === "agent_end") {
       writeJsonl(contextWindowEnvelope(session));
@@ -1591,6 +1603,14 @@ async function createJsonlSDKRuntime(options) {
             }
           },
         })
+        .then(() => {
+          if (!preflightSucceeded) {
+            preflightSucceeded = true;
+            writeJsonl(successResponse("prompt", { runtime: "sdk" }, request.id));
+          }
+          writeJsonl(contextWindowEnvelope(session));
+          writeJsonl({ type: "agent_end", willRetry: false });
+        })
         .catch((error) => {
           if (!preflightSucceeded) {
             writeJsonl(errorResponse("prompt", error, request.id));
@@ -1602,7 +1622,18 @@ async function createJsonlSDKRuntime(options) {
         });
     },
     answerExtensionUI: async function (request) {
-      throw new ProbeError("E_PARAM", `unknown extension UI request id: ${request.id}`);
+      const id = String(request.id ?? "").trim();
+      const pending = pendingUI.get(id);
+      if (!pending) {
+        throw new ProbeError("E_PARAM", `unknown extension UI request id: ${id || request.id}`);
+      }
+      const requestedMethod = String(request.method ?? "").trim();
+      if (requestedMethod && requestedMethod !== pending.method) {
+        throw new ProbeError("E_PARAM", `extension UI method mismatch for ${id}: got ${requestedMethod} want ${pending.method}`);
+      }
+      pendingUI.delete(id);
+      pending.resolve(extensionUIResponseValue(pending.method, request));
+      writeJsonl(successResponse("extension_ui_response", { method: pending.method, remaining: pendingUI.size }, id));
     },
     getState: async function (request) {
       writeJsonl(successResponse("get_state", {
@@ -1670,11 +1701,109 @@ async function createJsonlSDKRuntime(options) {
       writeJsonl(successResponse("abort", {}, request.id));
     },
     dispose: async function () {
+      resolvePendingJsonlBridgeUI(pendingUI);
       unsubscribe?.();
       unsubscribe = undefined;
       session.dispose?.();
     },
   };
+}
+
+function createJsonlBridgeUI(pending) {
+  const nextId = makeIdGenerator("ui");
+  const requestDialog = (method, payload, options) =>
+    new Promise((resolve) => {
+      const id = nextId(method);
+      pending.set(id, { method, resolve });
+      writeJsonl({
+        type: "extension_ui_request",
+        id,
+        method,
+        ...payload,
+        opts: sanitizeDialogOptions(options),
+      });
+    });
+  const fireAndForget = (method, payload) => {
+    writeJsonl({
+      type: "extension_ui_request",
+      id: nextId(method),
+      method,
+      ...payload,
+    });
+  };
+
+  return {
+    select: (title, choices, options) => requestDialog("select", { title, options: choices }, options),
+    confirm: (title, message, options) => requestDialog("confirm", { title, message }, options),
+    input: (title, placeholder, options) => requestDialog("input", { title, placeholder }, options),
+    editor: (title, prefill, options) => requestDialog("editor", { title, prefill }, options),
+    notify: (message, notificationType) => fireAndForget("notify", { message, notificationType }),
+    onTerminalInput: () => () => {},
+    setStatus: (statusKey, statusText) => fireAndForget("setStatus", { statusKey, statusText }),
+    setWorkingMessage: (message) => fireAndForget("setWorkingMessage", { message }),
+    setWorkingVisible: (visible) => fireAndForget("setWorkingVisible", { visible }),
+    setWorkingIndicator: (options) => fireAndForget("setWorkingIndicator", { options }),
+    setHiddenThinkingLabel: (label) => fireAndForget("setHiddenThinkingLabel", { label }),
+    setWidget: (widgetKey, content, widgetOptions) => fireAndForget("setWidget", {
+      widgetKey,
+      content: typeof content === "function" ? "<component-factory>" : content,
+      placement: widgetOptions?.placement,
+      widgetPlacement: widgetOptions?.placement,
+    }),
+    setFooter: () => {},
+    setHeader: () => {},
+    setTitle: (title) => fireAndForget("setTitle", { title }),
+    custom: async () => undefined,
+    pasteToEditor: (text) => fireAndForget("pasteToEditor", { text }),
+    setEditorText: (text) => fireAndForget("setEditorText", { text }),
+    getEditorText: () => "",
+    addAutocompleteProvider: () => {},
+    setEditorComponent: () => {},
+    getEditorComponent: () => undefined,
+    theme: noopTheme(),
+    getAllThemes: () => [],
+    getTheme: () => undefined,
+    setTheme: () => ({ success: false, error: "theme switching not implemented in MindFS bridge UI" }),
+    getToolsExpanded: () => false,
+    setToolsExpanded: () => {},
+  };
+}
+
+function noopTheme() {
+  const passthrough = (...args) => String(args[args.length - 1] ?? "");
+  return {
+    fg: passthrough,
+    bg: passthrough,
+    bold: passthrough,
+    dim: passthrough,
+    italic: passthrough,
+    underline: passthrough,
+    strikethrough: passthrough,
+    inverse: passthrough,
+  };
+}
+
+function extensionUIResponseValue(method, request) {
+  if (request.cancelled) {
+    return undefined;
+  }
+  if (method === "confirm") {
+    return Boolean(request.confirmed);
+  }
+  if (request.value !== undefined) {
+    return request.value;
+  }
+  if (request.text !== undefined) {
+    return request.text;
+  }
+  return undefined;
+}
+
+function resolvePendingJsonlBridgeUI(pending) {
+  for (const entry of pending.values()) {
+    entry.resolve(undefined);
+  }
+  pending.clear();
 }
 
 async function openJsonlSDKSessionManager(options, cwd, agentDir) {

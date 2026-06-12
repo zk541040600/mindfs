@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -214,6 +215,86 @@ func TestRuntimeUIDemoEmitsExtensionUIAndAcceptsResponses(t *testing.T) {
 	}
 	if err := sess.AnswerExtensionUI(ctx, agenttypes.ExtensionUIResponse{RequestID: "confirm-1", Method: "confirm", Confirmed: &confirmed}); err == nil || !strings.Contains(err.Error(), "not pending") {
 		t.Fatalf("expected duplicate response to fail as not pending, got %v", err)
+	}
+}
+
+func TestRuntimeRealSDKExtensionUIRoundTripCompletesTurn(t *testing.T) {
+	root := repoRoot(t)
+	agentDir := filepath.Join(t.TempDir(), "agent")
+	extensionDir := filepath.Join(agentDir, "extensions")
+	if err := os.MkdirAll(extensionDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(extensionDir, "mindfs-ui-roundtrip.js"), []byte(`
+export default function mindfsUIRoundTrip(pi) {
+  pi.registerCommand("mindfs-ui-roundtrip", {
+    description: "MindFS SDK UI roundtrip test command",
+    handler: async (_args, ctx) => {
+      const selected = await ctx.ui.select("Pick route", ["left", "right"]);
+      ctx.ui.notify("selected=" + selected, "info");
+    },
+  });
+}
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	sess, err := NewRuntime().OpenSession(ctx, OpenOptions{
+		AgentName:  "pi",
+		SessionKey: "sdk-real-ui-test",
+		RootPath:   root,
+		Command:    "pi",
+		Probe:      true,
+		AgentDir:   agentDir,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sess.Close() })
+	events, mu := collectSessionEvents(sess)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- sess.SendMessage(ctx, "/mindfs-ui-roundtrip")
+	}()
+	waitForEvent(t, events, mu, agenttypes.EventTypeExtensionUI)
+
+	var selectReq agenttypes.ExtensionUIRequest
+	for _, ev := range snapshotEvents(events, mu) {
+		if ev.Type != agenttypes.EventTypeExtensionUI {
+			continue
+		}
+		req, ok := ev.Data.(agenttypes.ExtensionUIRequest)
+		if ok && req.Method == "select" {
+			selectReq = req
+			break
+		}
+	}
+	if selectReq.ID == "" {
+		t.Fatalf("select extension UI request missing: %#v", snapshotEvents(events, mu))
+	}
+	if err := sess.AnswerExtensionUI(ctx, agenttypes.ExtensionUIResponse{
+		RequestID: selectReq.ID,
+		Method:    "select",
+		Value:     "right",
+	}); err != nil {
+		t.Fatalf("AnswerExtensionUI: %v", err)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("SendMessage: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("SendMessage did not complete after extension UI response; events=%#v", snapshotEvents(events, mu))
+	}
+
+	gotEvents := snapshotEvents(events, mu)
+	if !hasEvent(gotEvents, agenttypes.EventTypeMessageDone) {
+		t.Fatalf("message_done event missing after UI roundtrip: %#v", gotEvents)
 	}
 }
 
