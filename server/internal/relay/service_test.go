@@ -326,6 +326,155 @@ func TestManagerPollTerminalBindStatusStopsPolling(t *testing.T) {
 	}
 }
 
+func TestServiceCheckPublicHealth(t *testing.T) {
+	configRoot := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", configRoot)
+	t.Setenv("HOME", configRoot)
+
+	svc, err := NewService(":7331", false)
+	if err != nil {
+		t.Fatalf("NewService() error = %v", err)
+	}
+	svc.client = &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if req.URL.String() != "https://relay.example.com/n/node_live/health" {
+				t.Fatalf("unexpected health URL: %s", req.URL.String())
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Header:     http.Header{},
+				Body:       io.NopCloser(strings.NewReader("ok")),
+			}, nil
+		}),
+	}
+
+	if err := svc.CheckPublicHealth(context.Background(), "https://relay.example.com/n/node_live/"); err != nil {
+		t.Fatalf("CheckPublicHealth() error = %v", err)
+	}
+}
+
+func TestManagerReconnectRequiresBoundRelay(t *testing.T) {
+	configRoot := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", configRoot)
+	t.Setenv("HOME", configRoot)
+
+	manager, err := NewManager(":7331", false, "https://relay.example.com", false)
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := manager.Start(ctx); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if _, err := manager.Reconnect(); err == nil {
+		t.Fatal("expected reconnect to require bound relay credentials")
+	}
+}
+
+func TestManagerReconnectRestartsRelayWithoutClearingCredentials(t *testing.T) {
+	configRoot := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", configRoot)
+	t.Setenv("HOME", configRoot)
+
+	manager, err := NewManager(":7331", false, "https://relay.example.com", false)
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+	if err := manager.service.store.Save(Credentials{
+		Relay: RelayCredentials{
+			DeviceToken: "dev_live",
+			NodeID:      "node_live",
+			Endpoint:    "wss://relay.example.com/ws/connector",
+		},
+	}); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	manager.service.client = &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if strings.HasPrefix(req.URL.String(), "http://localhost:7331/health") {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Status:     "200 OK",
+					Header:     http.Header{},
+					Body:       io.NopCloser(strings.NewReader("ok")),
+				}, nil
+			}
+			return nil, context.Canceled
+		}),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := manager.Start(ctx); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	status, err := manager.Reconnect()
+	if err != nil {
+		t.Fatalf("Reconnect() error = %v", err)
+	}
+	if status.ReconnectCount != 1 {
+		t.Fatalf("reconnect count = %d", status.ReconnectCount)
+	}
+	if status.LastReconnectAt == "" {
+		t.Fatal("expected last reconnect timestamp")
+	}
+	creds, err := manager.service.store.Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if creds.Relay.DeviceToken != "dev_live" || creds.Relay.Endpoint == "" {
+		t.Fatalf("expected relay credentials to remain, got %+v", creds.Relay)
+	}
+}
+
+func TestManagerStatusTracksRelaySessionState(t *testing.T) {
+	configRoot := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", configRoot)
+	t.Setenv("HOME", configRoot)
+
+	manager, err := NewManager(":7331", false, "https://relay.example.com", false)
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+	if err := manager.service.store.Save(Credentials{
+		Relay: RelayCredentials{
+			DeviceToken: "dev_live",
+			NodeID:      "node_live",
+			Endpoint:    "wss://relay.example.com/ws/connector",
+		},
+	}); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+
+	manager.mu.Lock()
+	manager.relayGeneration = 7
+	manager.mu.Unlock()
+	manager.markRelayConnected(7)
+	status := manager.Status()
+	if !status.Connected || status.LastConnectedAt == "" {
+		t.Fatalf("expected connected status, got %+v", status)
+	}
+	manager.markRelayDisconnected(7, errors.New("websocket closed"))
+	status = manager.Status()
+	if status.Connected || status.LastDisconnectedAt == "" || !strings.Contains(status.LastError, "websocket closed") {
+		t.Fatalf("expected disconnected status with error, got %+v", status)
+	}
+}
+
+func TestRelayLogHelpersRedactEndpointAndClassifyErrors(t *testing.T) {
+	if got := relayEndpointSummary("wss://relay.example.com/ws/connector?token=secret"); got != "wss://relay.example.com" {
+		t.Fatalf("relayEndpointSummary() = %q", got)
+	}
+	if got := relayErrorKind(errors.New("websocket: close 1006 (abnormal closure): unexpected EOF")); got != "websocket_close_1006" {
+		t.Fatalf("relayErrorKind(close 1006) = %q", got)
+	}
+	if got := relayErrorKind(errors.New("yamux: keepalive failed: i/o deadline reached")); got != "yamux_keepalive" {
+		t.Fatalf("relayErrorKind(keepalive) = %q", got)
+	}
+}
+
 func TestManagerDefaultsRelayBaseToLocalhost(t *testing.T) {
 	configRoot := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", configRoot)

@@ -56,6 +56,11 @@ type BindPollResult struct {
 	Credentials   RelayCredentials
 }
 
+type SessionHooks struct {
+	OnConnected    func()
+	OnDisconnected func(error)
+}
+
 func NewService(localAddr string, useTLS bool) (*Service, error) {
 	store, err := NewCredentialsStore()
 	if err != nil {
@@ -92,34 +97,45 @@ func NewService(localAddr string, useTLS bool) (*Service, error) {
 	}, nil
 }
 
-func (s *Service) Run(ctx context.Context) error {
+func (s *Service) Run(ctx context.Context, hooks SessionHooks) error {
 	creds, err := s.store.Load()
 	if err != nil {
 		return err
 	}
 	if creds.Relay.DeviceToken == "" || creds.Relay.Endpoint == "" {
+		log.Printf("[relay] connector.skip reason=unbound")
 		return nil
 	}
+	endpoint := relayEndpointSummary(creds.Relay.Endpoint)
+	log.Printf("[relay] connector.start node=%s endpoint=%s local=%s", creds.Relay.NodeID, endpoint, s.localURL)
 	if err := s.waitForLocalServer(ctx); err != nil {
+		log.Printf("[relay] connector.local_health_failed node=%s endpoint=%s err=%v", creds.Relay.NodeID, endpoint, err)
 		return err
 	}
 
 	backoff := relayReconnectInitialBackoff
+	attempt := int64(0)
 	for {
+		attempt++
 		startedAt := time.Now()
-		err := s.runSession(ctx, creds.Relay)
+		log.Printf("[relay] session.open attempt=%d node=%s endpoint=%s", attempt, creds.Relay.NodeID, endpoint)
+		err := s.runSession(ctx, creds.Relay, hooks)
+		duration := time.Since(startedAt).Round(time.Millisecond)
 		if ctx.Err() != nil {
+			log.Printf("[relay] session.context_done attempt=%d node=%s endpoint=%s duration=%s", attempt, creds.Relay.NodeID, endpoint, duration)
 			return nil
 		}
 		if isPermanentRelayError(err) {
+			log.Printf("[relay] session.permanent_error attempt=%d node=%s endpoint=%s duration=%s class=%s err=%v", attempt, creds.Relay.NodeID, endpoint, duration, relayErrorKind(err), err)
 			return err
 		}
 		if time.Since(startedAt) >= relayReconnectStableDuration {
 			backoff = relayReconnectInitialBackoff
 		}
-		log.Printf("[relay] reconnecting after error in %s: %v", backoff, err)
+		log.Printf("[relay] session.reconnect_scheduled attempt=%d node=%s endpoint=%s duration=%s backoff=%s class=%s err=%v", attempt, creds.Relay.NodeID, endpoint, duration, backoff, relayErrorKind(err), err)
 		select {
 		case <-ctx.Done():
+			log.Printf("[relay] session.context_done_waiting_reconnect attempt=%d node=%s endpoint=%s", attempt, creds.Relay.NodeID, endpoint)
 			return nil
 		case <-time.After(backoff):
 		}
@@ -212,9 +228,30 @@ func buildBindPollURL(baseURL, pendingCode string) (string, error) {
 	}
 }
 
-func (s *Service) runSession(ctx context.Context, creds RelayCredentials) error {
+func (s *Service) CheckPublicHealth(ctx context.Context, nodeURL string) error {
+	healthURL := strings.TrimSuffix(strings.TrimSpace(nodeURL), "/") + "/health"
+	if healthURL == "/health" {
+		return errors.New("relay node URL required")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, healthURL, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("relay public health failed: %s", resp.Status)
+	}
+	return nil
+}
+
+func (s *Service) runSession(ctx context.Context, creds RelayCredentials, hooks SessionHooks) (retErr error) {
 	headers := http.Header{}
 	headers.Set("Authorization", "Bearer "+creds.DeviceToken)
+	endpoint := relayEndpointSummary(creds.Endpoint)
 	conn, resp, err := websocket.DefaultDialer.DialContext(ctx, creds.Endpoint, headers)
 	if err != nil {
 		if resp != nil && strings.TrimSpace(resp.Status) != "" {
@@ -223,6 +260,16 @@ func (s *Service) runSession(ctx context.Context, creds RelayCredentials) error 
 		return err
 	}
 	defer conn.Close()
+	status := ""
+	if resp != nil {
+		status = strings.TrimSpace(resp.Status)
+	}
+	log.Printf("[relay] websocket.connected node=%s endpoint=%s status=%s local=%s remote=%s", creds.NodeID, endpoint, status, conn.LocalAddr(), conn.RemoteAddr())
+	defaultCloseHandler := conn.CloseHandler()
+	conn.SetCloseHandler(func(code int, text string) error {
+		log.Printf("[relay] websocket.close_frame node=%s endpoint=%s code=%d text=%q", creds.NodeID, endpoint, code, text)
+		return defaultCloseHandler(code, text)
+	})
 
 	wsConn := NewWebSocketNetConn(conn)
 	yamuxConfig := yamux.DefaultConfig()
@@ -234,6 +281,14 @@ func (s *Service) runSession(ctx context.Context, creds RelayCredentials) error 
 		return err
 	}
 	defer muxSession.Close()
+	if hooks.OnConnected != nil {
+		hooks.OnConnected()
+	}
+	defer func() {
+		if hooks.OnDisconnected != nil {
+			hooks.OnDisconnected(retErr)
+		}
+	}()
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -251,11 +306,15 @@ func (s *Service) runSession(ctx context.Context, creds RelayCredentials) error 
 		}
 	}()
 
+	startedAt := time.Now()
 	select {
 	case <-ctx.Done():
+		log.Printf("[relay] session.close_requested node=%s endpoint=%s duration=%s", creds.NodeID, endpoint, time.Since(startedAt).Round(time.Millisecond))
 		return nil
 	case err := <-errCh:
-		return err
+		retErr = err
+		log.Printf("[relay] session.closed node=%s endpoint=%s duration=%s class=%s err=%v", creds.NodeID, endpoint, time.Since(startedAt).Round(time.Millisecond), relayErrorKind(err), err)
+		return retErr
 	}
 }
 
@@ -360,6 +419,48 @@ func (s *Service) waitForLocalServer(ctx context.Context) error {
 			return ctx.Err()
 		case <-ticker.C:
 		}
+	}
+}
+
+func relayEndpointSummary(raw string) string {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return "invalid_endpoint"
+	}
+	return u.Scheme + "://" + u.Host
+}
+
+func relayErrorKind(err error) string {
+	if err == nil {
+		return "none"
+	}
+	var closeErr *websocket.CloseError
+	if errors.As(err, &closeErr) {
+		return fmt.Sprintf("websocket_close_%d", closeErr.Code)
+	}
+	if errors.Is(err, context.Canceled) {
+		return "context_canceled"
+	}
+	text := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(text, "close 1006"):
+		return "websocket_close_1006"
+	case strings.Contains(text, "unexpected eof"):
+		return "unexpected_eof"
+	case strings.Contains(text, "keepalive"):
+		return "yamux_keepalive"
+	case strings.Contains(text, "i/o timeout") || strings.Contains(text, "deadline"):
+		return "timeout"
+	case strings.Contains(text, "connection reset"):
+		return "connection_reset"
+	case strings.Contains(text, "connection refused"):
+		return "connection_refused"
+	case strings.Contains(text, "bad handshake"):
+		return "bad_handshake"
+	case strings.Contains(text, "yamux"):
+		return "yamux"
+	default:
+		return "other"
 	}
 }
 
