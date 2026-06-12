@@ -752,7 +752,7 @@ func probeSessionTimeoutForPhase(phase probePhase) (time.Duration, bool) {
 	case probePhaseInitial:
 		return probeSessionTimeout, true
 	case probePhaseRecovery:
-		return 30 * time.Second, true
+		return probeSessionTimeout, true
 	default:
 		return 0, false
 	}

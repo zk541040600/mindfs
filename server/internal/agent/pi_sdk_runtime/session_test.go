@@ -69,6 +69,12 @@ func TestStartPayloadForOptionsUsesSDKRuntimeForProbe(t *testing.T) {
 	}
 }
 
+func TestStartupTimeoutCoversPiSDKInitialization(t *testing.T) {
+	if startupTimeout < 30*time.Second {
+		t.Fatalf("startupTimeout = %s, want at least 30s for Pi SDK initialization", startupTimeout)
+	}
+}
+
 func TestStartPayloadForOptionsPassesResumeSessionID(t *testing.T) {
 	payload := startPayloadForOptions(OpenOptions{
 		ResumeSessionID: " 019eb637-77d1-7567-ab40-4e22386a40c1 ",

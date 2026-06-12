@@ -29,3 +29,13 @@ func TestIsClosedProbeError(t *testing.T) {
 		})
 	}
 }
+
+func TestRecoveryProbeSessionTimeoutMatchesInitialProbeBudget(t *testing.T) {
+	got, ok := probeSessionTimeoutForPhase(probePhaseRecovery)
+	if !ok {
+		t.Fatal("recovery probe session timeout is disabled")
+	}
+	if got != probeSessionTimeout {
+		t.Fatalf("recovery probe session timeout = %s, want %s", got, probeSessionTimeout)
+	}
+}

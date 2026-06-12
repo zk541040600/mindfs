@@ -2,6 +2,9 @@ import { expect, test } from "@playwright/test";
 
 declare global {
   interface Window {
+    __agentSelectorTest: {
+      refreshes: string[];
+    };
     __agentSelectorResolvePiRefresh?: () => void;
   }
 }
@@ -30,8 +33,25 @@ test("opens Pi model choices after a stale Pi row refreshes", async ({ page }) =
 
   await page.getByAltText("OpenCode").click();
   await expect(page.getByRole("button", { name: "查看 pi 错误信息" })).toBeVisible();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () => window.__agentSelectorTest.refreshes.filter((name) => name === "pi").length,
+      ),
+    )
+    .toBeGreaterThanOrEqual(1);
+  const piRefreshesAfterOpen = await page.evaluate(
+    () => window.__agentSelectorTest.refreshes.filter((name) => name === "pi").length,
+  );
 
   await page.getByText("pi", { exact: true }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () => window.__agentSelectorTest.refreshes.filter((name) => name === "pi").length,
+      ),
+    )
+    .toBe(piRefreshesAfterOpen + 1);
   await expect(page.getByTestId("selected-state")).toHaveText(
     "opencode:(none):(none)",
   );

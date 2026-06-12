@@ -23,7 +23,7 @@ import (
 const (
 	defaultNodeCommand      = "node"
 	defaultCommandTimeout   = 30 * time.Second
-	startupTimeout          = 10 * time.Second
+	startupTimeout          = 45 * time.Second
 	messageEndFallbackDelay = 1500 * time.Millisecond
 )
 

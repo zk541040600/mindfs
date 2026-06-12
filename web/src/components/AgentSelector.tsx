@@ -217,16 +217,16 @@ export function AgentSelector({
   }, [isOpen]);
 
   const requestAgentRefresh = useCallback(
-    (entry: AgentStatus) => {
+    (entry: AgentStatus, force = false) => {
       const name = String(entry.name || "").trim();
       if (!name || !onAgentRefresh) {
         return;
       }
       const hasOptions = hasAgentConfigurationOptions(entry);
-      if (entry.available && hasOptions && !entry.models_error && !entry.modes_error) {
+      if (!force && entry.available && hasOptions && !entry.models_error && !entry.modes_error) {
         return;
       }
-      if (refreshRequestedRef.current.has(name)) {
+      if (!force && refreshRequestedRef.current.has(name)) {
         return;
       }
       refreshRequestedRef.current.add(name);
@@ -337,7 +337,7 @@ export function AgentSelector({
         handleSubmenuToggle(entry);
         return;
       }
-      requestAgentRefresh(entry);
+      requestAgentRefresh(entry, true);
       if (shouldDeferAgentSelectionForRefresh(entry, !!onAgentRefresh)) {
         setPendingSubmenuAgent(entry.name);
         setSubmenuAgent(null);
