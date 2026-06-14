@@ -566,19 +566,23 @@ func printUninstallCommand() {
 		fmt.Fprintln(os.Stdout, "Run one of the following commands manually:")
 		fmt.Fprintln(os.Stdout, "")
 		fmt.Fprintln(os.Stdout, "Uninstall MindFS, keeping user config and project data:")
-		fmt.Fprintln(os.Stdout, `& ([scriptblock]::Create((irm https://raw.githubusercontent.com/a9gent/mindfs/main/scripts/install.ps1))) -Uninstall`)
+		fmt.Fprintln(os.Stdout, "Download scripts/install.ps1 from https://github.com/a9gent/mindfs, then run it with -Uninstall.")
 		fmt.Fprintln(os.Stdout, "")
 		fmt.Fprintln(os.Stdout, "Purge MindFS, including user config and logs:")
-		fmt.Fprintln(os.Stdout, `& ([scriptblock]::Create((irm https://raw.githubusercontent.com/a9gent/mindfs/main/scripts/install.ps1))) -Uninstall -Purge`)
+		fmt.Fprintln(os.Stdout, "Download scripts/install.ps1 from https://github.com/a9gent/mindfs, then run it with -Uninstall -Purge.")
 		return
 	}
 	fmt.Fprintln(os.Stdout, "Run one of the following commands manually:")
 	fmt.Fprintln(os.Stdout, "")
 	fmt.Fprintln(os.Stdout, "Uninstall MindFS, keeping user config and project data:")
-	fmt.Fprintln(os.Stdout, "curl -fsSL https://raw.githubusercontent.com/a9gent/mindfs/main/scripts/install.sh | bash -s -- --uninstall")
+	fmt.Fprintln(os.Stdout, `installer="${TMPDIR:-/tmp}/mindfs-install.sh"`)
+	fmt.Fprintln(os.Stdout, `curl -fsSL https://raw.githubusercontent.com/a9gent/mindfs/main/scripts/install.sh -o "$installer"`)
+	fmt.Fprintln(os.Stdout, `bash "$installer" --uninstall`)
 	fmt.Fprintln(os.Stdout, "")
 	fmt.Fprintln(os.Stdout, "Purge MindFS, including user config and logs:")
-	fmt.Fprintln(os.Stdout, "curl -fsSL https://raw.githubusercontent.com/a9gent/mindfs/main/scripts/install.sh | bash -s -- --uninstall --purge")
+	fmt.Fprintln(os.Stdout, `installer="${TMPDIR:-/tmp}/mindfs-install.sh"`)
+	fmt.Fprintln(os.Stdout, `curl -fsSL https://raw.githubusercontent.com/a9gent/mindfs/main/scripts/install.sh -o "$installer"`)
+	fmt.Fprintln(os.Stdout, `bash "$installer" --uninstall --purge`)
 }
 
 func handleUpdateCommand(ctx context.Context, addr string, useTLS bool) error {

@@ -134,12 +134,16 @@ The uninstall command removes the installed binary, bundled web assets, bundled 
 
 **macOS / Linux**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/a9gent/mindfs/main/scripts/install.sh | bash -s -- --uninstall
+installer="${TMPDIR:-/tmp}/mindfs-install.sh"
+curl -fsSL https://raw.githubusercontent.com/a9gent/mindfs/main/scripts/install.sh -o "$installer"
+bash "$installer" --uninstall
 ```
 
 **Windows (PowerShell)**
 ```powershell
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/a9gent/mindfs/main/scripts/install.ps1))) -Uninstall
+$Installer = Join-Path $env:TEMP "mindfs-install.ps1"
+Invoke-WebRequest -Uri "https://raw.githubusercontent.com/a9gent/mindfs/main/scripts/install.ps1" -OutFile $Installer
+& $Installer -Uninstall
 ```
 
 To also remove user-level MindFS config and logs, add `--purge` on macOS/Linux or `-Purge` on Windows. Project `.mindfs/` directories are never removed automatically.

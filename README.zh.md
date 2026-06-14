@@ -135,12 +135,16 @@ irm https://raw.githubusercontent.com/a9gent/mindfs/main/scripts/install.ps1 | i
 
 **macOS / Linux**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/a9gent/mindfs/main/scripts/install.sh | bash -s -- --uninstall
+installer="${TMPDIR:-/tmp}/mindfs-install.sh"
+curl -fsSL https://raw.githubusercontent.com/a9gent/mindfs/main/scripts/install.sh -o "$installer"
+bash "$installer" --uninstall
 ```
 
 **Windows（PowerShell）**
 ```powershell
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/a9gent/mindfs/main/scripts/install.ps1))) -Uninstall
+$Installer = Join-Path $env:TEMP "mindfs-install.ps1"
+Invoke-WebRequest -Uri "https://raw.githubusercontent.com/a9gent/mindfs/main/scripts/install.ps1" -OutFile $Installer
+& $Installer -Uninstall
 ```
 
 如需同时删除用户级 MindFS 配置和日志，macOS/Linux 追加 `--purge`，Windows 追加 `-Purge`。项目目录中的 `.mindfs/` 不会被自动删除。
