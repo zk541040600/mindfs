@@ -758,6 +758,54 @@ func isCanceledTurnError(err error) bool {
 		strings.Contains(value, "cancelled")
 }
 
+func isNonRecoverableAgentError(err error) bool {
+	if err == nil {
+		return false
+	}
+	value := strings.ToLower(strings.TrimSpace(err.Error()))
+	if value == "" {
+		return false
+	}
+	needles := []string{
+		"429",
+		"too many requests",
+		"exceeded retry limit",
+		"rate limit",
+		"ratelimit",
+		"usage limit",
+		"usagelimitexceeded",
+		"remote compaction failed",
+		"compact_remote",
+		"responsetoomanyfailedattempts",
+	}
+	for _, needle := range needles {
+		if strings.Contains(value, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func cancelRuntimeAfterNonRecoverableError(sess agenttypes.Session, pool *agent.Pool, agentName string, cause error) {
+	agentName = strings.TrimSpace(agentName)
+	if sess != nil {
+		if err := sess.CancelCurrentTurn(); err != nil {
+			log.Printf("[session] turn.cancel_after_non_recoverable.error agent=%s cause=%v err=%v", agentName, cause, err)
+		}
+	}
+	if pool != nil && agentName != "" {
+		if _, ok := pool.KillAgentProcess(agentName, 0); ok {
+			log.Printf("[session] runtime.kill_after_non_recoverable.done agent=%s cause=%v", agentName, cause)
+			return
+		}
+	}
+	if sess != nil {
+		if err := sess.Close(); err != nil {
+			log.Printf("[session] runtime.close_after_non_recoverable.error agent=%s cause=%v err=%v", agentName, cause, err)
+		}
+	}
+}
+
 func contextLineCount(exchanges []session.Exchange) int {
 	return len(exchanges)
 }
@@ -1349,7 +1397,10 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 	}
 	sendErr := sendWithAttachedUpdates(sess, prompt)
 	if sendErr != nil && !isCanceledTurnError(sendErr) {
-		if !sawAssistantChunk {
+		if isNonRecoverableAgentError(sendErr) {
+			log.Printf("[session] turn.send.non_recoverable root=%s session=%s agent=%s action=fail_without_recovery err=%v", in.RootID, current.Key, in.Agent, sendErr)
+			cancelRuntimeAfterNonRecoverableError(sess, agentPool, in.Agent, sendErr)
+		} else if !sawAssistantChunk {
 			log.Printf("[session] turn.send.no_response root=%s session=%s agent=%s action=fail_without_recovery", in.RootID, current.Key, in.Agent)
 		} else {
 			if in.OnUpdate != nil {
@@ -1939,6 +1990,10 @@ func (s *Service) recoverAgentTurn(ctx context.Context, in SendRecoveryInput) (a
 		log.Printf("[session/recovery] send.start root=%s session=%s agent=%s attempt=%d/%d action=%s", in.RootID, in.SessionKey, in.AgentName, attempt, sessionRecoveryAttempts, recoveryAction)
 		if err := in.SendWithAttachment(sess, recoveryMessage); err != nil {
 			if isCanceledTurnError(err) || ctx.Err() != nil {
+				return nil, err
+			}
+			if isNonRecoverableAgentError(err) {
+				log.Printf("[session/recovery] send.non_recoverable root=%s session=%s agent=%s attempt=%d/%d action=%s err=%v", in.RootID, in.SessionKey, in.AgentName, attempt, sessionRecoveryAttempts, recoveryAction, err)
 				return nil, err
 			}
 			lastErr = err
