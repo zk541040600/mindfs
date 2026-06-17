@@ -11,7 +11,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
 import { createInterface } from "node:readline";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -315,7 +315,7 @@ async function capabilitiesProbe(options) {
   const { prompts, diagnostics: promptDiagnostics } = loader.getPrompts();
   const { themes, diagnostics: themeDiagnostics } = loader.getThemes();
   const { agentsFiles } = loader.getAgentsFiles();
-  const availableModels = modelRegistry.getAvailable();
+  const availableModels = await filterModelsByPiEnabledModels(modelRegistry.getAvailable(), options.agentDir);
   const allModels = modelRegistry.getAll();
   const modelRegistryError = modelRegistry.getError();
 
@@ -454,6 +454,43 @@ function sanitizeModel(model) {
     contextWindow: model.contextWindow,
     maxTokens: model.maxTokens,
   };
+}
+
+async function readPiEnabledModelIDs(agentDir) {
+  const settingsPath = join(agentDir || DEFAULT_AGENT_DIR, "settings.json");
+  try {
+    const settings = JSON.parse(await readFile(settingsPath, "utf8"));
+    const enabledModels = Array.isArray(settings?.enabledModels) ? settings.enabledModels : [];
+    return enabledModels.map((item) => String(item || "").trim()).filter(Boolean);
+  } catch (error) {
+    console.warn(`[mindfs/pi] failed to read enabledModels from ${settingsPath}: ${error instanceof Error ? error.message : String(error)}`);
+    return [];
+  }
+}
+
+async function filterModelsByPiEnabledModels(models, agentDir) {
+  const available = Array.isArray(models) ? models : [];
+  const enabledModelIDs = await readPiEnabledModelIDs(agentDir);
+  if (enabledModelIDs.length === 0 || available.length === 0) {
+    return available;
+  }
+  const byID = new Map();
+  for (const model of available) {
+    const fullID = `${String(model?.provider || "").trim()}/${String(model?.id || "").trim()}`;
+    if (fullID !== "/") {
+      byID.set(fullID, model);
+    }
+  }
+  const filtered = [];
+  for (const fullID of enabledModelIDs) {
+    const model = byID.get(fullID);
+    if (model) {
+      filtered.push(model);
+    }
+  }
+  // Safety fallback: if the installed Pi registry and settings are temporarily out of sync,
+  // keep the original list instead of rendering an empty model dropdown.
+  return filtered.length > 0 ? filtered : available;
 }
 
 function collectCommands(extensionsResult, prompts, skills) {
@@ -1749,11 +1786,11 @@ async function createJsonlSDKRuntime(options) {
       }, request.id));
     },
     getAvailableModels: async function (request) {
-      const models = await session.modelRegistry.getAvailable();
+      const models = await filterModelsByPiEnabledModels(await session.modelRegistry.getAvailable(), agentDir);
       writeJsonl(successResponse("get_available_models", { models }, request.id));
     },
     setModel: async function (request) {
-      const models = await session.modelRegistry.getAvailable();
+      const models = await filterModelsByPiEnabledModels(await session.modelRegistry.getAvailable(), agentDir);
       const model = models.find((item) => item.provider === request.provider && item.id === request.modelId);
       if (!model) {
         throw new ProbeError("E_PARAM", `model not found: ${request.provider}/${request.modelId}`);
