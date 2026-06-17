@@ -1090,6 +1090,10 @@ func (s *session) SetMode(ctx context.Context, mode string) error {
 	return nil
 }
 
+func (s *session) SetPlanMode(_ context.Context, _ bool) error {
+	return nil
+}
+
 func (s *session) ListModes(ctx context.Context) (agenttypes.ModeList, error) {
 	_ = s.refreshState(ctx)
 	modes := []agenttypes.ModeInfo{

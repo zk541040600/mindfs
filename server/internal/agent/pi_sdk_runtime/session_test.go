@@ -454,6 +454,31 @@ func TestRuntimePromptStreamEmitsMessageDoneAndContextWindow(t *testing.T) {
 	}
 }
 
+func TestHandleMessageUpdateFallsBackToAssistantContentSnapshots(t *testing.T) {
+	sess := &session{sessionID: "synthetic-session"}
+	events, mu := collectSessionEvents(sess)
+
+	sess.handleMessageUpdate([]byte(`{"type":"message_update","message":{"role":"assistant","content":[{"type":"text","text":"hello"}]}}`))
+	sess.handleMessageUpdate([]byte(`{"type":"message_update","message":{"role":"assistant","content":[{"type":"text","text":"hello world"}]}}`))
+	sess.handleMessageEnd([]byte(`{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"hello world"}]}}`))
+
+	if got := joinedMessageChunks(snapshotEvents(events, mu)); got != "hello world" {
+		t.Fatalf("message chunks = %q, want snapshot delta text without duplication", got)
+	}
+}
+
+func TestHandleMessageEndCompletesMissingSnapshotTail(t *testing.T) {
+	sess := &session{sessionID: "synthetic-session"}
+	events, mu := collectSessionEvents(sess)
+
+	sess.handleMessageUpdate([]byte(`{"type":"message_update","message":{"role":"assistant"},"assistantMessageEvent":{"type":"text_delta","delta":"hello"}}`))
+	sess.handleMessageEnd([]byte(`{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"hello world"}]}}`))
+
+	if got := joinedMessageChunks(snapshotEvents(events, mu)); got != "hello world" {
+		t.Fatalf("message chunks = %q, want message_end snapshot tail", got)
+	}
+}
+
 func TestRuntimeMessageEndOnlyDoesNotCompleteTurn(t *testing.T) {
 	sess := openTestSession(t, "message-end-only")
 	events, mu := collectSessionEvents(sess)

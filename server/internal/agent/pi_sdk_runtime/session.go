@@ -254,19 +254,21 @@ type session struct {
 	pendingExtensionUI map[string]string
 	pendingQuestions   map[string]struct{}
 
-	onUpdate     func(agenttypes.Event)
-	sessionID    string
-	model        string
-	mode         string
-	contextStats agenttypes.ContextWindow
-	eventBacklog []agenttypes.Event
-	seenText     bool
-	seenThinking bool
-	lastTurnErr  string
-	turnComplete bool
-	turn         agenttypes.TurnCanceler
-	turnMu       sync.Mutex
-	turnDone     chan error
+	onUpdate                func(agenttypes.Event)
+	sessionID               string
+	model                   string
+	mode                    string
+	contextStats            agenttypes.ContextWindow
+	eventBacklog            []agenttypes.Event
+	seenText                bool
+	seenThinking            bool
+	messageTextSnapshot     string
+	messageThinkingSnapshot string
+	lastTurnErr             string
+	turnComplete            bool
+	turn                    agenttypes.TurnCanceler
+	turnMu                  sync.Mutex
+	turnDone                chan error
 
 	closeOnce sync.Once
 	closed    chan struct{}
@@ -592,6 +594,8 @@ func (s *session) resetTurnState() {
 	s.mu.Lock()
 	s.seenText = false
 	s.seenThinking = false
+	s.messageTextSnapshot = ""
+	s.messageThinkingSnapshot = ""
 	s.lastTurnErr = ""
 	s.turnComplete = false
 	s.mu.Unlock()
@@ -601,31 +605,120 @@ func (s *session) resetMessageDeltaState() {
 	s.mu.Lock()
 	s.seenText = false
 	s.seenThinking = false
+	s.messageTextSnapshot = ""
+	s.messageThinkingSnapshot = ""
 	s.mu.Unlock()
 }
 
-func (s *session) markTextSeen() {
+func messageSnapshotDelta(prev, next string) string {
+	if next == "" {
+		return ""
+	}
+	if prev == "" {
+		return next
+	}
+	if strings.HasPrefix(next, prev) {
+		return next[len(prev):]
+	}
+	return next
+}
+
+func assistantContentText(items []struct {
+	Type     string `json:"type"`
+	Text     string `json:"text"`
+	Thinking string `json:"thinking"`
+}) string {
+	var b strings.Builder
+	for _, item := range items {
+		itemType := strings.ToLower(strings.TrimSpace(item.Type))
+		if item.Text == "" || itemType == "thinking" || itemType == "reasoning" || itemType == "thought" {
+			continue
+		}
+		b.WriteString(item.Text)
+	}
+	return b.String()
+}
+
+func assistantContentThinking(items []struct {
+	Type     string `json:"type"`
+	Text     string `json:"text"`
+	Thinking string `json:"thinking"`
+}) string {
+	var b strings.Builder
+	for _, item := range items {
+		thinking := item.Thinking
+		if thinking == "" {
+			itemType := strings.ToLower(strings.TrimSpace(item.Type))
+			if itemType == "thinking" || itemType == "reasoning" || itemType == "thought" {
+				thinking = item.Text
+			}
+		}
+		if thinking == "" {
+			continue
+		}
+		b.WriteString(thinking)
+	}
+	return b.String()
+}
+
+func (s *session) emitMessageTextDelta(delta string) bool {
+	if delta == "" {
+		return false
+	}
 	s.mu.Lock()
 	s.seenText = true
+	s.messageTextSnapshot += delta
 	s.mu.Unlock()
+	s.emit(agenttypes.Event{Type: agenttypes.EventTypeMessageChunk, SessionID: s.SessionID(), Data: agenttypes.MessageChunk{Content: delta}})
+	return true
 }
 
-func (s *session) markThinkingSeen() {
+func (s *session) emitMessageTextSnapshot(text string) bool {
+	if strings.TrimSpace(text) == "" {
+		return false
+	}
+	s.mu.Lock()
+	delta := messageSnapshotDelta(s.messageTextSnapshot, text)
+	if delta != "" {
+		s.seenText = true
+		s.messageTextSnapshot = text
+	}
+	s.mu.Unlock()
+	if delta == "" {
+		return false
+	}
+	s.emit(agenttypes.Event{Type: agenttypes.EventTypeMessageChunk, SessionID: s.SessionID(), Data: agenttypes.MessageChunk{Content: delta}})
+	return true
+}
+
+func (s *session) emitMessageThinkingDelta(delta string) bool {
+	if delta == "" {
+		return false
+	}
 	s.mu.Lock()
 	s.seenThinking = true
+	s.messageThinkingSnapshot += delta
 	s.mu.Unlock()
+	s.emit(agenttypes.Event{Type: agenttypes.EventTypeThoughtChunk, SessionID: s.SessionID(), Data: agenttypes.ThoughtChunk{Content: delta}})
+	return true
 }
 
-func (s *session) hasTextSeen() bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.seenText
-}
-
-func (s *session) hasThinkingSeen() bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.seenThinking
+func (s *session) emitMessageThinkingSnapshot(thinking string) bool {
+	if strings.TrimSpace(thinking) == "" {
+		return false
+	}
+	s.mu.Lock()
+	delta := messageSnapshotDelta(s.messageThinkingSnapshot, thinking)
+	if delta != "" {
+		s.seenThinking = true
+		s.messageThinkingSnapshot = thinking
+	}
+	s.mu.Unlock()
+	if delta == "" {
+		return false
+	}
+	s.emit(agenttypes.Event{Type: agenttypes.EventTypeThoughtChunk, SessionID: s.SessionID(), Data: agenttypes.ThoughtChunk{Content: delta}})
+	return true
 }
 
 func (s *session) handleMessageUpdate(raw []byte) {
@@ -653,33 +746,31 @@ func (s *session) handleMessageUpdate(raw []byte) {
 	}
 	switch ev.AssistantMessageEvent.Type {
 	case "text_delta":
-		if ev.AssistantMessageEvent.Delta != "" {
-			s.markTextSeen()
-			s.emit(agenttypes.Event{Type: agenttypes.EventTypeMessageChunk, SessionID: s.SessionID(), Data: agenttypes.MessageChunk{Content: ev.AssistantMessageEvent.Delta}})
+		if s.emitMessageTextDelta(ev.AssistantMessageEvent.Delta) {
 			return
 		}
 	case "thinking_delta":
-		if ev.AssistantMessageEvent.Delta != "" {
-			s.markThinkingSeen()
-			s.emit(agenttypes.Event{Type: agenttypes.EventTypeThoughtChunk, SessionID: s.SessionID(), Data: agenttypes.ThoughtChunk{Content: ev.AssistantMessageEvent.Delta}})
+		if s.emitMessageThinkingDelta(ev.AssistantMessageEvent.Delta) {
 			return
 		}
 	case "text_end":
-		if text := strings.TrimSpace(ev.AssistantMessageEvent.Content); text != "" && !s.hasTextSeen() {
-			s.markTextSeen()
-			s.emit(agenttypes.Event{Type: agenttypes.EventTypeMessageChunk, SessionID: s.SessionID(), Data: agenttypes.MessageChunk{Content: text}})
+		if s.emitMessageTextSnapshot(ev.AssistantMessageEvent.Content) {
 			return
 		}
 	case "thinking_end":
-		thinking := strings.TrimSpace(ev.AssistantMessageEvent.Thinking)
+		thinking := ev.AssistantMessageEvent.Thinking
 		if thinking == "" {
-			thinking = strings.TrimSpace(ev.AssistantMessageEvent.Content)
+			thinking = ev.AssistantMessageEvent.Content
 		}
-		if thinking != "" && !s.hasThinkingSeen() {
-			s.markThinkingSeen()
-			s.emit(agenttypes.Event{Type: agenttypes.EventTypeThoughtChunk, SessionID: s.SessionID(), Data: agenttypes.ThoughtChunk{Content: thinking}})
+		if s.emitMessageThinkingSnapshot(thinking) {
 			return
 		}
+	}
+	if text := assistantContentText(ev.Message.Content); text != "" {
+		s.emitMessageTextSnapshot(text)
+	}
+	if thinking := assistantContentThinking(ev.Message.Content); thinking != "" {
+		s.emitMessageThinkingSnapshot(thinking)
 	}
 }
 
@@ -717,21 +808,11 @@ func (s *session) handleMessageEnd(raw []byte) {
 		s.emit(agenttypes.Event{Type: agenttypes.EventTypeRecovery, SessionID: s.SessionID(), Data: agenttypes.RecoveryStatus{Message: msg}})
 		return
 	}
-	for _, item := range ev.Message.Content {
-		switch item.Type {
-		case "text":
-			text := strings.TrimSpace(item.Text)
-			if text != "" && !s.hasTextSeen() {
-				s.markTextSeen()
-				s.emit(agenttypes.Event{Type: agenttypes.EventTypeMessageChunk, SessionID: s.SessionID(), Data: agenttypes.MessageChunk{Content: text}})
-			}
-		case "thinking":
-			thinking := strings.TrimSpace(item.Thinking)
-			if thinking != "" && !s.hasThinkingSeen() {
-				s.markThinkingSeen()
-				s.emit(agenttypes.Event{Type: agenttypes.EventTypeThoughtChunk, SessionID: s.SessionID(), Data: agenttypes.ThoughtChunk{Content: thinking}})
-			}
-		}
+	if text := assistantContentText(ev.Message.Content); text != "" {
+		s.emitMessageTextSnapshot(text)
+	}
+	if thinking := assistantContentThinking(ev.Message.Content); thinking != "" {
+		s.emitMessageThinkingSnapshot(thinking)
 	}
 	total := ev.Message.Usage.TotalTokens
 	if total == 0 {
@@ -1341,6 +1422,10 @@ func (s *session) SetMode(ctx context.Context, mode string) error {
 	s.mu.Lock()
 	s.mode = mode
 	s.mu.Unlock()
+	return nil
+}
+
+func (s *session) SetPlanMode(_ context.Context, _ bool) error {
 	return nil
 }
 
