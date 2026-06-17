@@ -1,0 +1,23 @@
+ M server/internal/agent/importers.go
+ M server/internal/agent/pi_sdk_bridge/README.md
+ M server/internal/agent/pi_sdk_bridge/probe.mjs
+ M server/internal/agent/pi_sdk_runtime/session.go
+ M server/internal/agent/pi_sdk_runtime/session_test.go
+ M server/internal/agent/pool_test.go
+ M server/internal/api/usecase/session.go
+ M server/internal/api/usecase/usecase_test.go
+ M server/internal/api/ws.go
+ M start.sh
+ M status.sh
+ M stop.sh
+ M web/src/App.tsx
+ M web/src/components/ActionBar.tsx
+?? .merge-backups/
+?? Dockerfile
+?? dist-release/
+?? docker-compose.yml
+?? mindfs.backup.20260613080028
+?? restart.sh
+?? web/test-results/
+?? web/tests/app-agent-defaults.spec.ts
+?? web/tests/app-pending-state.spec.ts

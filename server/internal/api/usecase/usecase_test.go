@@ -280,6 +280,74 @@ func TestSubSessionSyntheticDonePersistsPartialResponse(t *testing.T) {
 	}
 }
 
+func TestSendMessageSynthesizesFallbackWhenAgentReturnsOnlyToolEvents(t *testing.T) {
+	ctx := context.Background()
+	rootDir := t.TempDir()
+	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
+	manager := session.NewManager(root)
+	created, err := manager.Create(ctx, session.CreateInput{Type: session.TypeChat, Agent: "pi", Name: "chat"})
+	if err != nil {
+		t.Fatalf("create chat session: %v", err)
+	}
+
+	pool := agent.NewPool(agent.Config{Agents: []agent.Definition{{
+		Name:     "pi",
+		Command:  writeFakePiSDKNoTextForUsecase(t),
+		Protocol: agent.ProtocolPiSDK,
+	}}})
+	defer pool.CloseAll()
+	service := Service{Registry: &chatAgentTestRegistry{
+		commandTestRegistry: &commandTestRegistry{root: root, manager: manager},
+		pool:                pool,
+	}}
+
+	var chunks []string
+	var sawDone bool
+	if err := service.SendMessage(ctx, SendMessageInput{
+		RootID:  root.ID,
+		Key:     created.Key,
+		Agent:   "pi",
+		Content: "run a tool",
+		OnUpdate: func(event agenttypes.Event) {
+			switch event.Type {
+			case agenttypes.EventTypeMessageChunk:
+				if chunk, ok := event.Data.(agenttypes.MessageChunk); ok {
+					chunks = append(chunks, chunk.Content)
+				}
+			case agenttypes.EventTypeMessageDone:
+				sawDone = true
+			}
+		},
+	}); err != nil {
+		t.Fatalf("SendMessage returned error: %v", err)
+	}
+	if !sawDone {
+		t.Fatalf("message_done was not emitted")
+	}
+	fallback := strings.Join(chunks, "")
+	if !strings.Contains(fallback, "已完成工具调用") || !strings.Contains(fallback, "没有返回可见文本") {
+		t.Fatalf("fallback chunk = %q", fallback)
+	}
+
+	loaded, err := manager.Get(ctx, created.Key, 0)
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	if len(loaded.Exchanges) != 2 {
+		t.Fatalf("exchanges = %d, want user and agent", len(loaded.Exchanges))
+	}
+	if loaded.Exchanges[1].Content != fallback {
+		t.Fatalf("persisted agent content = %q, want fallback %q", loaded.Exchanges[1].Content, fallback)
+	}
+	aux, err := manager.GetExchangeAux(ctx, created.Key, 0)
+	if err != nil {
+		t.Fatalf("get aux: %v", err)
+	}
+	if len(aux[2]) == 0 || aux[2][0].ToolCall == nil || aux[2][0].ToolCall.Status != "complete" {
+		t.Fatalf("aux[2] = %#v, want completed tool call", aux[2])
+	}
+}
+
 func TestStaleAgentSessionErrorDetection(t *testing.T) {
 	cases := []struct {
 		name string
@@ -288,6 +356,7 @@ func TestStaleAgentSessionErrorDetection(t *testing.T) {
 	}{
 		{name: "unknown session id", err: errors.New("Invalid params: Unknown sessionId: 019ea739"), want: true},
 		{name: "session not found", err: errors.New("session not found"), want: true},
+		{name: "agent already processing", err: errors.New("Agent is already processing"), want: false},
 		{name: "invalid unrelated params", err: errors.New("Invalid params: model required"), want: false},
 		{name: "ordinary upstream failure", err: errors.New("rate limit exceeded"), want: false},
 		{name: "nil", err: nil, want: false},
@@ -296,6 +365,27 @@ func TestStaleAgentSessionErrorDetection(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := isStaleAgentSessionError(tc.err); got != tc.want {
 				t.Fatalf("isStaleAgentSessionError(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestAgentAlreadyProcessingErrorDetection(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "plain", err: errors.New("Agent is already processing"), want: true},
+		{name: "compact", err: errors.New("agentisalreadyprocessing"), want: true},
+		{name: "with newline", err: errors.New("Agent is\nalready processing"), want: true},
+		{name: "unknown session", err: errors.New("Unknown sessionId"), want: false},
+		{name: "nil", err: nil, want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isAgentAlreadyProcessingError(tc.err); got != tc.want {
+				t.Fatalf("isAgentAlreadyProcessingError(%v) = %v, want %v", tc.err, got, tc.want)
 			}
 		})
 	}
@@ -1275,6 +1365,54 @@ for line in sys.stdin:
 	return path
 }
 
+func writeFakePiSDKNoTextForUsecase(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "fake-node")
+	script := `#!/usr/bin/env python3
+import json
+import sys
+
+def send(obj):
+    print(json.dumps(obj, ensure_ascii=False), flush=True)
+
+for line in sys.stdin:
+    req = json.loads(line)
+    req_id = req.get("id")
+    typ = req.get("type")
+    if typ == "start_sdk_runtime":
+        send({
+            "id": req_id,
+            "type": "response",
+            "command": "start_sdk_runtime",
+            "success": True,
+            "data": {"sessionId": "fake-pi-sdk-session"},
+        })
+    elif typ == "prompt":
+        send({"id": req_id, "type": "response", "command": "prompt", "success": True, "data": {"runtime": "sdk"}})
+        send({"type": "agent_start"})
+        send({
+            "type": "tool_execution_start",
+            "toolCallId": "tool-1",
+            "toolName": "fffind",
+            "args": {"pattern": "AGENTS.md"},
+        })
+        send({
+            "type": "tool_execution_end",
+            "toolCallId": "tool-1",
+            "toolName": "fffind",
+            "result": {"content": [{"type": "text", "text": "AGENTS.md"}]},
+            "isError": False,
+        })
+        send({"type": "agent_end", "willRetry": False})
+    else:
+        send({"id": req_id, "type": "response", "command": typ, "success": True, "data": {}})
+`
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake pi sdk: %v", err)
+	}
+	return path
+}
+
 func selectRunnableAgent(cfg agent.Config) (string, bool) {
 	want := strings.TrimSpace(os.Getenv("MINDFS_IT_AGENT_NAME"))
 	if want != "" {
@@ -1424,6 +1562,15 @@ func (s *fakeUsecaseAgentSession) emit(event agenttypes.Event) {
 type commandTestRegistry struct {
 	root    rootfs.RootInfo
 	manager *session.Manager
+}
+
+type chatAgentTestRegistry struct {
+	*commandTestRegistry
+	pool *agent.Pool
+}
+
+func (r *chatAgentTestRegistry) GetAgentPool() *agent.Pool {
+	return r.pool
 }
 
 func (r *commandTestRegistry) GetRoot(rootID string) (rootfs.RootInfo, error) {

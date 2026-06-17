@@ -95,16 +95,90 @@ func TestStartPayloadForOptionsUsesExplicitTestScenario(t *testing.T) {
 	}
 }
 
-func TestApplyStartResponseUpdatesSessionID(t *testing.T) {
-	data, err := json.Marshal(map[string]any{"sessionId": "019eb637-77d1-7567-ab40-4e22386a40c1"})
+func TestApplyStartResponseUpdatesSessionState(t *testing.T) {
+	data, err := json.Marshal(map[string]any{
+		"sessionId":     "019eb637-77d1-7567-ab40-4e22386a40c1",
+		"thinkingLevel": "high",
+		"model": map[string]any{
+			"provider": "fake",
+			"id":       "model",
+		},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	sess := &session{sessionID: "synthetic-session"}
+	sess := &session{sessionID: "synthetic-session", model: "old/model", mode: "off"}
 	sess.applyStartResponse(bridgeResponse{Data: data})
 	if got := sess.SessionID(); got != "019eb637-77d1-7567-ab40-4e22386a40c1" {
 		t.Fatalf("SessionID = %q, want real SDK session id", got)
 	}
+	if got := sess.CurrentModel(); got != "fake/model" {
+		t.Fatalf("CurrentModel = %q, want fake/model", got)
+	}
+	if got := sess.mode; got != "high" {
+		t.Fatalf("mode = %q, want high", got)
+	}
+}
+
+func TestApplyStartResponseAcceptsStringModel(t *testing.T) {
+	data, err := json.Marshal(map[string]any{
+		"sessionId":     "real-session",
+		"thinkingLevel": "medium",
+		"model":         "provider/string-model",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess := &session{sessionID: "synthetic-session", model: "old/model", mode: "off"}
+	sess.applyStartResponse(bridgeResponse{Data: data})
+	if got := sess.SessionID(); got != "real-session" {
+		t.Fatalf("SessionID = %q, want real-session", got)
+	}
+	if got := sess.CurrentModel(); got != "provider/string-model" {
+		t.Fatalf("CurrentModel = %q, want provider/string-model", got)
+	}
+	if got := sess.mode; got != "medium" {
+		t.Fatalf("mode = %q, want medium", got)
+	}
+}
+
+func TestSessionOnUpdateReplaysBacklog(t *testing.T) {
+	sess := &session{sessionID: "synthetic-session"}
+	sess.emit(agenttypes.Event{Type: agenttypes.EventTypeRecovery, SessionID: sess.SessionID(), Data: agenttypes.RecoveryStatus{Message: "booting"}})
+	sess.emit(agenttypes.Event{Type: agenttypes.EventTypeMessageChunk, SessionID: sess.SessionID(), Data: agenttypes.MessageChunk{Content: "boot"}})
+
+	var got []agenttypes.Event
+	sess.OnUpdate(func(ev agenttypes.Event) {
+		got = append(got, ev)
+	})
+	if len(got) != 2 {
+		t.Fatalf("replayed events = %#v, want 2", got)
+	}
+	if got[0].Type != agenttypes.EventTypeRecovery || got[1].Type != agenttypes.EventTypeMessageChunk {
+		t.Fatalf("replayed event order = %#v", got)
+	}
+}
+
+func TestSessionBacklogPreservesBlockingExtensionUI(t *testing.T) {
+	sess := &session{sessionID: "synthetic-session"}
+	sess.emit(agenttypes.Event{Type: agenttypes.EventTypeExtensionUI, SessionID: sess.SessionID(), Data: agenttypes.ExtensionUIRequest{ID: "ui-1", Method: "select"}})
+	for i := 0; i < maxBufferedEventsBeforeSubscriber+10; i++ {
+		sess.emit(agenttypes.Event{Type: agenttypes.EventTypeRecovery, SessionID: sess.SessionID(), Data: agenttypes.RecoveryStatus{Message: "status"}})
+	}
+
+	var got []agenttypes.Event
+	sess.OnUpdate(func(ev agenttypes.Event) {
+		got = append(got, ev)
+	})
+	if len(got) != maxBufferedEventsBeforeSubscriber {
+		t.Fatalf("replayed events = %d, want capped %d", len(got), maxBufferedEventsBeforeSubscriber)
+	}
+	for _, ev := range got {
+		if isBlockingExtensionUIEvent(ev) {
+			return
+		}
+	}
+	t.Fatalf("blocking extension UI was evicted from backlog: %#v", got[:3])
 }
 
 func collectSessionEvents(sess agenttypes.Session) (*[]agenttypes.Event, *sync.Mutex) {
@@ -173,6 +247,36 @@ func toolCalls(events []agenttypes.Event, typ agenttypes.EventType) []agenttypes
 		}
 	}
 	return calls
+}
+
+func todoUpdates(events []agenttypes.Event) []agenttypes.TodoUpdate {
+	updates := make([]agenttypes.TodoUpdate, 0)
+	for _, ev := range events {
+		if ev.Type != agenttypes.EventTypeTodoUpdate {
+			continue
+		}
+		update, ok := ev.Data.(agenttypes.TodoUpdate)
+		if ok {
+			updates = append(updates, update)
+		}
+	}
+	return updates
+}
+
+func waitForToolCallKind(t *testing.T, events *[]agenttypes.Event, mu *sync.Mutex, kind agenttypes.ToolKind) agenttypes.ToolCall {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		calls := toolCalls(snapshotEvents(events, mu), agenttypes.EventTypeToolCall)
+		for _, call := range calls {
+			if call.Kind == kind {
+				return call
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("tool call kind %q not observed: %#v", kind, snapshotEvents(events, mu))
+	return agenttypes.ToolCall{}
 }
 
 func waitForEvent(t *testing.T, events *[]agenttypes.Event, mu *sync.Mutex, typ agenttypes.EventType) {
@@ -350,26 +454,23 @@ func TestRuntimePromptStreamEmitsMessageDoneAndContextWindow(t *testing.T) {
 	}
 }
 
-func TestRuntimeMessageEndFallbackCompletesTurn(t *testing.T) {
+func TestRuntimeMessageEndOnlyDoesNotCompleteTurn(t *testing.T) {
 	sess := openTestSession(t, "message-end-only")
 	events, mu := collectSessionEvents(sess)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
 	defer cancel()
-	if err := sess.SendMessage(ctx, "hello sdk"); err != nil {
-		t.Fatal(err)
+	err := sess.SendMessage(ctx, "hello sdk")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("SendMessage error = %v, want context deadline because message_end is not terminal", err)
 	}
 
 	gotEvents := snapshotEvents(events, mu)
 	if got := joinedMessageChunks(gotEvents); got != "sdk prompt: hello sdk" {
 		t.Fatalf("message chunks = %q, want deterministic sdk prompt", got)
 	}
-	window, err := sess.ContextWindow(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if window.TotalTokens != 7 || window.ModelContextWindow != 100 {
-		t.Fatalf("context window = %+v, want total=7 window=100", window)
+	if hasEvent(gotEvents, agenttypes.EventTypeMessageDone) {
+		t.Fatalf("message_done emitted for message_end-only runtime: %#v", gotEvents)
 	}
 }
 
@@ -412,22 +513,272 @@ func TestRuntimeToolEventsMapToMindFSToolCalls(t *testing.T) {
 	}
 }
 
-func TestRuntimeTurnEndOnlyCompletesEmptyTurn(t *testing.T) {
-	sess := openTestSession(t, "turn-end-only")
+func TestRuntimeAskUserQuestionAnswerRoundTripAndTodoUpdate(t *testing.T) {
+	sess := openTestSession(t, "ask-user-todo")
+	events, mu := collectSessionEvents(sess)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- sess.SendMessage(ctx, "ask user and update todos")
+	}()
+
+	askCall := waitForToolCallKind(t, events, mu, agenttypes.ToolKindAskUser)
+	if askCall.CallID != "ask-1" || askCall.Status != "running" {
+		t.Fatalf("ask user tool call = %+v", askCall)
+	}
+	if _, ok := askCall.Meta["questions"]; !ok {
+		t.Fatalf("ask user tool call missing questions meta: %+v", askCall.Meta)
+	}
+	waitForEvent(t, events, mu, agenttypes.EventTypeTodoUpdate)
+
+	if err := sess.AnswerQuestion(ctx, agenttypes.AskUserAnswer{
+		ToolUseID: "ask-1",
+		Answers:   map[string]string{"Which bridge route should MindFS use?": "SDK bridge"},
+	}); err != nil {
+		t.Fatalf("AnswerQuestion: %v", err)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("SendMessage: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("SendMessage did not finish after AnswerQuestion: %v", ctx.Err())
+	}
+
+	gotEvents := snapshotEvents(events, mu)
+	updates := todoUpdates(gotEvents)
+	if len(updates) < 2 {
+		t.Fatalf("todo updates = %#v, want start and completion updates", updates)
+	}
+	if len(updates[0].Items) != 2 || updates[0].Items[0].Status != "in_progress" {
+		t.Fatalf("first todo update = %#v", updates[0])
+	}
+	askUpdates := toolCalls(gotEvents, agenttypes.EventTypeToolUpdate)
+	foundAskComplete := false
+	for _, update := range askUpdates {
+		if update.CallID == "ask-1" && update.Status == "complete" {
+			foundAskComplete = true
+			break
+		}
+	}
+	if !foundAskComplete {
+		t.Fatalf("ask completion update missing: %#v", askUpdates)
+	}
+	if got := joinedMessageChunks(gotEvents); !strings.Contains(got, "SDK bridge") {
+		t.Fatalf("message chunks = %q, want answered route", got)
+	}
+}
+
+func TestPiSDKEditInputMapsToDiffContent(t *testing.T) {
+	items := inputContentItems("edit", map[string]any{
+		"path":  "server/file.go",
+		"edits": []any{map[string]any{"oldText": "old", "newText": "new"}},
+	})
+	if len(items) != 1 {
+		t.Fatalf("inputContentItems = %#v, want one diff", items)
+	}
+	if items[0].Type != "diff" || items[0].Path != "server/file.go" || items[0].OldText == nil || *items[0].OldText != "old" || items[0].NewText != "new" {
+		t.Fatalf("edit diff item = %#v", items[0])
+	}
+}
+
+func TestPiSDKWriteInputMapsToAddContent(t *testing.T) {
+	items := inputContentItems("write", map[string]any{"path": "server/new.go", "content": "package main\n"})
+	if len(items) != 1 {
+		t.Fatalf("inputContentItems = %#v, want one add", items)
+	}
+	if items[0].Type != "text" || items[0].Path != "server/new.go" || items[0].ChangeKind != "add" || items[0].Text != "package main\n" {
+		t.Fatalf("write add item = %#v", items[0])
+	}
+}
+
+func TestPiSDKEditResultMapsPatchToDiffContent(t *testing.T) {
+	patch := "--- server/file.go\n+++ server/file.go\n@@ -1 +1 @@\n-old\n+new\n"
+	raw, err := json.Marshal(map[string]any{
+		"content": []map[string]any{{"type": "text", "text": "Successfully replaced 1 block(s) in server/file.go."}},
+		"details": map[string]any{"patch": patch, "diff": "-1 old\n+1 new", "firstChangedLine": 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	items := resultContentItems(raw)
+	if len(items) < 2 {
+		t.Fatalf("resultContentItems = %#v, want patch plus text", items)
+	}
+	if items[0].Type != "text" || items[0].Text != patch || items[0].Path != "server/file.go" {
+		t.Fatalf("patch content item = %#v", items[0])
+	}
+	locations := resultLocations(raw)
+	if len(locations) != 1 || locations[0].Path != "server/file.go" {
+		t.Fatalf("resultLocations = %#v, want server/file.go", locations)
+	}
+}
+
+func TestPiSDKWriteFinalResultPreservesAddPreview(t *testing.T) {
+	raw, err := json.Marshal(map[string]any{
+		"content": []map[string]any{{"type": "text", "text": "Successfully wrote 13 bytes to server/new.go"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	items := toolResultContentItems("write", map[string]any{
+		"path":    "server/new.go",
+		"content": "package main\n",
+	}, raw)
+	if len(items) != 2 {
+		t.Fatalf("toolResultContentItems = %#v, want add preview plus success text", items)
+	}
+	if items[0].Type != "text" || items[0].Path != "server/new.go" || items[0].ChangeKind != "add" || items[0].Text != "package main\n" {
+		t.Fatalf("add preview item = %#v", items[0])
+	}
+	if items[1].Text != "Successfully wrote 13 bytes to server/new.go" {
+		t.Fatalf("success item = %#v", items[1])
+	}
+}
+
+func TestPiSDKEditResultMapsDiffDetailWhenPatchMissing(t *testing.T) {
+	diff := "+1 new line\n-1 old line"
+	raw, err := json.Marshal(map[string]any{
+		"content": []map[string]any{{"type": "text", "text": "Successfully replaced 1 block(s) in server/file.go."}},
+		"details": map[string]any{"diff": diff, "firstChangedLine": 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	items := resultContentItems(raw)
+	if len(items) < 2 {
+		t.Fatalf("resultContentItems = %#v, want diff plus text", items)
+	}
+	if items[0].Type != "text" || items[0].Text != diff {
+		t.Fatalf("diff detail item = %#v", items[0])
+	}
+}
+
+func TestPiSDKThinkingLevelChangedUpdatesMode(t *testing.T) {
+	sess := &session{mode: "off"}
+	sess.handleThinkingLevelChanged([]byte(`{"type":"thinking_level_changed","level":"high"}`))
+	if got := sess.mode; got != "high" {
+		t.Fatalf("mode = %q, want high", got)
+	}
+}
+
+func TestRuntimeWaitsAcrossToolTurnUntilAgentEnd(t *testing.T) {
+	sess := openTestSession(t, "tool-multi-turn")
 	events, mu := collectSessionEvents(sess)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	started := time.Now()
-	if err := sess.SendMessage(ctx, "empty answer"); err != nil {
+	if err := sess.SendMessage(ctx, "list files"); err != nil {
 		t.Fatal(err)
 	}
-	if elapsed := time.Since(started); elapsed > time.Second {
-		t.Fatalf("SendMessage took %s, want turn_end to unblock promptly", elapsed)
+	if elapsed := time.Since(started); elapsed < messageEndFallbackDelay {
+		t.Fatalf("SendMessage returned after %s; want it to wait past delayed next LLM turn until final agent_end", elapsed)
+	}
+
+	gotEvents := snapshotEvents(events, mu)
+	if got := joinedMessageChunks(gotEvents); got != "final answer after tool: list files" {
+		t.Fatalf("message chunks = %q, want final post-tool answer; events=%#v", got, gotEvents)
+	}
+	if !hasEvent(gotEvents, agenttypes.EventTypeMessageDone) {
+		t.Fatalf("message_done event missing: %#v", gotEvents)
+	}
+}
+
+func TestRuntimeWaitsAcrossTextThenDelayedTool(t *testing.T) {
+	sess := openTestSession(t, "text-then-delayed-tool")
+	events, mu := collectSessionEvents(sess)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	started := time.Now()
+	if err := sess.SendMessage(ctx, "run bash"); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(started); elapsed < messageEndFallbackDelay+400*time.Millisecond {
+		t.Fatalf("SendMessage returned after %s; want it to wait across delayed tool execution", elapsed)
+	}
+
+	gotEvents := snapshotEvents(events, mu)
+	if got := joinedMessageChunks(gotEvents); got != "preparing tool: run bashdelayed tool complete: run bash" {
+		t.Fatalf("message chunks = %q, want pre-tool and final text; events=%#v", got, gotEvents)
+	}
+	starts := toolCalls(gotEvents, agenttypes.EventTypeToolCall)
+	if len(starts) != 1 || starts[0].Status != "running" {
+		t.Fatalf("tool_call events = %#v, want one running delayed tool", starts)
+	}
+	updates := toolCalls(gotEvents, agenttypes.EventTypeToolUpdate)
+	if len(updates) != 1 || updates[0].Status != "complete" {
+		t.Fatalf("tool_update events = %#v, want one complete delayed tool", updates)
+	}
+	if !hasEvent(gotEvents, agenttypes.EventTypeMessageDone) {
+		t.Fatalf("message_done event missing: %#v", gotEvents)
+	}
+}
+
+func TestRuntimeAgentEndWillRetryDoesNotCompleteTurn(t *testing.T) {
+	sess := openTestSession(t, "agent-end-retry")
+	events, mu := collectSessionEvents(sess)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	started := time.Now()
+	if err := sess.SendMessage(ctx, "after retry"); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(started); elapsed < 75*time.Millisecond {
+		t.Fatalf("SendMessage returned after %s; want willRetry=true agent_end to be ignored", elapsed)
+	}
+
+	gotEvents := snapshotEvents(events, mu)
+	if got := joinedMessageChunks(gotEvents); got != "retry finished: after retry" {
+		t.Fatalf("message chunks = %q, want retry output; events=%#v", got, gotEvents)
+	}
+}
+
+func TestRuntimeWaitsForPromptDoneAfterRawAgentEnd(t *testing.T) {
+	sess := openTestSession(t, "prompt-done-after-agent-end")
+	events, mu := collectSessionEvents(sess)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	started := time.Now()
+	if err := sess.SendMessage(ctx, "compact first"); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(started); elapsed < messageEndFallbackDelay {
+		t.Fatalf("SendMessage returned after %s; want raw agent_end promptDone=false to wait for SDK prompt resolution", elapsed)
+	}
+
+	gotEvents := snapshotEvents(events, mu)
+	if got := joinedMessageChunks(gotEvents); got != "answer before compaction: compact first" {
+		t.Fatalf("message chunks = %q, want answer before compaction; events=%#v", got, gotEvents)
+	}
+	if !hasEvent(gotEvents, agenttypes.EventTypeMessageDone) {
+		t.Fatalf("message_done event missing: %#v", gotEvents)
+	}
+}
+
+func TestRuntimeTurnEndOnlyDoesNotCompleteTurn(t *testing.T) {
+	sess := openTestSession(t, "turn-end-only")
+	events, mu := collectSessionEvents(sess)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	err := sess.SendMessage(ctx, "empty answer")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("SendMessage error = %v, want context deadline because turn_end is not terminal", err)
 	}
 	gotEvents := snapshotEvents(events, mu)
-	if !hasEvent(gotEvents, agenttypes.EventTypeMessageDone) {
-		t.Fatalf("message_done not emitted for turn_end-only runtime: %#v", gotEvents)
+	if hasEvent(gotEvents, agenttypes.EventTypeMessageDone) {
+		t.Fatalf("message_done emitted for turn_end-only runtime: %#v", gotEvents)
 	}
 	if got := joinedMessageChunks(gotEvents); got != "" {
 		t.Fatalf("message chunks = %q, want empty", got)

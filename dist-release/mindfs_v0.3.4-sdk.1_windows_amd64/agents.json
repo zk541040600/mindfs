@@ -1,0 +1,254 @@
+{
+  "shells": [
+    {
+      "command": "zsh",
+      "args": ["-ic"],
+      "longShellArgs": [],
+      "os": ["darwin", "linux"]
+    },
+    {
+      "command": "bash",
+      "args": ["-ic"],
+      "longShellArgs": [],
+      "os": ["darwin", "linux"]
+    },
+    {
+      "command": "sh",
+      "args": ["-lc"],
+      "longShellArgs": [],
+      "os": ["darwin", "linux"]
+    },
+    {
+      "command": "pwsh",
+      "args": ["-NoLogo", "-NoProfile", "-Command"],
+      "longShellArgs": ["-NoLogo", "-NoProfile"],
+      "commandPrefix": "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); [Console]::InputEncoding = [Console]::OutputEncoding; $OutputEncoding = [Console]::OutputEncoding;",
+      "os": "windows"
+    },
+    {
+      "name": "ps",
+      "command": "powershell.exe",
+      "args": ["-NoLogo", "-NoProfile", "-Command"],
+      "longShellArgs": ["-NoLogo", "-NoProfile"],
+      "commandPrefix": "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); [Console]::InputEncoding = [Console]::OutputEncoding; $OutputEncoding = [Console]::OutputEncoding;",
+      "os": "windows"
+    },
+    {
+      "command": "bash.exe",
+      "args": ["-lc"],
+      "longShellArgs": [],
+      "os": "windows"
+    },
+    {
+      "command": "wsl.exe",
+      "args": ["--exec", "bash", "-lc"],
+      "longShellArgs": ["--exec", "bash"],
+      "os": "windows"
+    },
+    {
+      "command": "cmd.exe",
+      "args": ["/D", "/S", "/C"],
+      "longShellArgs": ["/Q", "/K"],
+      "commandPrefix": "chcp 65001 >NUL &",
+      "os": "windows"
+    }
+  ],
+  "agents": [
+    {
+      "name": "gemini",
+      "command": "gemini",
+      "protocol": "acp",
+      "args": [
+        "--experimental-acp"
+      ],
+      "configBackup": {
+        "fileSources": [
+          "~/.gemini/.env",
+          "~/.gemini/settings.json"
+        ],
+        "envKeys": [
+          "GEMINI_API_KEY",
+          "GOOGLE_GEMINI_BASE_URL",
+          "GEMINI_MODEL"
+        ]
+      }
+    },
+    {
+      "name": "codex",
+      "command": "codex",
+      "protocol": "codex-sdk",
+      "configBackup": {
+        "fileSources": [
+          "~/.codex/auth.json",
+          "~/.codex/config.toml"
+        ]
+      }
+    },
+    {
+      "name": "claude",
+      "command": "claude",
+      "protocol": "claude-sdk",
+      "configBackup": {
+        "envKeys": [
+          "ANTHROPIC_AUTH_TOKEN",
+          "ANTHROPIC_BASE_URL",
+          "ANTHROPIC_API_KEY",
+          "ANTHROPIC_MODEL",
+          "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+          "ANTHROPIC_DEFAULT_SONNET_MODEL",
+          "ANTHROPIC_DEFAULT_OPUS_MODEL",
+          "AUTH_MODE"
+        ]
+      }
+    },
+    {
+      "name": "cursor",
+      "command": "agent",
+      "protocol": "acp",
+      "args": [
+        "acp"
+      ],
+      "configBackup": {}
+    },
+    {
+      "name": "augment",
+      "command": "auggie",
+      "protocol": "acp",
+      "args": [
+        "--acp"
+      ],
+      "configBackup": {}
+    },
+    {
+      "name": "cline",
+      "command": "cline",
+      "protocol": "acp",
+      "args": [
+        "--acp"
+      ],
+      "configBackup": {}
+    },
+    {
+      "name": "copilot",
+      "command": "copilot",
+      "protocol": "acp",
+      "args": [
+        "--acp"
+      ],
+      "configBackup": {}
+    },
+    {
+      "name": "kimi",
+      "command": "kimi",
+      "protocol": "acp",
+      "args": [
+        "acp"
+      ],
+      "configBackup": {}
+    },
+    {
+      "name": "kiro",
+      "command": "kiro-cli",
+      "protocol": "acp",
+      "args": [
+        "acp"
+      ],
+      "configBackup": {}
+    },
+    {
+      "name": "openclaw",
+      "command": "openclaw",
+      "protocol": "acp",
+      "args": [
+        "acp"
+      ],
+      "configBackup": {
+        "fileSources": [
+          "~/.openclaw/openclaw.json"
+        ]
+      }
+    },
+    {
+      "name": "opencode",
+      "command": "opencode",
+      "protocol": "acp",
+      "args": [
+        "acp"
+      ],
+      "configBackup": {
+        "fileSources": [
+          "~/.config/opencode/opencode.json",
+          "~/.local/share/opencode/auth.json"
+        ]
+      }
+    },
+    {
+      "name": "qwen",
+      "command": "qwen",
+      "protocol": "acp",
+      "args": [
+        "--acp"
+      ],
+      "configBackup": {}
+    },
+    {
+      "name": "qoder",
+      "command": "qodercli",
+      "protocol": "acp",
+      "args": [
+        "--acp"
+      ],
+      "configBackup": {}
+    },
+    {
+      "name": "omp",
+      "command": "omp",
+      "protocol": "acp",
+      "args": [
+        "acp"
+      ],
+      "configBackup": {
+        "fileSources": [
+          "~/.omp/agent/.env",
+          "~/.omp/.env",
+          "~/.omp/agent/config.yml",
+          "~/.omp/agent/models.yml",
+          "~/.omp/agent/mcp.json",
+          "~/.omp/agent/agent.db"
+        ],
+        "envKeys": [
+          "PI_CONFIG_DIR",
+          "PI_CODING_AGENT_DIR",
+          "OMP_AUTH_BROKER_URL",
+          "OMP_AUTH_BROKER_TOKEN"
+        ]
+      }
+    },
+    {
+      "name": "pi",
+      "command": "pi",
+      "protocol": "pi-rpc",
+      "args": [
+        "--mode",
+        "rpc",
+        "--no-session"
+      ],
+      "configBackup": {}
+    },
+    {
+      "name": "hermes",
+      "command": "hermes",
+      "protocol": "acp",
+      "args": [
+        "acp"
+      ],
+      "configBackup": {
+        "fileSources": [
+          "~/.hermes/auth.json",
+          "~/.hermes/config.yaml"
+        ]
+      }
+    }
+  ],
+  "relayBaseURL": "https://relay.a9gent.com"
+}

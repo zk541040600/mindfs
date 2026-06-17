@@ -99,7 +99,7 @@ The web UI adds a Pi-only confirmation gate and labels the footer action as `安
 Loads Pi SDK resources through `DefaultResourceLoader` and reports safe metadata only:
 
 - SDK availability/version,
-- support flags for sessions, fork/clone/import, extension UI, resources, steer/follow-up, and compaction,
+- support flags for sessions, import, extension UI, resources, steer/follow-up, compaction, active tools, queue modes, retry controls, and deterministic runtime-replacement smoke coverage,
 - skills, prompts, extensions, themes, and context file paths/counts,
 - slash command metadata from extension registrations, prompt templates, and skills,
 - model counts and safe model metadata.
@@ -150,7 +150,7 @@ printf '%s\n' \
   | node server/internal/agent/pi_sdk_bridge/probe.mjs jsonl
 ```
 
-It emits deterministic `extension_ui_request` events for UI contract mapping.
+It emits deterministic `extension_ui_request` events for UI contract mapping. Runtime-control requests also cover Pi SDK queueing and controls such as `steer`, `follow_up`, `compact`, `get_active_tools`, `get_all_tools`, `set_active_tools`, `set_queue_modes`, `set_auto_compaction`, `set_auto_retry`, `abort_compaction`, and `abort_retry`.
 
 ## Operational notes
 

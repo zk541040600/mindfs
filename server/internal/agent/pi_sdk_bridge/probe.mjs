@@ -36,6 +36,28 @@ const DEFAULT_IMPORT_MAX_MESSAGES = 200;
 const DEFAULT_IMPORT_MAX_BYTES = 256 * 1024;
 const SDK_PROMPT_IDLE_POLL_MS = 250;
 const SDK_PROMPT_IDLE_FALLBACK_MS = 1500;
+const SDK_PROMPT_HARD_IDLE_TIMEOUT_MS = 120000;
+const SDK_JSONL_EOF_PROMPT_GRACE_MS = 120000;
+
+const protocolStdoutWrite = process.stdout.write.bind(process.stdout);
+const protocolStderrWrite = process.stderr.write.bind(process.stderr);
+let protocolStdoutWriteDepth = 0;
+
+function writeProtocolStdout(text) {
+  protocolStdoutWriteDepth += 1;
+  try {
+    return protocolStdoutWrite(text);
+  } finally {
+    protocolStdoutWriteDepth -= 1;
+  }
+}
+
+process.stdout.write = (chunk, encoding, callback) => {
+  if (protocolStdoutWriteDepth > 0) {
+    return protocolStdoutWrite(chunk, encoding, callback);
+  }
+  return protocolStderrWrite(chunk, encoding, callback);
+};
 
 for (const method of ["log", "info", "warn", "error", "debug"]) {
   console[method] = (...args) => process.stderr.write(`${args.map(String).join(" ")}\n`);
@@ -91,7 +113,9 @@ async function loadPiSDK() {
   const errors = [];
   for (const candidate of candidates) {
     try {
-      return await import(toImportSpecifier(candidate));
+      const sdk = await import(toImportSpecifier(candidate));
+      await takeOverPiStdout(candidate);
+      return sdk;
     } catch (error) {
       errors.push(`${candidate}: ${error?.message || String(error)}`);
     }
@@ -102,6 +126,22 @@ async function loadPiSDK() {
     "unable to resolve Pi SDK module; set MINDFS_PI_SDK_MODULE to @earendil-works/pi-coding-agent/dist/index.js or to an absolute dist/index.js path",
     { candidates, errors },
   );
+}
+
+async function takeOverPiStdout(candidate) {
+  const candidatePath = String(candidate || "");
+  const marker = "/dist/index.js";
+  const markerIndex = candidatePath.endsWith(marker) ? candidatePath.length - marker.length : -1;
+  if (markerIndex < 0) {
+    return;
+  }
+  try {
+    const guardPath = join(candidatePath.slice(0, markerIndex), "dist", "core", "output-guard.js");
+    const guard = await import(pathToFileURL(guardPath).href);
+    guard.takeOverStdout?.();
+  } catch {
+    // Older SDK builds may not expose the guard; keep the bridge-level stdout isolation above.
+  }
 }
 
 function addCandidate(candidates, value) {
@@ -239,11 +279,11 @@ function readValue(argv, index, flag) {
 }
 
 function printJson(value) {
-  process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
+  writeProtocolStdout(`${JSON.stringify(value, null, 2)}\n`);
 }
 
 function writeJsonl(value) {
-  process.stdout.write(`${JSON.stringify(value)}\n`);
+  writeProtocolStdout(`${JSON.stringify(value)}\n`);
 }
 
 function successResponse(command, data, id = undefined) {
@@ -371,12 +411,18 @@ function buildSupports() {
     followUp: true,
     extensionUI: true,
     sessions: true,
-    fork: true,
-    clone: true,
+    // Fork/clone are validated by runtime-replacement-smoke but are not yet
+    // product controls exposed through the production JSONL runtime.
+    fork: false,
+    clone: false,
     importJsonl: true,
     compact: true,
+    activeTools: true,
+    queueModes: true,
+    retryControls: true,
     resources: true,
     deterministicHarness: true,
+    runtimeReplacementSmoke: true,
   };
 }
 
@@ -1162,6 +1208,27 @@ async function bindProbeExtensions(session, uiContext, errors) {
 async function runJsonl(argv) {
   const baseOptions = parseArgs(argv);
   let runtime;
+  let eofExitTimer;
+  const scheduleEofExit = () => {
+    if (!process.stdin.readableEnded && !process.stdin.destroyed) {
+      return;
+    }
+    if (eofExitTimer) {
+      clearTimeout(eofExitTimer);
+    }
+    const startedAt = Date.now();
+    const attemptExit = () => {
+      if (runtime?.isPromptActive?.() && Date.now() - startedAt < SDK_JSONL_EOF_PROMPT_GRACE_MS) {
+        eofExitTimer = setTimeout(attemptExit, 500);
+        eofExitTimer.unref?.();
+        return;
+      }
+      void runtime?.dispose?.();
+      process.exit(0);
+    };
+    eofExitTimer = setTimeout(attemptExit, 500);
+    eofExitTimer.unref?.();
+  };
   try {
     for await (const rawLine of createInterface({ input: process.stdin, crlfDelay: Infinity })) {
       const line = rawLine.trim();
@@ -1184,7 +1251,26 @@ async function runJsonl(argv) {
         } else if (request.type === "start_sdk_runtime") {
           await runtime?.dispose?.();
           runtime = await createJsonlSDKRuntime({ ...baseOptions, cwd: resolve(request.cwd ?? baseOptions.cwd), agentDir: resolve(request.agentDir ?? baseOptions.agentDir), model: request.model, mode: request.mode, sessionId: request.sessionId });
-          writeJsonl({ id: request.id, type: "response", command: "start_sdk_runtime", success: true, data: { cwd: runtime.cwd, agentDir: runtime.agentDir, sessionDir: runtime.sessionDir, sessionId: runtime.sessionId, sessionFile: runtime.sessionFile, resumed: runtime.resumed } });
+          writeJsonl({
+            id: request.id,
+            type: "response",
+            command: "start_sdk_runtime",
+            success: true,
+            data: {
+              cwd: runtime.cwd,
+              agentDir: runtime.agentDir,
+              sessionDir: runtime.sessionDir,
+              sessionId: runtime.sessionId,
+              sessionFile: runtime.sessionFile,
+              resumed: runtime.resumed,
+              model: runtime.model,
+              thinkingLevel: runtime.thinkingLevel,
+              extensionsReady: runtime.extensionsReady,
+              extensionsFailed: runtime.extensionsFailed,
+              extensionErrorCount: runtime.extensionErrors.length,
+              extensionErrors: runtime.extensionErrors,
+            },
+          });
         } else if (request.type === "prompt") {
           if (!runtime) {
             throw new ProbeError("E_STATE", "runtime must be started before prompt");
@@ -1209,9 +1295,14 @@ async function runJsonl(argv) {
       } catch (error) {
         writeJsonl(errorResponse(request.type ?? "jsonl", error, request.id));
       }
+      scheduleEofExit();
     }
   } finally {
+    if (eofExitTimer) {
+      clearTimeout(eofExitTimer);
+    }
     await runtime?.dispose?.();
+    process.exit(0);
   }
 }
 
@@ -1222,6 +1313,19 @@ async function dispatchJsonlRuntimeControl(runtime, request) {
     set_model: "setModel",
     set_thinking_level: "setThinkingLevel",
     get_commands: "getCommands",
+    steer: "steer",
+    follow_up: "followUp",
+    followup: "followUp",
+    compact: "compact",
+    abort_compaction: "abortCompaction",
+    get_active_tools: "getActiveTools",
+    get_all_tools: "getAllTools",
+    set_active_tools: "setActiveTools",
+    set_queue_modes: "setQueueModes",
+    set_auto_compaction: "setAutoCompaction",
+    set_auto_retry: "setAutoRetry",
+    abort_retry: "abortRetry",
+    answer_question: "answerQuestion",
     abort: "abort",
   };
   const method = handlers[request.type];
@@ -1251,6 +1355,21 @@ function createJsonlTestRuntime(scenario) {
   if (scenario === "tool-events") {
     return createJsonlToolRuntime();
   }
+  if (scenario === "ask-user-todo") {
+    return createJsonlAskUserTodoRuntime();
+  }
+  if (scenario === "tool-multi-turn") {
+    return createJsonlToolMultiTurnRuntime();
+  }
+  if (scenario === "text-then-delayed-tool") {
+    return createJsonlTextThenDelayedToolRuntime();
+  }
+  if (scenario === "agent-end-retry") {
+    return createJsonlAgentEndRetryRuntime();
+  }
+  if (scenario === "prompt-done-after-agent-end") {
+    return createJsonlPromptDoneAfterAgentEndRuntime();
+  }
   if (scenario === "turn-end-only") {
     return createJsonlTurnEndOnlyRuntime();
   }
@@ -1264,6 +1383,10 @@ function createJsonlTestRuntime(scenario) {
     return createJsonlAbortHangsRuntime();
   }
   throw new ProbeError("E_PARAM", `unsupported test runtime scenario: ${scenario}`);
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function createJsonlUIRuntime() {
@@ -1375,6 +1498,118 @@ function createJsonlMessageEndOnlyRuntime() {
   };
 }
 
+function createJsonlAskUserTodoRuntime() {
+  const runtime = {
+    kind: "ask-user-todo",
+    pendingQuestions: new Map(),
+    prompt: async function (request) {
+      const message = String(request.message ?? "").trim();
+      if (!message) {
+        throw new ProbeError("E_PARAM", "prompt message required");
+      }
+      writeJsonl(successResponse("prompt", { scenario: "ask-user-todo" }, request.id));
+      writeJsonl({ type: "agent_start" });
+      writeJsonl({
+        type: "tool_execution_start",
+        toolCallId: "todo-1",
+        toolName: "todo_write",
+        args: {
+          todos: [
+            { content: "Audit Pi SDK bridge", activeForm: "Auditing Pi SDK bridge", status: "in_progress" },
+            { content: "Wire ask user", activeForm: "Wiring ask user", status: "pending" },
+          ],
+        },
+      });
+      writeJsonl({
+        type: "tool_execution_end",
+        toolCallId: "todo-1",
+        toolName: "todo_write",
+        args: {
+          todos: [
+            { content: "Audit Pi SDK bridge", activeForm: "Auditing Pi SDK bridge", status: "completed" },
+            { content: "Wire ask user", activeForm: "Wiring ask user", status: "in_progress" },
+          ],
+        },
+        result: { content: [{ type: "text", text: "Todos updated" }] },
+        isError: false,
+      });
+      writeJsonl({
+        type: "tool_execution_start",
+        toolCallId: "ask-1",
+        toolName: "ask_user_question",
+        args: {
+          questions: [
+            {
+              question: "Which bridge route should MindFS use?",
+              header: "Route",
+              multiSelect: false,
+              options: [
+                { label: "SDK bridge", description: "Use Pi SDK runtime" },
+                { label: "RPC fallback", description: "Use legacy RPC runtime" },
+              ],
+            },
+          ],
+        },
+      });
+      runtime.pendingQuestions.set("ask-1", { promptId: request.id });
+    },
+    answerQuestion: async function (request) {
+      const toolUseId = String(request.toolUseId ?? "").trim();
+      const pending = runtime.pendingQuestions.get(toolUseId);
+      if (!pending) {
+        throw new ProbeError("E_PARAM", `unknown ask user question id: ${toolUseId || request.toolUseId}`);
+      }
+      runtime.pendingQuestions.delete(toolUseId);
+      const answers = request.answers && typeof request.answers === "object" ? request.answers : {};
+      const answerText = Object.values(answers).map((value) => String(value)).filter(Boolean).join(", ");
+      writeJsonl(successResponse("answer_question", { toolUseId, remaining: runtime.pendingQuestions.size }, request.id));
+      writeJsonl({
+        type: "tool_execution_end",
+        toolCallId: toolUseId,
+        toolName: "ask_user_question",
+        args: {
+          questions: [
+            {
+              question: "Which bridge route should MindFS use?",
+              header: "Route",
+              multiSelect: false,
+              options: [
+                { label: "SDK bridge", description: "Use Pi SDK runtime" },
+                { label: "RPC fallback", description: "Use legacy RPC runtime" },
+              ],
+            },
+          ],
+        },
+        result: { content: [{ type: "text", text: `Answer received: ${answerText}` }], details: { answers } },
+        isError: false,
+      });
+      writeJsonl({
+        type: "message_update",
+        message: { role: "assistant", content: [{ type: "text", text: `answer received: ${answerText}` }] },
+        assistantMessageEvent: { type: "text_delta", delta: `answer received: ${answerText}` },
+      });
+      writeJsonl({
+        type: "message_end",
+        message: {
+          role: "assistant",
+          stopReason: "end_turn",
+          content: [{ type: "text", text: `answer received: ${answerText}` }],
+          usage: { input: 4, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 9 },
+        },
+      });
+      writeJsonl({ type: "context_window", totalTokens: 9, modelContextWindow: 100 });
+      writeJsonl({ type: "agent_end", willRetry: false });
+    },
+    answerExtensionUI: async function (request) {
+      throw new ProbeError("E_PARAM", `unknown extension UI request id: ${request.id}`);
+    },
+    dispose: async function () {
+      runtime.pendingQuestions.clear();
+    },
+  };
+  return runtime;
+}
+
 function createJsonlToolRuntime() {
   return {
     kind: "tool-events",
@@ -1411,6 +1646,203 @@ function createJsonlToolRuntime() {
       });
       writeJsonl({ type: "context_window", totalTokens: 3, modelContextWindow: 100 });
       writeJsonl({ type: "agent_end", willRetry: false });
+    },
+    answerExtensionUI: async function (request) {
+      throw new ProbeError("E_PARAM", `unknown extension UI request id: ${request.id}`);
+    },
+    dispose: async function () {},
+  };
+}
+
+function createJsonlToolMultiTurnRuntime() {
+  return {
+    kind: "tool-multi-turn",
+    prompt: async function (request) {
+      const message = String(request.message ?? "").trim();
+      if (!message) {
+        throw new ProbeError("E_PARAM", "prompt message required");
+      }
+      writeJsonl(successResponse("prompt", { scenario: "tool-multi-turn" }, request.id));
+      writeJsonl({ type: "agent_start" });
+      writeJsonl({ type: "message_start", message: { role: "assistant", content: [] } });
+      writeJsonl({
+        type: "message_end",
+        message: {
+          role: "assistant",
+          stopReason: "end_turn",
+          content: [{ type: "toolCall", id: "tool-1", name: "ls", arguments: { path: "." } }],
+          usage: { input: 2, output: 1, totalTokens: 3 },
+        },
+      });
+      writeJsonl({ type: "tool_execution_start", toolCallId: "tool-1", toolName: "ls", args: { path: "." } });
+      writeJsonl({
+        type: "tool_execution_end",
+        toolCallId: "tool-1",
+        toolName: "ls",
+        result: { content: [{ type: "text", text: "README.md" }] },
+        isError: false,
+      });
+      writeJsonl({ type: "turn_end", stopReason: "end_turn", willRetry: false });
+      await delay(SDK_PROMPT_IDLE_FALLBACK_MS + 200);
+      writeJsonl({ type: "turn_start" });
+      writeJsonl({ type: "message_start", message: { role: "assistant", content: [] } });
+      writeJsonl({
+        type: "message_update",
+        message: { role: "assistant", content: [{ type: "text", text: `final answer after tool: ${message}` }] },
+        assistantMessageEvent: { type: "text_delta", delta: `final answer after tool: ${message}` },
+      });
+      writeJsonl({
+        type: "message_end",
+        message: {
+          role: "assistant",
+          stopReason: "end_turn",
+          content: [{ type: "text", text: `final answer after tool: ${message}` }],
+          usage: { input: 4, output: 5, totalTokens: 9 },
+        },
+      });
+      writeJsonl({ type: "context_window", totalTokens: 9, modelContextWindow: 100 });
+      writeJsonl({ type: "agent_end", willRetry: false });
+    },
+    answerExtensionUI: async function (request) {
+      throw new ProbeError("E_PARAM", `unknown extension UI request id: ${request.id}`);
+    },
+    dispose: async function () {},
+  };
+}
+
+function createJsonlTextThenDelayedToolRuntime() {
+  return {
+    kind: "text-then-delayed-tool",
+    prompt: async function (request) {
+      const message = String(request.message ?? "").trim();
+      if (!message) {
+        throw new ProbeError("E_PARAM", "prompt message required");
+      }
+      writeJsonl(successResponse("prompt", { scenario: "text-then-delayed-tool" }, request.id));
+      writeJsonl({ type: "agent_start" });
+      writeJsonl({ type: "message_start", message: { role: "assistant", content: [] } });
+      writeJsonl({
+        type: "message_update",
+        message: { role: "assistant", content: [{ type: "text", text: `preparing tool: ${message}` }] },
+        assistantMessageEvent: { type: "text_delta", delta: `preparing tool: ${message}` },
+      });
+      writeJsonl({
+        type: "message_end",
+        message: {
+          role: "assistant",
+          stopReason: "end_turn",
+          content: [{ type: "text", text: `preparing tool: ${message}` }],
+          usage: { input: 2, output: 2, totalTokens: 4 },
+        },
+      });
+      await delay(SDK_PROMPT_IDLE_FALLBACK_MS + 750);
+      writeJsonl({ type: "tool_execution_start", toolCallId: "tool-1", toolName: "execute bash", args: { command: "pwd" } });
+      writeJsonl({
+        type: "tool_execution_end",
+        toolCallId: "tool-1",
+        toolName: "execute bash",
+        result: { content: [{ type: "text", text: "/root/mindfs" }] },
+        isError: false,
+      });
+      writeJsonl({ type: "turn_end", stopReason: "end_turn", willRetry: false });
+      writeJsonl({ type: "message_start", message: { role: "assistant", content: [] } });
+      writeJsonl({
+        type: "message_update",
+        message: { role: "assistant", content: [{ type: "text", text: `delayed tool complete: ${message}` }] },
+        assistantMessageEvent: { type: "text_delta", delta: `delayed tool complete: ${message}` },
+      });
+      writeJsonl({
+        type: "message_end",
+        message: {
+          role: "assistant",
+          stopReason: "end_turn",
+          content: [{ type: "text", text: `delayed tool complete: ${message}` }],
+          usage: { input: 3, output: 5, totalTokens: 8 },
+        },
+      });
+      writeJsonl({ type: "context_window", totalTokens: 8, modelContextWindow: 100 });
+      writeJsonl({ type: "agent_end", willRetry: false });
+    },
+    answerExtensionUI: async function (request) {
+      throw new ProbeError("E_PARAM", `unknown extension UI request id: ${request.id}`);
+    },
+    dispose: async function () {},
+  };
+}
+
+function createJsonlAgentEndRetryRuntime() {
+  return {
+    kind: "agent-end-retry",
+    prompt: async function (request) {
+      const message = String(request.message ?? "").trim();
+      if (!message) {
+        throw new ProbeError("E_PARAM", "prompt message required");
+      }
+      writeJsonl(successResponse("prompt", { scenario: "agent-end-retry" }, request.id));
+      writeJsonl({ type: "agent_start" });
+      writeJsonl({ type: "agent_end", willRetry: true });
+      await delay(100);
+      writeJsonl({ type: "message_start", message: { role: "assistant", content: [] } });
+      writeJsonl({
+        type: "message_update",
+        message: { role: "assistant", content: [{ type: "text", text: `retry finished: ${message}` }] },
+        assistantMessageEvent: { type: "text_delta", delta: `retry finished: ${message}` },
+      });
+      writeJsonl({
+        type: "message_end",
+        message: {
+          role: "assistant",
+          stopReason: "end_turn",
+          content: [{ type: "text", text: `retry finished: ${message}` }],
+          usage: { input: 1, output: 2, totalTokens: 3 },
+        },
+      });
+      writeJsonl({ type: "agent_end", willRetry: false });
+    },
+    answerExtensionUI: async function (request) {
+      throw new ProbeError("E_PARAM", `unknown extension UI request id: ${request.id}`);
+    },
+    dispose: async function () {},
+  };
+}
+
+function createJsonlPromptDoneAfterAgentEndRuntime() {
+  return {
+    kind: "prompt-done-after-agent-end",
+    prompt: async function (request) {
+      const message = String(request.message ?? "").trim();
+      if (!message) {
+        throw new ProbeError("E_PARAM", "prompt message required");
+      }
+      writeJsonl(successResponse("prompt", { scenario: "prompt-done-after-agent-end" }, request.id));
+      writeJsonl({ type: "agent_start" });
+      writeJsonl({ type: "message_start", message: { role: "assistant", content: [] } });
+      writeJsonl({
+        type: "message_update",
+        message: { role: "assistant", content: [{ type: "text", text: `answer before compaction: ${message}` }] },
+        assistantMessageEvent: { type: "text_delta", delta: `answer before compaction: ${message}` },
+      });
+      writeJsonl({
+        type: "message_end",
+        message: {
+          role: "assistant",
+          stopReason: "end_turn",
+          content: [{ type: "text", text: `answer before compaction: ${message}` }],
+          usage: { input: 80, output: 20, totalTokens: 100 },
+        },
+      });
+      writeJsonl({ type: "agent_end", willRetry: false, promptDone: false });
+      writeJsonl({ type: "compaction_start", reason: "threshold" });
+      await delay(SDK_PROMPT_IDLE_FALLBACK_MS + 200);
+      writeJsonl({
+        type: "compaction_end",
+        reason: "threshold",
+        result: { summary: "summary", firstKeptEntryId: "entry-1", tokensBefore: 100 },
+        aborted: false,
+        willRetry: false,
+      });
+      writeJsonl({ type: "context_window", totalTokens: 40, modelContextWindow: 100 });
+      writeJsonl({ type: "agent_end", willRetry: false, promptDone: true, synthetic: true, reason: "sdk_prompt_resolved" });
     },
     answerExtensionUI: async function (request) {
       throw new ProbeError("E_PARAM", `unknown extension UI request id: ${request.id}`);
@@ -1486,12 +1918,32 @@ function createJsonlControlsRuntime() {
     { id: "model", name: "Fake Model", provider: "fake", reasoning: true, thinkingLevelMap: { off: "off", high: "high" } },
     { id: "plain", name: "Plain Model", provider: "fake", reasoning: false },
   ];
+  const allTools = [
+    { name: "read", description: "Read a file", parameters: { type: "object" }, promptGuidelines: ["Read before edit"], sourceInfo: { source: "builtin", scope: "test" } },
+    { name: "edit", description: "Edit a file", parameters: { type: "object" }, promptGuidelines: [], sourceInfo: { source: "builtin", scope: "test" } },
+  ];
   const state = {
     sessionId: "sdk-test",
     model: { provider: "fake", id: "model" },
     thinkingLevel: "off",
     isStreaming: false,
+    steering: [],
+    followUp: [],
+    steeringMode: "all",
+    followUpMode: "all",
+    activeTools: ["read"],
+    autoCompactionEnabled: true,
+    autoRetryEnabled: true,
+    compactCount: 0,
+    abortCompactionCount: 0,
+    abortRetryCount: 0,
   };
+  const emitQueueUpdate = () => writeJsonl({ type: "queue_update", steering: state.steering, followUp: state.followUp });
+  const deterministicQueueState = () => ({
+    pendingMessageCount: state.steering.length + state.followUp.length,
+    steering: [...state.steering],
+    followUp: [...state.followUp],
+  });
   return {
     kind: "runtime-controls",
     prompt: async function (request) {
@@ -1523,7 +1975,7 @@ function createJsonlControlsRuntime() {
       writeJsonl({ type: "agent_end", willRetry: false });
     },
     getState: async function (request) {
-      writeJsonl(successResponse("get_state", state, request.id));
+      writeJsonl(successResponse("get_state", { ...state, pendingMessageCount: state.steering.length + state.followUp.length }, request.id));
     },
     getAvailableModels: async function (request) {
       writeJsonl(successResponse("get_available_models", { models }, request.id));
@@ -1546,6 +1998,57 @@ function createJsonlControlsRuntime() {
     },
     getCommands: async function (request) {
       writeJsonl(successResponse("get_commands", { commands: [] }, request.id));
+    },
+    steer: async function (request) {
+      state.steering.push(jsonlRequestText(request, "steer"));
+      emitQueueUpdate();
+      writeJsonl(successResponse("steer", deterministicQueueState(), request.id));
+    },
+    followUp: async function (request) {
+      state.followUp.push(jsonlRequestText(request, "follow_up"));
+      emitQueueUpdate();
+      writeJsonl(successResponse("follow_up", deterministicQueueState(), request.id));
+    },
+    compact: async function (request) {
+      state.compactCount += 1;
+      writeJsonl({ type: "compaction_start", reason: request.reason || "manual" });
+      writeJsonl({ type: "compaction_end", reason: request.reason || "manual", aborted: false, willRetry: false, result: { summary: "deterministic compaction" } });
+      writeJsonl(successResponse("compact", { compactCount: state.compactCount }, request.id));
+    },
+    abortCompaction: async function (request) {
+      state.abortCompactionCount += 1;
+      writeJsonl(successResponse("abort_compaction", { abortCompactionCount: state.abortCompactionCount }, request.id));
+    },
+    getActiveTools: async function (request) {
+      writeJsonl(successResponse("get_active_tools", { toolNames: [...state.activeTools] }, request.id));
+    },
+    getAllTools: async function (request) {
+      writeJsonl(successResponse("get_all_tools", { tools: allTools.map(sanitizeToolInfo) }, request.id));
+    },
+    setActiveTools: async function (request) {
+      state.activeTools = jsonlStringArray(request.toolNames ?? request.tools, "toolNames");
+      writeJsonl(successResponse("set_active_tools", { toolNames: [...state.activeTools] }, request.id));
+    },
+    setQueueModes: async function (request) {
+      if (request.steeringMode !== undefined) {
+        state.steeringMode = normalizeQueueMode(request.steeringMode, "steeringMode");
+      }
+      if (request.followUpMode !== undefined) {
+        state.followUpMode = normalizeQueueMode(request.followUpMode, "followUpMode");
+      }
+      writeJsonl(successResponse("set_queue_modes", { steeringMode: state.steeringMode, followUpMode: state.followUpMode }, request.id));
+    },
+    setAutoCompaction: async function (request) {
+      state.autoCompactionEnabled = jsonlBoolean(request.enabled, "enabled");
+      writeJsonl(successResponse("set_auto_compaction", { enabled: state.autoCompactionEnabled }, request.id));
+    },
+    setAutoRetry: async function (request) {
+      state.autoRetryEnabled = jsonlBoolean(request.enabled, "enabled");
+      writeJsonl(successResponse("set_auto_retry", { enabled: state.autoRetryEnabled }, request.id));
+    },
+    abortRetry: async function (request) {
+      state.abortRetryCount += 1;
+      writeJsonl(successResponse("abort_retry", { abortRetryCount: state.abortRetryCount }, request.id));
     },
     abort: async function (request) {
       state.isStreaming = false;
@@ -1587,12 +2090,226 @@ function createJsonlAbortHangsRuntime() {
     },
     abort: async function () {
       writeJsonl({ type: "turn_end", stopReason: "aborted", willRetry: false });
+      writeJsonl({ type: "agent_end", stopReason: "aborted", willRetry: false });
     },
     answerExtensionUI: async function (request) {
       throw new ProbeError("E_PARAM", `unknown extension UI request id: ${request.id}`);
     },
     dispose: async function () {},
   };
+}
+
+function createMindFSAskUserQuestionTool(pendingQuestions) {
+  return {
+    name: "ask_user_question",
+    label: "Ask User Question",
+    description: "Ask the MindFS user one or more structured questions and wait for their answer. Use this only when local evidence is exhausted or a product decision is required.",
+    promptSnippet: "Ask the user a structured question and wait for an answer",
+    executionMode: "sequential",
+    parameters: {
+      type: "object",
+      properties: {
+        questions: {
+          type: "array",
+          minItems: 1,
+          items: {
+            type: "object",
+            properties: {
+              question: { type: "string" },
+              header: { type: "string" },
+              multiSelect: { type: "boolean" },
+              options: {
+                type: "array",
+                items: {
+                  type: "object",
+                  properties: {
+                    label: { type: "string" },
+                    description: { type: "string" },
+                  },
+                  required: ["label"],
+                  additionalProperties: true,
+                },
+              },
+            },
+            required: ["question"],
+            additionalProperties: true,
+          },
+        },
+      },
+      required: ["questions"],
+      additionalProperties: true,
+    },
+    async execute(toolCallId, params, signal) {
+      const questions = Array.isArray(params?.questions) ? params.questions : [];
+      if (questions.length === 0) {
+        return {
+          content: [{ type: "text", text: "Error: questions required" }],
+          details: { cancelled: true, error: "questions required" },
+        };
+      }
+      return new Promise((resolve, reject) => {
+        const cleanup = () => {
+          pendingQuestions.delete(toolCallId);
+          signal?.removeEventListener?.("abort", onAbort);
+        };
+        const onAbort = () => {
+          cleanup();
+          reject(new Error("Ask user question aborted"));
+        };
+        pendingQuestions.set(toolCallId, {
+          questions,
+          resolve: (answers) => {
+            cleanup();
+            resolve({
+              content: [{ type: "text", text: formatAskUserAnswerResult(answers) }],
+              details: { questions, answers },
+            });
+          },
+          reject: (error) => {
+            cleanup();
+            reject(error);
+          },
+        });
+        if (signal?.aborted) {
+          onAbort();
+          return;
+        }
+        signal?.addEventListener?.("abort", onAbort, { once: true });
+      });
+    },
+  };
+}
+
+function normalizeAnswerMap(value) {
+  const answers = {};
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return answers;
+  }
+  for (const [key, rawValue] of Object.entries(value)) {
+    const normalizedKey = String(key ?? "").trim();
+    const normalizedValue = String(rawValue ?? "").trim();
+    if (normalizedKey && normalizedValue) {
+      answers[normalizedKey] = normalizedValue;
+    }
+  }
+  return answers;
+}
+
+function formatAskUserAnswerResult(answers) {
+  const values = Object.entries(answers ?? {})
+    .map(([key, value]) => `${key}: ${value}`)
+    .filter(Boolean);
+  return values.length > 0 ? `User answered:\n${values.join("\n")}` : "User answered.";
+}
+
+function jsonlRequestText(request, command) {
+  const text = String(request.message ?? request.content ?? request.text ?? "").trim();
+  if (!text) {
+    throw new ProbeError("E_PARAM", `${command} message required`);
+  }
+  return text;
+}
+
+function jsonlStringArray(value, fieldName) {
+  const source = Array.isArray(value) ? value : [];
+  const items = source.map((item) => String(item ?? "").trim()).filter(Boolean);
+  if (items.length === 0) {
+    throw new ProbeError("E_PARAM", `${fieldName} required`);
+  }
+  return items;
+}
+
+function jsonlBoolean(value, fieldName) {
+  if (typeof value === "boolean") {
+    return value;
+  }
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === "true") {
+      return true;
+    }
+    if (normalized === "false") {
+      return false;
+    }
+  }
+  throw new ProbeError("E_PARAM", `${fieldName} boolean required`);
+}
+
+function queueState(session) {
+  return {
+    pendingMessageCount: Number(session?.pendingMessageCount ?? 0) || 0,
+    steering: Array.from(session?.getSteeringMessages?.() ?? []),
+    followUp: Array.from(session?.getFollowUpMessages?.() ?? []),
+  };
+}
+
+function sanitizeToolInfo(tool) {
+  return {
+    name: tool?.name,
+    description: tool?.description,
+    parameters: tool?.parameters,
+    promptGuidelines: tool?.promptGuidelines,
+    sourceInfo: sanitizeSourceInfo(tool?.sourceInfo),
+  };
+}
+
+function sanitizeCompactionResult(result) {
+  if (!result || typeof result !== "object") {
+    return result;
+  }
+  return {
+    ...result,
+    summary: result.summary === undefined ? undefined : preview(String(result.summary), 4000),
+    details: result.details === undefined ? undefined : result.details,
+  };
+}
+
+function normalizeQueueMode(value, fieldName) {
+  const mode = String(value ?? "").trim();
+  if (mode === "all" || mode === "one-at-a-time") {
+    return mode;
+  }
+  throw new ProbeError("E_PARAM", `${fieldName} must be all or one-at-a-time`);
+}
+
+function installExtensionEventForwarding(session) {
+  const runner = session.extensionRunner;
+  if (!runner) {
+    return () => {};
+  }
+  const originalEmit = typeof runner.emit === "function" ? runner.emit.bind(runner) : undefined;
+  if (originalEmit) {
+    runner.emit = async (event) => {
+      if (event?.type === "model_select" || event?.type === "thinking_level_select") {
+        writeJsonl(sanitizeExtensionEvent(event));
+      }
+      return originalEmit(event);
+    };
+  }
+  return () => {
+    if (originalEmit) {
+      runner.emit = originalEmit;
+    }
+  };
+}
+
+function sanitizeExtensionEvent(event) {
+  if (event?.type === "model_select") {
+    return {
+      type: event.type,
+      model: sanitizeModel(event.model),
+      previousModel: sanitizeModel(event.previousModel),
+      source: event.source,
+    };
+  }
+  if (event?.type === "thinking_level_select") {
+    return {
+      type: event.type,
+      level: event.level,
+      previousLevel: event.previousLevel,
+    };
+  }
+  return event;
 }
 
 async function createJsonlSDKRuntime(options) {
@@ -1605,15 +2322,32 @@ async function createJsonlSDKRuntime(options) {
     agentDir,
   });
   const model = resolveJsonlModel(services.modelRegistry, options.model);
+  const pendingQuestions = new Map();
   const { session } = await createAgentSessionFromServices({
     services,
     sessionManager: sessionState.sessionManager,
     model,
     thinkingLevel,
+    customTools: [createMindFSAskUserQuestionTool(pendingQuestions)],
   });
+  const restoreExtensionForwarding = installExtensionEventForwarding(session);
   const pendingUI = new Map();
   const extensionErrors = [];
-  await bindProbeExtensions(session, createJsonlBridgeUI(pendingUI), extensionErrors);
+  let bindingsSettled = false;
+  let bindingsFailed = false;
+  const bindingsReady = bindProbeExtensions(session, createJsonlBridgeUI(pendingUI), extensionErrors)
+    .then(() => {
+      bindingsSettled = true;
+    })
+    .catch((error) => {
+      bindingsSettled = true;
+      bindingsFailed = true;
+      extensionErrors.push(error);
+      writeJsonl({
+        type: "recovery",
+        message: `Pi SDK extension binding failed: ${error instanceof Error ? error.message : String(error)}`,
+      });
+    });
   let activePrompt = undefined;
   const clearPromptWatchdog = (state) => {
     if (state?.timer) {
@@ -1633,52 +2367,42 @@ async function createJsonlSDKRuntime(options) {
     }
     return [];
   };
-  const latestAssistantAfter = (state) => {
-    const messages = messagesForSession();
-    for (let index = messages.length - 1; index >= Math.max(0, state.baselineMessageCount); index--) {
-      if (messages[index]?.role === "assistant") {
-        return messages[index];
-      }
-    }
-    return undefined;
-  };
-  const writePromptTerminalFallback = (state, reason) => {
-    if (!state || state.done) {
-      return false;
-    }
-    const assistant = latestAssistantAfter(state);
-    if (!state.sawAssistantActivity && !assistant) {
-      return false;
-    }
-    if (!state.seenMessageEnd && assistant) {
-      writeJsonl({ type: "message_end", message: assistant, synthetic: true, reason });
-      state.seenMessageEnd = true;
-    }
-    writeJsonl(contextWindowEnvelope(session));
-    writeJsonl({ type: "agent_end", willRetry: false, synthetic: true, reason });
-    state.done = true;
-    state.seenAgentEnd = true;
-    clearPromptWatchdog(state);
-    return true;
-  };
   const startPromptWatchdog = (state) => {
     state.timer = setInterval(() => {
-      if (state.done || state.seenAgentEnd) {
+      if (state.done) {
         clearPromptWatchdog(state);
         return;
       }
-      const elapsed = Date.now() - state.startedAt;
+      const elapsed = Date.now() - (state.lastActivityAt ?? state.startedAt);
       if (elapsed < SDK_PROMPT_IDLE_FALLBACK_MS) {
         return;
       }
-      if (session.isStreaming === false) {
-        writePromptTerminalFallback(state, "sdk_idle_without_terminal_event");
+      if (session.isRetrying === true || session.isCompacting === true || state.pendingToolCalls.size > 0 || pendingUI.size > 0) {
+        return;
       }
+      if (elapsed < SDK_PROMPT_HARD_IDLE_TIMEOUT_MS) {
+        return;
+      }
+      const error = new ProbeError("E_TIMEOUT", `Pi SDK prompt idle timeout after ${SDK_PROMPT_HARD_IDLE_TIMEOUT_MS}ms`);
+      if (typeof session.abort === "function") {
+        void session.abort().catch(() => {});
+      }
+      if (!state.preflightSucceeded) {
+        writeJsonl(errorResponse("prompt", error, state.requestId));
+      } else {
+        writeJsonl({ type: "recovery", message: error.message });
+        writeJsonl(contextWindowEnvelope(session));
+        writeJsonl({ type: "agent_end", willRetry: false, promptDone: true, synthetic: true, reason: "sdk_prompt_idle_timeout" });
+      }
+      state.done = true;
+      state.seenAgentEnd = true;
+      clearPromptWatchdog(state);
     }, SDK_PROMPT_IDLE_POLL_MS);
   };
   let unsubscribe = session.subscribe((event) => {
     const state = activePrompt;
     if (state && !state.done) {
+      state.lastActivityAt = Date.now();
       if (event.type === "message_update") {
         state.sawAssistantActivity = true;
       } else if (event.type === "message_end") {
@@ -1686,14 +2410,22 @@ async function createJsonlSDKRuntime(options) {
         if (event.message?.role === "assistant") {
           state.sawAssistantActivity = true;
         }
+      } else if (event.type === "tool_execution_start") {
+        if (event.toolCallId) {
+          state.pendingToolCalls.add(event.toolCallId);
+        }
+      } else if (event.type === "tool_execution_end") {
+        if (event.toolCallId) {
+          state.pendingToolCalls.delete(event.toolCallId);
+        }
       } else if (event.type === "agent_end") {
         state.seenAgentEnd = true;
-        state.done = true;
-        clearPromptWatchdog(state);
       }
     }
     if (event.type === "agent_end") {
       writeJsonl(contextWindowEnvelope(session));
+      writeJsonl({ ...event, promptDone: false });
+      return;
     }
     writeJsonl(event);
   });
@@ -1705,17 +2437,38 @@ async function createJsonlSDKRuntime(options) {
     sessionId: session.sessionId,
     sessionFile: session.sessionFile,
     resumed: sessionState.resumed,
+    get model() {
+      return session.model;
+    },
+    get thinkingLevel() {
+      return session.thinkingLevel;
+    },
+    get extensionsReady() {
+      return bindingsSettled && !bindingsFailed;
+    },
+    get extensionsFailed() {
+      return bindingsFailed;
+    },
+    get extensionErrors() {
+      return extensionErrors.map((error) => error instanceof Error ? error.message : String(error));
+    },
     pending: new Map(),
     responses: [],
+    isPromptActive: function () {
+      return Boolean(activePrompt && !activePrompt.done);
+    },
     prompt: async function (request) {
-      let preflightSucceeded = false;
+      await bindingsReady;
       const state = {
         requestId: request.id,
         startedAt: Date.now(),
+        lastActivityAt: Date.now(),
         baselineMessageCount: messagesForSession().length,
         sawAssistantActivity: false,
         seenMessageEnd: false,
         seenAgentEnd: false,
+        preflightSucceeded: false,
+        pendingToolCalls: new Set(),
         done: false,
         timer: undefined,
       };
@@ -1725,35 +2478,56 @@ async function createJsonlSDKRuntime(options) {
         .prompt(String(request.message ?? ""), {
           source: "rpc",
           preflightResult: (didSucceed) => {
-            if (didSucceed) {
-              preflightSucceeded = true;
+            if (didSucceed && !state.done && !state.preflightSucceeded) {
+              state.preflightSucceeded = true;
               writeJsonl(successResponse("prompt", { runtime: "sdk" }, request.id));
             }
           },
         })
         .then(() => {
-          if (!preflightSucceeded) {
-            preflightSucceeded = true;
+          if (state.done) {
+            return;
+          }
+          if (!state.preflightSucceeded) {
+            state.preflightSucceeded = true;
             writeJsonl(successResponse("prompt", { runtime: "sdk" }, request.id));
           }
-          if (!state.done && !state.seenAgentEnd) {
-            writeJsonl(contextWindowEnvelope(session));
-            writeJsonl({ type: "agent_end", willRetry: false });
-            state.done = true;
-          }
+          writeJsonl(contextWindowEnvelope(session));
+          writeJsonl({ type: "agent_end", willRetry: false, promptDone: true, synthetic: true, reason: "sdk_prompt_resolved" });
+          state.done = true;
+          state.seenAgentEnd = true;
           clearPromptWatchdog(state);
         })
         .catch((error) => {
+          if (state.done) {
+            return;
+          }
           clearPromptWatchdog(state);
-          if (!preflightSucceeded) {
+          if (!state.preflightSucceeded) {
+            state.done = true;
+            state.seenAgentEnd = true;
             writeJsonl(errorResponse("prompt", error, request.id));
             return;
           }
           writeJsonl({ type: "recovery", message: error instanceof Error ? error.message : String(error) });
           writeJsonl(contextWindowEnvelope(session));
-          writeJsonl({ type: "agent_end", willRetry: false });
+          writeJsonl({ type: "agent_end", willRetry: false, promptDone: true, synthetic: true, reason: "sdk_prompt_error" });
           state.done = true;
+          state.seenAgentEnd = true;
         });
+    },
+    answerQuestion: async function (request) {
+      const toolUseId = String(request.toolUseId ?? request.toolUseID ?? "").trim();
+      const pending = pendingQuestions.get(toolUseId);
+      if (!pending) {
+        throw new ProbeError("E_PARAM", `unknown ask user question id: ${toolUseId || request.toolUseId}`);
+      }
+      const answers = normalizeAnswerMap(request.answers);
+      if (Object.keys(answers).length === 0) {
+        throw new ProbeError("E_PARAM", "answers required");
+      }
+      writeJsonl(successResponse("answer_question", { toolUseId, remaining: Math.max(0, pendingQuestions.size - 1) }, request.id));
+      pending.resolve(answers);
     },
     answerExtensionUI: async function (request) {
       const id = String(request.id ?? "").trim();
@@ -1783,6 +2557,10 @@ async function createJsonlSDKRuntime(options) {
         autoCompactionEnabled: session.autoCompactionEnabled,
         messageCount: session.messages?.length ?? 0,
         pendingMessageCount: session.pendingMessageCount,
+        extensionsReady: bindingsSettled && !bindingsFailed,
+        extensionsFailed: bindingsFailed,
+        extensionErrorCount: extensionErrors.length,
+        extensionErrors: extensionErrors.map((error) => error instanceof Error ? error.message : String(error)),
       }, request.id));
     },
     getAvailableModels: async function (request) {
@@ -1803,6 +2581,7 @@ async function createJsonlSDKRuntime(options) {
       writeJsonl(successResponse("set_thinking_level", { level: session.thinkingLevel }, request.id));
     },
     getCommands: async function (request) {
+      await bindingsReady;
       const commands = [];
       for (const command of session.extensionRunner?.getRegisteredCommands?.() ?? []) {
         commands.push({
@@ -1830,12 +2609,71 @@ async function createJsonlSDKRuntime(options) {
       }
       writeJsonl(successResponse("get_commands", { commands }, request.id));
     },
+    steer: async function (request) {
+      await bindingsReady;
+      await session.steer(jsonlRequestText(request, "steer"));
+      writeJsonl(successResponse("steer", queueState(session), request.id));
+    },
+    followUp: async function (request) {
+      await bindingsReady;
+      await session.followUp(jsonlRequestText(request, "follow_up"));
+      writeJsonl(successResponse("follow_up", queueState(session), request.id));
+    },
+    compact: async function (request) {
+      await bindingsReady;
+      const instructions = String(request.customInstructions ?? request.instructions ?? "").trim() || undefined;
+      const result = await session.compact(instructions);
+      writeJsonl(successResponse("compact", { result: sanitizeCompactionResult(result), contextUsage: session.getContextUsage?.() }, request.id));
+    },
+    abortCompaction: async function (request) {
+      session.abortCompaction?.();
+      writeJsonl(successResponse("abort_compaction", {}, request.id));
+    },
+    getActiveTools: async function (request) {
+      writeJsonl(successResponse("get_active_tools", { toolNames: session.getActiveToolNames?.() ?? [] }, request.id));
+    },
+    getAllTools: async function (request) {
+      writeJsonl(successResponse("get_all_tools", { tools: (session.getAllTools?.() ?? []).map(sanitizeToolInfo) }, request.id));
+    },
+    setActiveTools: async function (request) {
+      const toolNames = jsonlStringArray(request.toolNames ?? request.tools, "toolNames");
+      session.setActiveToolsByName?.(toolNames);
+      writeJsonl(successResponse("set_active_tools", { toolNames: session.getActiveToolNames?.() ?? toolNames }, request.id));
+    },
+    setQueueModes: async function (request) {
+      if (request.steeringMode !== undefined) {
+        session.setSteeringMode?.(normalizeQueueMode(request.steeringMode, "steeringMode"));
+      }
+      if (request.followUpMode !== undefined) {
+        session.setFollowUpMode?.(normalizeQueueMode(request.followUpMode, "followUpMode"));
+      }
+      writeJsonl(successResponse("set_queue_modes", { steeringMode: session.steeringMode, followUpMode: session.followUpMode }, request.id));
+    },
+    setAutoCompaction: async function (request) {
+      const enabled = jsonlBoolean(request.enabled, "enabled");
+      session.setAutoCompactionEnabled?.(enabled);
+      writeJsonl(successResponse("set_auto_compaction", { enabled: session.autoCompactionEnabled }, request.id));
+    },
+    setAutoRetry: async function (request) {
+      const enabled = jsonlBoolean(request.enabled, "enabled");
+      session.setAutoRetryEnabled?.(enabled);
+      writeJsonl(successResponse("set_auto_retry", { enabled: session.autoRetryEnabled }, request.id));
+    },
+    abortRetry: async function (request) {
+      session.abortRetry?.();
+      writeJsonl(successResponse("abort_retry", {}, request.id));
+    },
     abort: async function (request) {
       await session.abort();
       writeJsonl(successResponse("abort", {}, request.id));
     },
     dispose: async function () {
       resolvePendingJsonlBridgeUI(pendingUI);
+      for (const pending of pendingQuestions.values()) {
+        pending.reject?.(new Error("Pi SDK runtime disposed"));
+      }
+      pendingQuestions.clear();
+      restoreExtensionForwarding();
       unsubscribe?.();
       unsubscribe = undefined;
       session.dispose?.();

@@ -21,10 +21,11 @@ import (
 )
 
 const (
-	defaultNodeCommand      = "node"
-	defaultCommandTimeout   = 30 * time.Second
-	startupTimeout          = 45 * time.Second
-	messageEndFallbackDelay = 1500 * time.Millisecond
+	defaultNodeCommand                = "node"
+	defaultCommandTimeout             = 30 * time.Second
+	startupTimeout                    = 45 * time.Second
+	messageEndFallbackDelay           = 1500 * time.Millisecond
+	maxBufferedEventsBeforeSubscriber = 256
 )
 
 type OpenOptions struct {
@@ -101,6 +102,7 @@ func (r *Runtime) OpenSession(ctx context.Context, opts OpenOptions) (agenttypes
 		mode:               strings.TrimSpace(opts.Mode),
 		pending:            make(map[string]chan bridgeResponse),
 		pendingExtensionUI: make(map[string]string),
+		pendingQuestions:   make(map[string]struct{}),
 		turnDone:           make(chan error, 1),
 		closed:             make(chan struct{}),
 	}
@@ -141,23 +143,58 @@ func startPayloadForOptions(opts OpenOptions) map[string]any {
 	return payload
 }
 
+// applyStartResponse mirrors SDK startup metadata into the runtime cache before the first prompt is persisted.
 func (s *session) applyStartResponse(resp bridgeResponse) {
 	if len(resp.Data) == 0 {
 		return
 	}
 	var data struct {
-		SessionID string `json:"sessionId"`
+		SessionID     string          `json:"sessionId"`
+		ThinkingLevel string          `json:"thinkingLevel"`
+		Model         json.RawMessage `json:"model"`
 	}
 	if err := json.Unmarshal(resp.Data, &data); err != nil {
 		return
 	}
-	sessionID := strings.TrimSpace(data.SessionID)
-	if sessionID == "" {
-		return
-	}
 	s.mu.Lock()
-	s.sessionID = sessionID
+	if sessionID := strings.TrimSpace(data.SessionID); sessionID != "" {
+		s.sessionID = sessionID
+	}
+	if thinkingLevel := strings.TrimSpace(data.ThinkingLevel); thinkingLevel != "" {
+		s.mode = thinkingLevel
+	}
+	if model := parseStartResponseModel(data.Model); model != "" {
+		s.model = model
+	}
 	s.mu.Unlock()
+}
+
+// parseStartResponseModel accepts both current object-shaped SDK models and older string-shaped model ids.
+func parseStartResponseModel(raw json.RawMessage) string {
+	if len(raw) == 0 || string(raw) == "null" {
+		return ""
+	}
+	var modelName string
+	if err := json.Unmarshal(raw, &modelName); err == nil {
+		return normalizeModelID(modelName)
+	}
+	var model struct {
+		ID       string `json:"id"`
+		Provider string `json:"provider"`
+	}
+	if err := json.Unmarshal(raw, &model); err != nil {
+		return ""
+	}
+	provider := strings.TrimSpace(model.Provider)
+	id := strings.TrimSpace(model.ID)
+	switch {
+	case provider != "" && id != "":
+		return normalizeModelID(provider + "/" + id)
+	case id != "":
+		return normalizeModelID(id)
+	default:
+		return ""
+	}
 }
 
 func (r *Runtime) Close(agentName string) error {
@@ -215,12 +252,14 @@ type session struct {
 	mu                 sync.RWMutex
 	pending            map[string]chan bridgeResponse
 	pendingExtensionUI map[string]string
+	pendingQuestions   map[string]struct{}
 
 	onUpdate     func(agenttypes.Event)
 	sessionID    string
 	model        string
 	mode         string
 	contextStats agenttypes.ContextWindow
+	eventBacklog []agenttypes.Event
 	seenText     bool
 	seenThinking bool
 	lastTurnErr  string
@@ -518,9 +557,9 @@ func isExtensionUIDialogMethod(method string) bool {
 func (s *session) handleEvent(raw []byte, eventType string) {
 	switch eventType {
 	case "agent_start":
-		s.resetDeltaState()
+		s.resetTurnState()
 	case "message_start":
-		s.resetDeltaState()
+		s.resetMessageDeltaState()
 	case "message_update":
 		s.handleMessageUpdate(raw)
 	case "message_end":
@@ -528,29 +567,40 @@ func (s *session) handleEvent(raw []byte, eventType string) {
 	case "context_window":
 		s.handleContextWindow(raw)
 	case "agent_end":
-		s.handleAgentEnd()
+		s.handleAgentEnd(raw)
 	case "turn_end":
 		s.handleTurnEnd(raw)
+	case "thinking_level_changed", "thinking_level_select":
+		s.handleThinkingLevelChanged(raw)
+	case "model_select":
+		s.handleModelSelect(raw)
 	case "tool_execution_start":
 		s.handleToolExecutionStart(raw)
 	case "tool_execution_update":
 		s.handleToolExecutionUpdate(raw)
 	case "tool_execution_end":
 		s.handleToolExecutionEnd(raw)
-	case "recovery", "auto_retry_start":
+	case "recovery", "auto_retry_start", "auto_retry_end", "compaction_start", "compaction_end":
 		s.handleRecovery(raw)
-	case "queue_update", "turn_start", "session_info_changed", "thinking_level_changed":
+	case "queue_update", "turn_start", "session_info_changed":
 	default:
 		log.Printf("[agent/pi-sdk] stdout.ignored_event session=%s type=%q", s.sessionKey, eventType)
 	}
 }
 
-func (s *session) resetDeltaState() {
+func (s *session) resetTurnState() {
 	s.mu.Lock()
 	s.seenText = false
 	s.seenThinking = false
 	s.lastTurnErr = ""
 	s.turnComplete = false
+	s.mu.Unlock()
+}
+
+func (s *session) resetMessageDeltaState() {
+	s.mu.Lock()
+	s.seenText = false
+	s.seenThinking = false
 	s.mu.Unlock()
 }
 
@@ -692,7 +742,6 @@ func (s *session) handleMessageEnd(raw []byte) {
 		s.contextStats.TotalTokens = total
 		s.mu.Unlock()
 	}
-	s.scheduleMessageEndFallback()
 }
 
 func (s *session) handleContextWindow(raw []byte) {
@@ -730,7 +779,33 @@ func (s *session) handleRecovery(raw []byte) {
 	s.emit(agenttypes.Event{Type: agenttypes.EventTypeRecovery, SessionID: s.SessionID(), Data: agenttypes.RecoveryStatus{Message: message}})
 }
 
-func (s *session) handleAgentEnd() {
+func (s *session) handleAgentEnd(raw []byte) {
+	var ev struct {
+		WillRetry     bool   `json:"willRetry"`
+		PromptDone    *bool  `json:"promptDone"`
+		Terminal      *bool  `json:"terminal"`
+		StopReason    string `json:"stopReason"`
+		ErrorMessage  string `json:"errorMessage"`
+		Error         string `json:"error"`
+		Cancelled     bool   `json:"cancelled"`
+		Canceled      bool   `json:"canceled"`
+		AbortReason   string `json:"abortReason"`
+		FailureReason string `json:"failureReason"`
+	}
+	_ = json.Unmarshal(raw, &ev)
+	if ev.WillRetry {
+		return
+	}
+	if ev.PromptDone != nil && !*ev.PromptDone {
+		return
+	}
+	if ev.Terminal != nil && !*ev.Terminal {
+		return
+	}
+	if message := terminalErrorMessage(ev.StopReason, ev.ErrorMessage, ev.Error, ev.AbortReason, ev.FailureReason, ev.Cancelled, ev.Canceled); message != "" {
+		s.setLastTurnErr(message)
+		s.emit(agenttypes.Event{Type: agenttypes.EventTypeRecovery, SessionID: s.SessionID(), Data: agenttypes.RecoveryStatus{Message: message}})
+	}
 	s.completeTurn()
 }
 
@@ -749,32 +824,77 @@ func (s *session) handleTurnEnd(raw []byte) {
 	if ev.WillRetry {
 		return
 	}
-	message := strings.TrimSpace(ev.ErrorMessage)
+	if message := terminalErrorMessage(ev.StopReason, ev.ErrorMessage, ev.Error, ev.AbortReason, ev.FailureReason, ev.Cancelled, ev.Canceled); message != "" {
+		s.setLastTurnErr(message)
+		s.emit(agenttypes.Event{Type: agenttypes.EventTypeRecovery, SessionID: s.SessionID(), Data: agenttypes.RecoveryStatus{Message: message}})
+	}
+	// Pi SDK turn_end is one model/tool turn, not the whole agent run. Do not
+	// complete MindFS SendMessage here: tool-call turns and compaction/retry can
+	// legitimately continue with another LLM turn before the SDK prompt settles.
+}
+
+func (s *session) handleThinkingLevelChanged(raw []byte) {
+	var ev struct {
+		Level string `json:"level"`
+	}
+	if err := json.Unmarshal(raw, &ev); err != nil {
+		return
+	}
+	if level := strings.TrimSpace(ev.Level); level != "" {
+		s.mu.Lock()
+		s.mode = level
+		s.mu.Unlock()
+	}
+}
+
+func (s *session) handleModelSelect(raw []byte) {
+	var ev struct {
+		Model json.RawMessage `json:"model"`
+	}
+	if err := json.Unmarshal(raw, &ev); err != nil {
+		return
+	}
+	if model := parseStartResponseModel(ev.Model); model != "" {
+		s.mu.Lock()
+		s.model = model
+		s.mu.Unlock()
+	}
+}
+
+func terminalErrorMessage(stopReason, errorMessage, errText, abortReason, failureReason string, cancelled, canceled bool) string {
+	message := strings.TrimSpace(errorMessage)
 	if message == "" {
-		message = strings.TrimSpace(ev.Error)
+		message = strings.TrimSpace(errText)
 	}
 	if message == "" {
-		message = strings.TrimSpace(ev.AbortReason)
+		message = strings.TrimSpace(abortReason)
 	}
 	if message == "" {
-		message = strings.TrimSpace(ev.FailureReason)
+		message = strings.TrimSpace(failureReason)
 	}
-	stopReason := strings.ToLower(strings.TrimSpace(ev.StopReason))
-	if message == "" && (stopReason == "error" || stopReason == "aborted" || stopReason == "cancelled" || ev.Cancelled || ev.Canceled) {
-		message = "pi sdk prompt " + strings.TrimSpace(ev.StopReason)
+	stopReason = strings.TrimSpace(stopReason)
+	lowerStopReason := strings.ToLower(stopReason)
+	if message == "" && (lowerStopReason == "error" || lowerStopReason == "aborted" || lowerStopReason == "cancelled" || cancelled || canceled) {
+		message = "pi sdk prompt " + stopReason
 		if strings.TrimSpace(message) == "pi sdk prompt" {
 			message = "pi sdk prompt aborted"
 		}
 	}
-	if message != "" {
-		s.setLastTurnErr(message)
-		s.emit(agenttypes.Event{Type: agenttypes.EventTypeRecovery, SessionID: s.SessionID(), Data: agenttypes.RecoveryStatus{Message: message}})
-	}
-	s.completeTurn()
+	return message
 }
 
 func (s *session) completeTurn() {
-	if !s.markTurnComplete() {
+	s.completeTurnFor(nil)
+}
+
+func (s *session) completeTurnFor(ch chan error) {
+	completed := false
+	if ch == nil {
+		completed = s.markTurnComplete()
+	} else {
+		completed = s.markTurnCompleteFor(ch)
+	}
+	if !completed {
 		return
 	}
 	contextWindow := s.cachedContextWindow()
@@ -783,10 +903,18 @@ func (s *session) completeTurn() {
 	lastErr := strings.TrimSpace(s.lastTurnErr)
 	s.mu.RUnlock()
 	if lastErr != "" {
-		s.signalTurnDone(errors.New(lastErr))
+		if ch == nil {
+			s.signalTurnDone(errors.New(lastErr))
+		} else {
+			s.signalTurnDoneTo(ch, errors.New(lastErr))
+		}
 		return
 	}
-	s.signalTurnDone(nil)
+	if ch == nil {
+		s.signalTurnDone(nil)
+	} else {
+		s.signalTurnDoneTo(ch, nil)
+	}
 }
 
 func (s *session) markTurnComplete() bool {
@@ -818,13 +946,22 @@ func (s *session) handleToolExecutionStart(raw []byte) {
 	if err := json.Unmarshal(raw, &ev); err != nil {
 		return
 	}
+	kind := inferToolKind(ev.ToolName)
+	if kind == agenttypes.ToolKindAskUser {
+		s.trackPendingQuestion(ev.ToolCallID)
+	}
+	if kind == agenttypes.ToolKindTodo {
+		s.emitTodoUpdateFromArgs(ev.Args)
+	}
 	s.emit(agenttypes.Event{Type: agenttypes.EventTypeToolCall, SessionID: s.SessionID(), Data: agenttypes.ToolCall{
-		CallID:  ev.ToolCallID,
-		Title:   toolTitle(ev.ToolName, ev.Args),
-		Status:  "running",
-		Kind:    inferToolKind(ev.ToolName),
-		RawType: "pi-sdk",
-		Meta:    map[string]any{"input": rawValueString(ev.Args), "rawInput": ev.Args},
+		CallID:    ev.ToolCallID,
+		Title:     toolTitle(ev.ToolName, ev.Args),
+		Status:    "running",
+		Kind:      kind,
+		Content:   inputContentItems(ev.ToolName, ev.Args),
+		Locations: toolLocationsFromArgs(ev.Args),
+		RawType:   "pi-sdk",
+		Meta:      toolCallMeta(ev.ToolCallID, ev.ToolName, ev.Args),
 	}})
 }
 
@@ -838,14 +975,19 @@ func (s *session) handleToolExecutionUpdate(raw []byte) {
 	if err := json.Unmarshal(raw, &ev); err != nil {
 		return
 	}
+	kind := inferToolKind(ev.ToolName)
+	if kind == agenttypes.ToolKindTodo {
+		s.emitTodoUpdateFromArgs(ev.Args)
+	}
 	s.emit(agenttypes.Event{Type: agenttypes.EventTypeToolUpdate, SessionID: s.SessionID(), Data: agenttypes.ToolCall{
-		CallID:  ev.ToolCallID,
-		Title:   toolTitle(ev.ToolName, ev.Args),
-		Status:  "running",
-		Kind:    inferToolKind(ev.ToolName),
-		Content: resultContentItems(ev.PartialResult),
-		RawType: "pi-sdk",
-		Meta:    resultMeta(ev.Args, ev.PartialResult),
+		CallID:    ev.ToolCallID,
+		Title:     toolTitle(ev.ToolName, ev.Args),
+		Status:    "running",
+		Kind:      kind,
+		Content:   toolResultContentItems(ev.ToolName, ev.Args, ev.PartialResult),
+		Locations: mergeToolLocations(toolLocationsFromArgs(ev.Args), resultLocations(ev.PartialResult)),
+		RawType:   "pi-sdk",
+		Meta:      resultMeta(ev.Args, ev.PartialResult),
 	}})
 }
 
@@ -853,6 +995,7 @@ func (s *session) handleToolExecutionEnd(raw []byte) {
 	var ev struct {
 		ToolCallID string          `json:"toolCallId"`
 		ToolName   string          `json:"toolName"`
+		Args       map[string]any  `json:"args"`
 		Result     json.RawMessage `json:"result"`
 		IsError    bool            `json:"isError"`
 	}
@@ -863,15 +1006,99 @@ func (s *session) handleToolExecutionEnd(raw []byte) {
 	if ev.IsError {
 		status = "failed"
 	}
+	kind := inferToolKind(ev.ToolName)
+	if kind == agenttypes.ToolKindAskUser {
+		s.untrackPendingQuestion(ev.ToolCallID)
+	}
+	if kind == agenttypes.ToolKindTodo {
+		s.emitTodoUpdateFromArgs(ev.Args)
+	}
 	s.emit(agenttypes.Event{Type: agenttypes.EventTypeToolUpdate, SessionID: s.SessionID(), Data: agenttypes.ToolCall{
-		CallID:  ev.ToolCallID,
-		Title:   strings.TrimSpace(ev.ToolName),
-		Status:  status,
-		Kind:    inferToolKind(ev.ToolName),
-		Content: resultContentItems(ev.Result),
-		RawType: "pi-sdk",
-		Meta:    resultMeta(nil, ev.Result),
+		CallID:    ev.ToolCallID,
+		Title:     strings.TrimSpace(ev.ToolName),
+		Status:    status,
+		Kind:      kind,
+		Content:   toolResultContentItems(ev.ToolName, ev.Args, ev.Result),
+		Locations: mergeToolLocations(toolLocationsFromArgs(ev.Args), resultLocations(ev.Result)),
+		RawType:   "pi-sdk",
+		Meta:      resultMeta(ev.Args, ev.Result),
 	}})
+}
+
+func (s *session) trackPendingQuestion(callID string) {
+	callID = strings.TrimSpace(callID)
+	if callID == "" {
+		return
+	}
+	s.mu.Lock()
+	if s.pendingQuestions == nil {
+		s.pendingQuestions = make(map[string]struct{})
+	}
+	s.pendingQuestions[callID] = struct{}{}
+	s.mu.Unlock()
+}
+
+func (s *session) untrackPendingQuestion(callID string) {
+	callID = strings.TrimSpace(callID)
+	if callID == "" {
+		return
+	}
+	s.mu.Lock()
+	delete(s.pendingQuestions, callID)
+	s.mu.Unlock()
+}
+
+func (s *session) isPendingQuestion(callID string) bool {
+	callID = strings.TrimSpace(callID)
+	if callID == "" {
+		return false
+	}
+	s.mu.RLock()
+	_, ok := s.pendingQuestions[callID]
+	s.mu.RUnlock()
+	return ok
+}
+
+func (s *session) clearPendingQuestions() {
+	s.mu.Lock()
+	s.pendingQuestions = make(map[string]struct{})
+	s.mu.Unlock()
+}
+
+func (s *session) emitTodoUpdateFromArgs(args map[string]any) {
+	update, ok := todoUpdateFromArgs(args)
+	if !ok {
+		return
+	}
+	s.emit(agenttypes.Event{Type: agenttypes.EventTypeTodoUpdate, SessionID: s.SessionID(), Data: update})
+}
+
+func todoUpdateFromArgs(args map[string]any) (agenttypes.TodoUpdate, bool) {
+	todos, ok := args["todos"].([]any)
+	if !ok || len(todos) == 0 {
+		return agenttypes.TodoUpdate{}, false
+	}
+	items := make([]agenttypes.TodoItem, 0, len(todos))
+	for _, raw := range todos {
+		item, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		content, _ := item["content"].(string)
+		activeForm, _ := item["activeForm"].(string)
+		status, _ := item["status"].(string)
+		content = strings.TrimSpace(content)
+		activeForm = strings.TrimSpace(activeForm)
+		status = strings.TrimSpace(status)
+		if content == "" && activeForm == "" {
+			continue
+		}
+		items = append(items, agenttypes.TodoItem{Content: content, ActiveForm: activeForm, Status: status})
+	}
+	if len(items) == 0 {
+		return agenttypes.TodoUpdate{}, false
+	}
+	return agenttypes.TodoUpdate{Items: items}, true
 }
 
 func (s *session) setLastTurnErr(message string) {
@@ -897,19 +1124,6 @@ func (s *session) signalTurnDoneTo(ch chan error, err error) {
 	}
 }
 
-func (s *session) scheduleMessageEndFallback() {
-	s.turnMu.Lock()
-	ch := s.turnDone
-	s.turnMu.Unlock()
-	go func() {
-		time.Sleep(messageEndFallbackDelay)
-		if s.markTurnCompleteFor(ch) {
-			s.emit(agenttypes.Event{Type: agenttypes.EventTypeMessageDone, SessionID: s.SessionID(), Data: agenttypes.MessageDone{ContextWindow: s.cachedContextWindow()}})
-		}
-		s.signalTurnDoneTo(ch, nil)
-	}()
-}
-
 func (s *session) resetTurnDone() chan error {
 	s.turnMu.Lock()
 	defer s.turnMu.Unlock()
@@ -917,13 +1131,46 @@ func (s *session) resetTurnDone() chan error {
 	return s.turnDone
 }
 
+// emit forwards runtime events to the registered subscriber, buffering startup events until the UI attaches.
 func (s *session) emit(ev agenttypes.Event) {
-	s.mu.RLock()
+	s.mu.Lock()
 	onUpdate := s.onUpdate
-	s.mu.RUnlock()
-	if onUpdate != nil {
-		onUpdate(ev)
+	if onUpdate == nil {
+		s.appendEventBacklogLocked(ev)
+		s.mu.Unlock()
+		return
 	}
+	s.mu.Unlock()
+	onUpdate(ev)
+}
+
+// appendEventBacklogLocked caps pre-subscriber buffering while preserving blocking extension UI requests first.
+func (s *session) appendEventBacklogLocked(ev agenttypes.Event) {
+	if len(s.eventBacklog) < maxBufferedEventsBeforeSubscriber {
+		s.eventBacklog = append(s.eventBacklog, ev)
+		return
+	}
+	newIsBlocking := isBlockingExtensionUIEvent(ev)
+	for idx, old := range s.eventBacklog {
+		if !isBlockingExtensionUIEvent(old) {
+			copy(s.eventBacklog[idx:], s.eventBacklog[idx+1:])
+			s.eventBacklog[len(s.eventBacklog)-1] = ev
+			return
+		}
+	}
+	if newIsBlocking {
+		copy(s.eventBacklog, s.eventBacklog[1:])
+		s.eventBacklog[len(s.eventBacklog)-1] = ev
+	}
+}
+
+// isBlockingExtensionUIEvent reports whether losing the event would leave a pending UI request unanswerable.
+func isBlockingExtensionUIEvent(ev agenttypes.Event) bool {
+	if ev.Type != agenttypes.EventTypeExtensionUI {
+		return false
+	}
+	req, ok := ev.Data.(agenttypes.ExtensionUIRequest)
+	return ok && isExtensionUIDialogMethod(req.Method)
 }
 
 func (s *session) SendMessage(ctx context.Context, content string) error {
@@ -934,7 +1181,7 @@ func (s *session) SendMessage(ctx context.Context, content string) error {
 	turnCtx, turnID := s.turn.Begin(ctx)
 	defer s.turn.End(turnID)
 	turnDone := s.resetTurnDone()
-	s.resetDeltaState()
+	s.resetTurnState()
 	if _, err := s.request(turnCtx, "prompt", map[string]any{"type": "prompt", "message": content}); err != nil {
 		return err
 	}
@@ -955,8 +1202,35 @@ func (s *session) SendMessage(ctx context.Context, content string) error {
 	}
 }
 
-func (s *session) AnswerQuestion(context.Context, agenttypes.AskUserAnswer) error {
-	return errors.New("ask user question is not supported by pi-sdk runtime foundation")
+func (s *session) AnswerQuestion(ctx context.Context, answer agenttypes.AskUserAnswer) error {
+	callID := strings.TrimSpace(answer.ToolUseID)
+	if callID == "" {
+		return errors.New("toolUseId required")
+	}
+	answers := make(map[string]string, len(answer.Answers))
+	for key, value := range answer.Answers {
+		key = strings.TrimSpace(key)
+		value = strings.TrimSpace(value)
+		if key != "" && value != "" {
+			answers[key] = value
+		}
+	}
+	if len(answers) == 0 {
+		return errors.New("answers required")
+	}
+	if !s.isPendingQuestion(callID) {
+		return errors.New("question is not pending: " + callID)
+	}
+	_, err := s.request(withDefaultTimeout(ctx), "answer-question", map[string]any{
+		"type":      "answer_question",
+		"toolUseId": callID,
+		"answers":   answers,
+	})
+	if err != nil {
+		return err
+	}
+	s.untrackPendingQuestion(callID)
+	return nil
 }
 
 func (s *session) AnswerExtensionUI(ctx context.Context, response agenttypes.ExtensionUIResponse) error {
@@ -1118,6 +1392,7 @@ func (s *session) ListCommands(ctx context.Context) (agenttypes.CommandList, err
 }
 
 func (s *session) CancelCurrentTurn() error {
+	s.clearPendingQuestions()
 	abortID := s.nextID("abort")
 	err := s.writeJSON(map[string]any{"type": "abort", "id": abortID})
 	s.turn.Cancel()
@@ -1128,10 +1403,29 @@ func (s *session) CancelCurrentTurn() error {
 	return nil
 }
 
+// OnUpdate registers the session event sink and replays events captured before subscription in order.
 func (s *session) OnUpdate(onUpdate func(agenttypes.Event)) {
-	s.mu.Lock()
-	s.onUpdate = onUpdate
-	s.mu.Unlock()
+	if onUpdate == nil {
+		s.mu.Lock()
+		s.onUpdate = nil
+		s.eventBacklog = nil
+		s.mu.Unlock()
+		return
+	}
+	for {
+		s.mu.Lock()
+		backlog := append([]agenttypes.Event(nil), s.eventBacklog...)
+		s.eventBacklog = nil
+		if len(backlog) == 0 {
+			s.onUpdate = onUpdate
+			s.mu.Unlock()
+			return
+		}
+		s.mu.Unlock()
+		for _, ev := range backlog {
+			onUpdate(ev)
+		}
+	}
 }
 
 func (s *session) SessionID() string {
@@ -1156,12 +1450,9 @@ func (s *session) refreshState(ctx context.Context) error {
 		return err
 	}
 	var data struct {
-		SessionID     string `json:"sessionId"`
-		ThinkingLevel string `json:"thinkingLevel"`
-		Model         *struct {
-			ID       string `json:"id"`
-			Provider string `json:"provider"`
-		} `json:"model"`
+		SessionID     string          `json:"sessionId"`
+		ThinkingLevel string          `json:"thinkingLevel"`
+		Model         json.RawMessage `json:"model"`
 	}
 	if err := json.Unmarshal(resp.Data, &data); err != nil {
 		return err
@@ -1173,10 +1464,8 @@ func (s *session) refreshState(ctx context.Context) error {
 	if strings.TrimSpace(data.ThinkingLevel) != "" {
 		s.mode = strings.TrimSpace(data.ThinkingLevel)
 	}
-	if data.Model != nil {
-		if id := normalizeModelID(data.Model.Provider + "/" + data.Model.ID); strings.Trim(id, "/") != "" {
-			s.model = id
-		}
+	if model := parseStartResponseModel(data.Model); model != "" {
+		s.model = model
 	}
 	s.mu.Unlock()
 	return nil
@@ -1212,14 +1501,16 @@ func inferToolKind(name string) agenttypes.ToolKind {
 	switch strings.ToLower(strings.TrimSpace(name)) {
 	case "read", "read_file", "grep", "find", "ls":
 		return agenttypes.ToolKindRead
-	case "edit", "write", "write_file":
+	case "edit", "multiedit", "multi_edit", "write", "write_file":
 		return agenttypes.ToolKindEdit
 	case "bash", "shell", "run_command":
 		return agenttypes.ToolKindExecute
 	case "web_search", "search_web":
 		return agenttypes.ToolKindWebSearch
-	case "ask_user_question":
+	case "ask_user_question", "askuserquestion":
 		return agenttypes.ToolKindAskUser
+	case "todowrite", "todo_write", "todos":
+		return agenttypes.ToolKindTodo
 	default:
 		return agenttypes.ToolKindOther
 	}
@@ -1230,10 +1521,171 @@ func toolTitle(name string, args map[string]any) string {
 	if cmd, ok := args["command"].(string); ok && strings.TrimSpace(cmd) != "" {
 		return name + ": " + strings.TrimSpace(cmd)
 	}
-	if path, ok := args["path"].(string); ok && strings.TrimSpace(path) != "" {
-		return name + ": " + filepath.Base(strings.TrimSpace(path))
+	if path := pathFromArgs(args); path != "" {
+		return name + ": " + filepath.Base(path)
+	}
+	if pattern, ok := args["pattern"].(string); ok && strings.TrimSpace(pattern) != "" {
+		return name + ": " + strings.TrimSpace(pattern)
+	}
+	if query, ok := args["query"].(string); ok && strings.TrimSpace(query) != "" {
+		return name + ": " + strings.TrimSpace(query)
 	}
 	return name
+}
+
+func inputContentItems(name string, args map[string]any) []agenttypes.ToolCallContentItem {
+	path := pathFromArgs(args)
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "edit", "multiedit", "multi_edit":
+		return editInputContentItems(path, args)
+	case "write", "write_file":
+		if content, ok := args["content"].(string); ok && content != "" {
+			return []agenttypes.ToolCallContentItem{{Type: "text", Text: content, Path: path, ChangeKind: "add"}}
+		}
+	case "todowrite", "todo_write", "todos":
+		if text := todoInputText(args); text != "" {
+			return []agenttypes.ToolCallContentItem{{Type: "text", Text: text}}
+		}
+	case "ask_user_question", "askuserquestion":
+		if text := askUserInputText(args); text != "" {
+			return []agenttypes.ToolCallContentItem{{Type: "text", Text: text}}
+		}
+	}
+	return nil
+}
+
+func editInputContentItems(path string, args map[string]any) []agenttypes.ToolCallContentItem {
+	var items []agenttypes.ToolCallContentItem
+	appendEdit := func(oldText, newText string) {
+		if oldText == "" && newText == "" {
+			return
+		}
+		old := oldText
+		items = append(items, agenttypes.ToolCallContentItem{Type: "diff", Path: path, OldText: &old, NewText: newText})
+	}
+	if edits, ok := args["edits"].([]any); ok {
+		for _, raw := range edits {
+			edit, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			oldText, _ := edit["oldText"].(string)
+			newText, _ := edit["newText"].(string)
+			appendEdit(oldText, newText)
+		}
+	}
+	if len(items) == 0 {
+		oldText, _ := args["oldText"].(string)
+		newText, _ := args["newText"].(string)
+		appendEdit(oldText, newText)
+	}
+	return items
+}
+
+func todoInputText(args map[string]any) string {
+	todos, ok := args["todos"].([]any)
+	if !ok || len(todos) == 0 {
+		return ""
+	}
+	lines := make([]string, 0, len(todos))
+	for _, raw := range todos {
+		item, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		content, _ := item["content"].(string)
+		activeForm, _ := item["activeForm"].(string)
+		status, _ := item["status"].(string)
+		label := strings.TrimSpace(content)
+		if strings.TrimSpace(activeForm) != "" && strings.EqualFold(strings.TrimSpace(status), "in_progress") {
+			label = strings.TrimSpace(activeForm)
+		}
+		if label == "" {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(status), "completed") {
+			lines = append(lines, "- [x] "+label)
+		} else {
+			lines = append(lines, "- [ ] "+label)
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+func askUserInputText(args map[string]any) string {
+	questions, ok := args["questions"].([]any)
+	if !ok || len(questions) == 0 {
+		return ""
+	}
+	sections := make([]string, 0, len(questions))
+	for idx, raw := range questions {
+		question, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		var lines []string
+		if header, _ := question["header"].(string); strings.TrimSpace(header) != "" {
+			lines = append(lines, fmt.Sprintf("**Q%d · %s**", idx+1, strings.TrimSpace(header)))
+		} else {
+			lines = append(lines, fmt.Sprintf("**Q%d**", idx+1))
+		}
+		if text, _ := question["question"].(string); strings.TrimSpace(text) != "" {
+			lines = append(lines, strings.TrimSpace(text))
+		}
+		if multi, _ := question["multiSelect"].(bool); multi {
+			lines = append(lines, "_Multiple selection allowed._")
+		}
+		if options, ok := question["options"].([]any); ok {
+			for _, rawOption := range options {
+				option, ok := rawOption.(map[string]any)
+				if !ok {
+					continue
+				}
+				label, _ := option["label"].(string)
+				label = strings.TrimSpace(label)
+				if label == "" {
+					continue
+				}
+				description, _ := option["description"].(string)
+				if strings.TrimSpace(description) != "" {
+					lines = append(lines, fmt.Sprintf("- **%s**: %s", label, strings.TrimSpace(description)))
+				} else {
+					lines = append(lines, "- "+label)
+				}
+			}
+		}
+		if len(lines) > 0 {
+			sections = append(sections, strings.Join(lines, "\n"))
+		}
+	}
+	return strings.Join(sections, "\n\n")
+}
+
+func toolResultContentItems(name string, args map[string]any, raw json.RawMessage) []agenttypes.ToolCallContentItem {
+	resultItems := resultContentItems(raw)
+	if inferToolKind(name) != agenttypes.ToolKindEdit {
+		return resultItems
+	}
+	inputItems := inputContentItems(name, args)
+	if len(inputItems) == 0 || hasStructuredChangeContent(resultItems) {
+		return resultItems
+	}
+	if len(resultItems) == 0 {
+		return inputItems
+	}
+	items := make([]agenttypes.ToolCallContentItem, 0, len(inputItems)+len(resultItems))
+	items = append(items, inputItems...)
+	items = append(items, resultItems...)
+	return items
+}
+
+func hasStructuredChangeContent(items []agenttypes.ToolCallContentItem) bool {
+	for _, item := range items {
+		if item.Type == "diff" || strings.TrimSpace(item.ChangeKind) != "" || isUnifiedDiffText(item.Text) {
+			return true
+		}
+	}
+	return false
 }
 
 func resultContentItems(raw json.RawMessage) []agenttypes.ToolCallContentItem {
@@ -1245,9 +1697,20 @@ func resultContentItems(raw json.RawMessage) []agenttypes.ToolCallContentItem {
 			Type string `json:"type"`
 			Text string `json:"text"`
 		} `json:"content"`
+		Details struct {
+			Patch string `json:"patch"`
+			Diff  string `json:"diff"`
+		} `json:"details"`
 	}
-	if err := json.Unmarshal(raw, &result); err == nil && len(result.Content) > 0 {
-		items := make([]agenttypes.ToolCallContentItem, 0, len(result.Content))
+	items := make([]agenttypes.ToolCallContentItem, 0, len(result.Content)+1)
+	if err := json.Unmarshal(raw, &result); err == nil {
+		diffText := result.Details.Patch
+		if strings.TrimSpace(diffText) == "" && strings.TrimSpace(result.Details.Diff) != "" {
+			diffText = result.Details.Diff
+		}
+		if strings.TrimSpace(diffText) != "" {
+			items = append(items, agenttypes.ToolCallContentItem{Type: "text", Text: diffText, Path: firstPatchPath(diffText)})
+		}
 		for _, item := range result.Content {
 			if strings.TrimSpace(item.Text) != "" {
 				items = append(items, agenttypes.ToolCallContentItem{Type: "text", Text: item.Text})
@@ -1262,6 +1725,151 @@ func resultContentItems(raw json.RawMessage) []agenttypes.ToolCallContentItem {
 		return nil
 	}
 	return []agenttypes.ToolCallContentItem{{Type: "text", Text: text}}
+}
+
+func isUnifiedDiffText(text string) bool {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return false
+	}
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "diff --git ") || strings.HasPrefix(line, "--- ") || strings.HasPrefix(line, "+++ ") || strings.HasPrefix(line, "@@ ") {
+			return true
+		}
+	}
+	return false
+}
+
+func resultLocations(raw json.RawMessage) []agenttypes.ToolCallLocation {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	var result struct {
+		Details struct {
+			Patch string `json:"patch"`
+		} `json:"details"`
+	}
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return nil
+	}
+	paths := patchPaths(result.Details.Patch)
+	locations := make([]agenttypes.ToolCallLocation, 0, len(paths))
+	for _, path := range paths {
+		locations = append(locations, agenttypes.ToolCallLocation{Path: path})
+	}
+	return locations
+}
+
+func toolLocationsFromArgs(args map[string]any) []agenttypes.ToolCallLocation {
+	path := pathFromArgs(args)
+	if path == "" {
+		return nil
+	}
+	return []agenttypes.ToolCallLocation{{Path: path}}
+}
+
+func pathFromArgs(args map[string]any) string {
+	if len(args) == 0 {
+		return ""
+	}
+	for _, key := range []string{"path", "file_path", "filePath"} {
+		path, ok := args[key].(string)
+		if ok && strings.TrimSpace(path) != "" {
+			return strings.TrimSpace(path)
+		}
+	}
+	return ""
+}
+
+func mergeToolLocations(groups ...[]agenttypes.ToolCallLocation) []agenttypes.ToolCallLocation {
+	seen := make(map[string]struct{})
+	var merged []agenttypes.ToolCallLocation
+	for _, group := range groups {
+		for _, loc := range group {
+			path := strings.TrimSpace(loc.Path)
+			if path == "" {
+				continue
+			}
+			if _, ok := seen[path]; ok {
+				continue
+			}
+			seen[path] = struct{}{}
+			loc.Path = path
+			merged = append(merged, loc)
+		}
+	}
+	return merged
+}
+
+func firstPatchPath(patch string) string {
+	paths := patchPaths(patch)
+	if len(paths) == 0 {
+		return ""
+	}
+	return paths[0]
+}
+
+func patchPaths(patch string) []string {
+	var paths []string
+	seen := make(map[string]struct{})
+	for _, line := range strings.Split(patch, "\n") {
+		path := ""
+		switch {
+		case strings.HasPrefix(line, "+++ "):
+			path = strings.TrimSpace(strings.TrimPrefix(line, "+++ "))
+		case strings.HasPrefix(line, "diff --git "):
+			fields := strings.Fields(line)
+			if len(fields) >= 4 {
+				path = fields[3]
+			}
+		}
+		path = cleanPatchPath(path)
+		if path == "" {
+			continue
+		}
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
+		paths = append(paths, path)
+	}
+	return paths
+}
+
+func cleanPatchPath(path string) string {
+	path = strings.TrimSpace(path)
+	if beforeTab, _, ok := strings.Cut(path, "\t"); ok {
+		path = strings.TrimSpace(beforeTab)
+	}
+	path = strings.Trim(path, "\"'")
+	if path == "" || path == "/dev/null" {
+		return ""
+	}
+	path = strings.TrimPrefix(path, "a/")
+	path = strings.TrimPrefix(path, "b/")
+	return strings.TrimSpace(path)
+}
+
+func toolCallMeta(callID, name string, args map[string]any) map[string]any {
+	meta := map[string]any{
+		"input":    rawValueString(args),
+		"rawInput": args,
+	}
+	switch inferToolKind(name) {
+	case agenttypes.ToolKindAskUser:
+		if strings.TrimSpace(callID) != "" {
+			meta["toolUseId"] = strings.TrimSpace(callID)
+		}
+		if questions, ok := args["questions"].([]any); ok {
+			meta["questions"] = questions
+		}
+	case agenttypes.ToolKindTodo:
+		if todos, ok := args["todos"].([]any); ok {
+			meta["todos"] = todos
+		}
+	}
+	return meta
 }
 
 func resultMeta(input map[string]any, raw json.RawMessage) map[string]any {

@@ -308,6 +308,13 @@ type PendingSend = {
   tempKey?: string;
 };
 type SessionQueueItem = QueuedUserMessage;
+type RunningSessionTurn = {
+  rootId: string;
+  sessionKey: string;
+  requestId?: string;
+  startedAt: number;
+  lastEventAt: number;
+};
 type ViewerSelection = {
   filePath: string;
   text?: string;
@@ -1030,6 +1037,7 @@ export function App({ onGoHome }: AppProps) {
   const queuedMessagesBySessionRef = useRef<Record<string, SessionQueueItem[]>>({});
   const queueFrozenBySessionRef = useRef<Record<string, boolean>>({});
   const optimisticDequeuedIdsRef = useRef<Record<string, Set<string>>>({});
+  const runningTurnBySessionRef = useRef<Record<string, RunningSessionTurn>>({});
   const cancelRequestedBySessionRef = useRef<Record<string, boolean>>({});
   const sessionCacheRef = useRef<Record<string, Session>>({});
   const loadedSessionRef = useRef<Record<string, boolean>>({});
@@ -1815,14 +1823,17 @@ export function App({ onGoHome }: AppProps) {
       const exchanges = Array.isArray((cached as any)?.exchanges)
         ? ((cached as any).exchanges as Exchange[]) || []
         : fallbackExchanges;
+      const hasRunningTurn = !!runningTurnBySessionRef.current[ck];
       const pending =
-        drawerSession?.key === key
-          ? !!(drawerSession as any)?.pending
-          : typeof (session as any)?.pending === "boolean"
-            ? !!(session as any).pending
-            : typeof (cached as any)?.pending === "boolean"
-              ? !!(cached as any).pending
-              : undefined;
+        hasRunningTurn
+          ? true
+          : drawerSession?.key === key
+            ? !!(drawerSession as any)?.pending
+            : typeof (session as any)?.pending === "boolean"
+              ? !!(session as any).pending
+              : typeof (cached as any)?.pending === "boolean"
+                ? !!(cached as any).pending
+                : undefined;
       return {
         ...(session as any),
         ...(cached as any),
@@ -1862,6 +1873,9 @@ export function App({ onGoHome }: AppProps) {
         return !!fallback;
       }
       const cacheKey = rootSessionKey(resolvedRoot, resolvedKey);
+      if (runningTurnBySessionRef.current[cacheKey]) {
+        return true;
+      }
       if (pendingBySessionRef.current[cacheKey]) {
         return true;
       }
@@ -1917,8 +1931,48 @@ export function App({ onGoHome }: AppProps) {
       }
       return (
         !!serverPending ||
+        !!runningTurnBySessionRef.current[rootSessionKey(resolvedRoot, resolvedKey)] ||
         !!pendingBySessionRef.current[rootSessionKey(resolvedRoot, resolvedKey)]
       );
+    },
+    [rootSessionKey],
+  );
+
+  const markSessionTurnRunning = useCallback(
+    (
+      rootID: string | null | undefined,
+      sessionKey: string | null | undefined,
+      requestId?: string,
+    ) => {
+      const resolvedRoot = String(rootID || "");
+      const resolvedKey = String(sessionKey || "");
+      if (!resolvedRoot || !resolvedKey || resolvedKey.startsWith("pending-")) {
+        return;
+      }
+      const cacheKey = rootSessionKey(resolvedRoot, resolvedKey);
+      const now = Date.now();
+      const previous = runningTurnBySessionRef.current[cacheKey];
+      runningTurnBySessionRef.current[cacheKey] = {
+        rootId: resolvedRoot,
+        sessionKey: resolvedKey,
+        requestId: requestId || previous?.requestId,
+        startedAt: previous?.startedAt || now,
+        lastEventAt: now,
+      };
+    },
+    [rootSessionKey],
+  );
+
+  const forgetSessionTurnRunning = useCallback(
+    (rootID: string | null | undefined, sessionKey: string | null | undefined) => {
+      const resolvedRoot = String(rootID || "");
+      const resolvedKey = String(sessionKey || "");
+      if (!resolvedRoot || !resolvedKey || resolvedKey.startsWith("pending-")) {
+        return;
+      }
+      delete runningTurnBySessionRef.current[
+        rootSessionKey(resolvedRoot, resolvedKey)
+      ];
     },
     [rootSessionKey],
   );
@@ -1945,6 +1999,7 @@ export function App({ onGoHome }: AppProps) {
         } as T;
       };
       const cacheKey = rootSessionKey(resolvedRoot, resolvedKey);
+      delete runningTurnBySessionRef.current[cacheKey];
       delete pendingBySessionRef.current[cacheKey];
 
       const cached = sessionCacheRef.current[cacheKey];
@@ -2615,12 +2670,24 @@ export function App({ onGoHome }: AppProps) {
       const mergeToolCall = (existing: any, incoming: any) => {
         const merged = { ...(existing || {}), ...incoming };
         const incomingMeta = (incoming?.meta || {}) as Record<string, unknown>;
+        const existingContent = ((existing?.content || []) as any[]).filter(Boolean);
+        const incomingContent = ((incoming?.content || []) as any[]).filter(Boolean);
+        const isDiffLikeToolText = (text: unknown): boolean => {
+          const value = typeof text === "string" ? text.trim() : "";
+          return /^(diff --git|index |--- |\+\+\+ |@@ )/m.test(value);
+        };
+        const hasStructuredChangeContent = (items: any[]): boolean =>
+          items.some((item) =>
+            item?.type === "diff" ||
+            (typeof item?.changeKind === "string" && item.changeKind.trim() !== "") ||
+            isDiffLikeToolText(item?.text),
+          );
         const isUserShellStream =
           incomingMeta.source === "userShell" && incomingMeta.phase === "stream";
         if (isUserShellStream) {
           const mergedContent = [
-            ...((existing?.content || []) as any[]),
-            ...((incoming?.content || []) as any[]),
+            ...existingContent,
+            ...incomingContent,
           ];
           const totalText = mergedContent.map((item) => item?.text || "").join("");
           if (totalText.length > 256 * 1024) {
@@ -2629,6 +2696,10 @@ export function App({ onGoHome }: AppProps) {
             merged.content = mergedContent;
           }
           merged.meta = { ...(existing?.meta || {}), ...incomingMeta };
+        } else if (hasStructuredChangeContent(existingContent) && !hasStructuredChangeContent(incomingContent)) {
+          merged.content = incomingContent.length > 0
+            ? [...existingContent, ...incomingContent]
+            : existingContent;
         }
         if (!incoming.kind && existing?.kind) merged.kind = existing.kind;
         if (!incoming.title && existing?.title) merged.title = existing.title;
@@ -3564,6 +3635,7 @@ export function App({ onGoHome }: AppProps) {
         delete loadedSessionRef.current[cacheKey];
         delete loadingSessionRef.current[cacheKey];
         delete pendingBySessionRef.current[cacheKey];
+        delete runningTurnBySessionRef.current[cacheKey];
         delete cancelRequestedBySessionRef.current[cacheKey];
         staleSessionKeysRef.current.delete(cacheKey);
         void deleteCachedSession(rootID, deletedKey);
@@ -4227,6 +4299,7 @@ export function App({ onGoHome }: AppProps) {
       if (sendSessionKey && !isQueueSend) {
         pendingBySessionRef.current[rootSessionKey(activeRoot, sendSessionKey)] =
           pendingRequestRef.current[requestId];
+        markSessionTurnRunning(activeRoot, sendSessionKey, requestId);
         const ck = rootSessionKey(activeRoot, sendSessionKey);
         const cached =
           sessionCacheRef.current[ck] || ({ ...(session as any) } as Session);
@@ -4356,6 +4429,7 @@ export function App({ onGoHome }: AppProps) {
         delete pendingBySessionRef.current[
           rootSessionKey(activeRoot, failedSessionKey)
         ];
+        forgetSessionTurnRunning(activeRoot, failedSessionKey);
         setSelectedPendingByKey(failedSessionKey, false);
         const latest = drawerSessionByRootRef.current[activeRoot];
         if (latest && latest.key === failedSessionKey) {
@@ -4374,6 +4448,8 @@ export function App({ onGoHome }: AppProps) {
       setBoundSessionForRoot,
       setDrawerOpenForRoot,
       setDrawerSessionForRoot,
+      markSessionTurnRunning,
+      forgetSessionTurnRunning,
       updateSessionAgentForKey,
       pendingPlanMode,
     ],
@@ -6301,6 +6377,8 @@ export function App({ onGoHome }: AppProps) {
       }
       const cacheKey = rootSessionKey(resolvedRoot, resolvedKey);
       const pending = pendingBySessionRef.current[cacheKey];
+      const hasLocalRunningTurn =
+        !!pending || !!runningTurnBySessionRef.current[cacheKey];
       const pendingAt = pending?.timestamp ? Date.parse(pending.timestamp) : Number.NaN;
       const pendingAge = Number.isFinite(pendingAt)
         ? Date.now() - pendingAt
@@ -6308,7 +6386,8 @@ export function App({ onGoHome }: AppProps) {
       candidates.set(cacheKey, {
         rootID: resolvedRoot,
         sessionKey: resolvedKey,
-        canClear: !pending || pendingAge >= PENDING_RECONCILE_MIN_AGE_MS,
+        canClear:
+          !hasLocalRunningTurn && pendingAge >= PENDING_RECONCILE_MIN_AGE_MS,
       });
     };
 
@@ -6552,6 +6631,7 @@ export function App({ onGoHome }: AppProps) {
     ) => {
       const cacheKey = rootSessionKey(rootID, sessionKey);
       const pending = pendingBySessionRef.current[cacheKey];
+      const runningTurn = runningTurnBySessionRef.current[cacheKey];
       if (requestId && pending?.requestId && pending.requestId !== requestId) {
         console.info("[session/stream] ignore_stale_done", {
           rootId: rootID,
@@ -6561,10 +6641,24 @@ export function App({ onGoHome }: AppProps) {
         });
         return;
       }
+      if (
+        requestId &&
+        runningTurn?.requestId &&
+        runningTurn.requestId !== requestId
+      ) {
+        console.info("[session/stream] ignore_stale_running_done", {
+          rootId: rootID,
+          sessionKey,
+          requestId,
+          runningRequestId: runningTurn.requestId,
+        });
+        return;
+      }
       const wasCanceled = !!cancelRequestedBySessionRef.current[cacheKey];
       if (wasCanceled) {
         delete cancelRequestedBySessionRef.current[cacheKey];
       }
+      forgetSessionTurnRunning(rootID, sessionKey);
       const queued = queuedMessagesBySessionRef.current[cacheKey] || [];
       const queueFrozen = !!queueFrozenBySessionRef.current[cacheKey];
       const hiddenQueued = optimisticDequeuedIdsRef.current[cacheKey];
@@ -6685,6 +6779,9 @@ export function App({ onGoHome }: AppProps) {
       }
       const event = payload.event;
       if (!event?.type) return;
+      if (event.type !== "error") {
+        markSessionTurnRunning(activeRoot, streamKey, pending?.requestId);
+      }
       const markStreamPending = () => {
         if (event.type === "message_done" || event.type === "error") return;
         markSessionPending(activeRoot, streamKey);
@@ -6839,7 +6936,6 @@ export function App({ onGoHome }: AppProps) {
             event.data?.contextWindow,
           );
           playCompletionSound();
-          handleSessionStreamDone(activeRoot, streamKey);
           break;
         case "error": {
           const errorRequestId =
@@ -7175,6 +7271,11 @@ export function App({ onGoHome }: AppProps) {
           };
           const acceptedTargetKey = pending.sessionKey || acceptedSessionKey;
           if (acceptedTargetKey) {
+            markSessionTurnRunning(
+              pending.rootId,
+              acceptedTargetKey,
+              pending.requestId,
+            );
             const cacheKey = rootSessionKey(pending.rootId, acceptedTargetKey);
             const accepted = markAccepted(sessionCacheRef.current[cacheKey]);
             if (accepted) {
@@ -7566,8 +7667,10 @@ export function App({ onGoHome }: AppProps) {
     appendToolCallForSession,
     appendTodoUpdateForSession,
     clearLocalPendingForSession,
+    forgetSessionTurnRunning,
     clearSessionStale,
     markSessionPending,
+    markSessionTurnRunning,
     markSessionStale,
     resolvePendingForSession,
     setSelectedPendingByKey,

@@ -108,6 +108,19 @@ func TestBundledAgentsJSONPiUsesPiSDK(t *testing.T) {
 	}
 }
 
+func TestExternalSessionImporterSupportsPiSDKProtocol(t *testing.T) {
+	importer, err := NewExternalSessionImporter(Definition{Name: "pi", Protocol: ProtocolPiSDK})
+	if err != nil {
+		t.Fatalf("NewExternalSessionImporter(pi-sdk) error = %v", err)
+	}
+	if importer == nil {
+		t.Fatalf("NewExternalSessionImporter(pi-sdk) returned nil")
+	}
+	if got := importer.AgentName(); got != "pi" {
+		t.Fatalf("importer.AgentName() = %q, want pi", got)
+	}
+}
+
 func TestPoolRoutesPiSDKProtocol(t *testing.T) {
 	cfg := Config{Agents: []Definition{{
 		Name:     "pi-sdk-test",

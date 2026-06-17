@@ -881,6 +881,7 @@ func (h *WSHandler) startNextQueuedSessionMessage(rootID, key string) {
 		ClientCtx:   item.ClientCtx,
 		Queued:      true,
 	})
+
 }
 
 func (h *WSHandler) handleSessionReady(clientID string, req WSRequest) {
@@ -937,8 +938,8 @@ func (h *WSHandler) handleSessionCancel(ctx context.Context, conn *websocket.Con
 	h.sendWSCancelled(conn, clientID, req.ID, rootID, key)
 	if h.AppContext != nil {
 		streamHub := h.AppContext.GetSessionStreamHub()
-		streamHub.ClearSessionPending(key)
 		streamHub.BroadcastSessionDone(rootID, key, req.ID)
+		streamHub.ClearSessionPending(key)
 	}
 }
 

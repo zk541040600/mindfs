@@ -1,0 +1,36 @@
+name: mindfs
+
+services:
+    mindfs:
+        container_name: mindfs
+        build:
+            context: .
+        image: mindfs:local
+        restart: always
+        stdin_open: true
+        tty: true
+        network_mode: "host"
+        volumes:
+            - /root/.local/bin/mindfs:/root/.local/bin/mindfs:ro
+            - /root/.local/bin/mindfs.real:/root/.local/bin/mindfs.real:ro
+            - /root/.local/share/mindfs:/root/.local/share/mindfs
+            - /root:/root
+            - /home/devuser/work:/home/devuser/work
+            - /etc/localtime:/etc/localtime
+        working_dir: /root
+        entrypoint: /root/mindfs/mindfs
+        command:
+            - "-foreground"
+            - "-addr"
+            - "10.23.50.137:7331"
+        environment:
+            HOME: /root
+            TMPDIR: /tmp
+            PATH: /root/.local/go1.25/bin:/root/.cargo/bin:/root/.pi/agent/bin:/root/node-v22.22.0-linux-x64/bin:/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/mysql/bin:/root/bin:/usr/local/go/bin
+            MINDFS_STATIC_DIR: /root/mindfs/web/dist
+        healthcheck:
+            test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/10.23.50.137/7331; printf '\''GET /health HTTP/1.0\\r\\n\\r\\n'\'' >&3; grep -q 200 <&3'"]
+            interval: 10s
+            timeout: 3s
+            retries: 6
+            start_period: 5s

@@ -154,10 +154,29 @@ const chatBlurPlaceholders = [
 const MOBILE_BREAKPOINT = 768;
 const IME_ENTER_GUARD_MS = 120;
 const CANDIDATE_FETCH_DEBOUNCE_MS = 512;
+const PI_GPT_DEFAULT_MODE = "xhigh";
 
-function getAgentDefaults(agent?: AgentStatus | null) {
+function agentSupportsMode(agent: AgentStatus | null | undefined, mode: string) {
+  return (agent?.modes ?? []).some((item) => item.id === mode);
+}
+
+function isPiGPTModel(agent: AgentStatus | null | undefined, modelID: string) {
+  if (agent?.name !== "pi") {
+    return false;
+  }
+  const selectedModel = (agent.models ?? []).find((item) => item.id === modelID);
+  return `${modelID} ${selectedModel?.name || ""}`.toLowerCase().includes("gpt");
+}
+
+function getAgentDefaults(agent?: AgentStatus | null, selectedModelID?: string) {
+  const model = selectedModelID || agent?.default_model_id || agent?.current_model_id || "";
+  const mode =
+    isPiGPTModel(agent, model) && agentSupportsMode(agent, PI_GPT_DEFAULT_MODE)
+      ? PI_GPT_DEFAULT_MODE
+      : agent?.current_mode_id || "";
   return {
-    model: agent?.default_model_id || agent?.current_model_id || "",
+    model,
+    mode,
     effort: agent?.default_effort || "",
     fastService: (agent?.default_fast_service || "") as "" | "on" | "off",
   } as const;
@@ -539,7 +558,7 @@ export function ActionBar({
     const defaults = getAgentDefaults(preferred);
     setAgent(preferred.name);
     setModel(defaults.model);
-    setAgentMode("");
+    setAgentMode(defaults.mode);
     setEffort(defaults.effort);
     setFastService(defaults.fastService);
   }, [agent, agents, currentSession]);
@@ -571,6 +590,7 @@ export function ActionBar({
       return;
     }
     setModel(defaults.model);
+    setAgentMode(defaults.mode);
     setEffort(defaults.effort);
     setFastService(defaults.fastService);
   }, [agent, agents, currentSession, model]);
@@ -1010,7 +1030,7 @@ export function ActionBar({
     const defaults = getAgentDefaults(nextAgent);
     setAgent(nextAgent.name);
     setModel(defaults.model);
-    setAgentMode("");
+    setAgentMode(defaults.mode);
     setEffort(defaults.effort);
     setFastService(defaults.fastService);
     syncedSessionSignatureRef.current = "";
@@ -1558,10 +1578,10 @@ export function ActionBar({
                   agents={agents}
                   onAgentChange={(nextAgent, nextModel) => {
                     const nextStatus = agents.find((item) => item.name === nextAgent);
-                    const defaults = getAgentDefaults(nextStatus);
+                    const defaults = getAgentDefaults(nextStatus, nextModel);
                     setAgent(nextAgent);
-                    setModel(nextModel || defaults.model);
-                    setAgentMode("");
+                    setModel(defaults.model);
+                    setAgentMode(defaults.mode);
                     setEffort(defaults.effort);
                     setFastService(defaults.fastService);
                   }}

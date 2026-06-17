@@ -1,0 +1,3620 @@
+diff --git a/server/internal/agent/importers.go b/server/internal/agent/importers.go
+index f8ff3c4..35e267b 100644
+--- a/server/internal/agent/importers.go
++++ b/server/internal/agent/importers.go
+@@ -31,7 +31,7 @@ func NewExternalSessionImporter(def Definition) (agenttypes.ExternalSessionImpor
+ 		return codex.NewImporter(codex.ImporterOptions{
+ 			AgentName: agentName,
+ 		}), nil
+-	case ProtocolPiRPC:
++	case ProtocolPiRPC, ProtocolPiSDK:
+ 		return pi.NewImporter(pi.ImporterOptions{
+ 			AgentName: agentName,
+ 		}), nil
+diff --git a/server/internal/agent/pi_sdk_bridge/README.md b/server/internal/agent/pi_sdk_bridge/README.md
+index ba4091b..98c6392 100644
+--- a/server/internal/agent/pi_sdk_bridge/README.md
++++ b/server/internal/agent/pi_sdk_bridge/README.md
+@@ -99,7 +99,7 @@ The web UI adds a Pi-only confirmation gate and labels the footer action as `安
+ Loads Pi SDK resources through `DefaultResourceLoader` and reports safe metadata only:
+ 
+ - SDK availability/version,
+-- support flags for sessions, fork/clone/import, extension UI, resources, steer/follow-up, and compaction,
++- support flags for sessions, import, extension UI, resources, steer/follow-up, compaction, active tools, queue modes, retry controls, and deterministic runtime-replacement smoke coverage,
+ - skills, prompts, extensions, themes, and context file paths/counts,
+ - slash command metadata from extension registrations, prompt templates, and skills,
+ - model counts and safe model metadata.
+@@ -150,7 +150,7 @@ printf '%s\n' \
+   | node server/internal/agent/pi_sdk_bridge/probe.mjs jsonl
+ ```
+ 
+-It emits deterministic `extension_ui_request` events for UI contract mapping.
++It emits deterministic `extension_ui_request` events for UI contract mapping. Runtime-control requests also cover Pi SDK queueing and controls such as `steer`, `follow_up`, `compact`, `get_active_tools`, `get_all_tools`, `set_active_tools`, `set_queue_modes`, `set_auto_compaction`, `set_auto_retry`, `abort_compaction`, and `abort_retry`.
+ 
+ ## Operational notes
+ 
+diff --git a/server/internal/agent/pi_sdk_bridge/probe.mjs b/server/internal/agent/pi_sdk_bridge/probe.mjs
+index 29d411b..de86cb8 100755
+--- a/server/internal/agent/pi_sdk_bridge/probe.mjs
++++ b/server/internal/agent/pi_sdk_bridge/probe.mjs
+@@ -36,6 +36,28 @@ const DEFAULT_IMPORT_MAX_MESSAGES = 200;
+ const DEFAULT_IMPORT_MAX_BYTES = 256 * 1024;
+ const SDK_PROMPT_IDLE_POLL_MS = 250;
+ const SDK_PROMPT_IDLE_FALLBACK_MS = 1500;
++const SDK_PROMPT_HARD_IDLE_TIMEOUT_MS = 120000;
++const SDK_JSONL_EOF_PROMPT_GRACE_MS = 120000;
++
++const protocolStdoutWrite = process.stdout.write.bind(process.stdout);
++const protocolStderrWrite = process.stderr.write.bind(process.stderr);
++let protocolStdoutWriteDepth = 0;
++
++function writeProtocolStdout(text) {
++  protocolStdoutWriteDepth += 1;
++  try {
++    return protocolStdoutWrite(text);
++  } finally {
++    protocolStdoutWriteDepth -= 1;
++  }
++}
++
++process.stdout.write = (chunk, encoding, callback) => {
++  if (protocolStdoutWriteDepth > 0) {
++    return protocolStdoutWrite(chunk, encoding, callback);
++  }
++  return protocolStderrWrite(chunk, encoding, callback);
++};
+ 
+ for (const method of ["log", "info", "warn", "error", "debug"]) {
+   console[method] = (...args) => process.stderr.write(`${args.map(String).join(" ")}\n`);
+@@ -91,7 +113,9 @@ async function loadPiSDK() {
+   const errors = [];
+   for (const candidate of candidates) {
+     try {
+-      return await import(toImportSpecifier(candidate));
++      const sdk = await import(toImportSpecifier(candidate));
++      await takeOverPiStdout(candidate);
++      return sdk;
+     } catch (error) {
+       errors.push(`${candidate}: ${error?.message || String(error)}`);
+     }
+@@ -104,6 +128,22 @@ async function loadPiSDK() {
+   );
+ }
+ 
++async function takeOverPiStdout(candidate) {
++  const candidatePath = String(candidate || "");
++  const marker = "/dist/index.js";
++  const markerIndex = candidatePath.endsWith(marker) ? candidatePath.length - marker.length : -1;
++  if (markerIndex < 0) {
++    return;
++  }
++  try {
++    const guardPath = join(candidatePath.slice(0, markerIndex), "dist", "core", "output-guard.js");
++    const guard = await import(pathToFileURL(guardPath).href);
++    guard.takeOverStdout?.();
++  } catch {
++    // Older SDK builds may not expose the guard; keep the bridge-level stdout isolation above.
++  }
++}
++
+ function addCandidate(candidates, value) {
+   const candidate = String(value || "").trim();
+   if (!candidate || candidates.includes(candidate)) {
+@@ -239,11 +279,11 @@ function readValue(argv, index, flag) {
+ }
+ 
+ function printJson(value) {
+-  process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
++  writeProtocolStdout(`${JSON.stringify(value, null, 2)}\n`);
+ }
+ 
+ function writeJsonl(value) {
+-  process.stdout.write(`${JSON.stringify(value)}\n`);
++  writeProtocolStdout(`${JSON.stringify(value)}\n`);
+ }
+ 
+ function successResponse(command, data, id = undefined) {
+@@ -371,12 +411,18 @@ function buildSupports() {
+     followUp: true,
+     extensionUI: true,
+     sessions: true,
+-    fork: true,
+-    clone: true,
++    // Fork/clone are validated by runtime-replacement-smoke but are not yet
++    // product controls exposed through the production JSONL runtime.
++    fork: false,
++    clone: false,
+     importJsonl: true,
+     compact: true,
++    activeTools: true,
++    queueModes: true,
++    retryControls: true,
+     resources: true,
+     deterministicHarness: true,
++    runtimeReplacementSmoke: true,
+   };
+ }
+ 
+@@ -1125,6 +1171,27 @@ async function bindProbeExtensions(session, uiContext, errors) {
+ async function runJsonl(argv) {
+   const baseOptions = parseArgs(argv);
+   let runtime;
++  let eofExitTimer;
++  const scheduleEofExit = () => {
++    if (!process.stdin.readableEnded && !process.stdin.destroyed) {
++      return;
++    }
++    if (eofExitTimer) {
++      clearTimeout(eofExitTimer);
++    }
++    const startedAt = Date.now();
++    const attemptExit = () => {
++      if (runtime?.isPromptActive?.() && Date.now() - startedAt < SDK_JSONL_EOF_PROMPT_GRACE_MS) {
++        eofExitTimer = setTimeout(attemptExit, 500);
++        eofExitTimer.unref?.();
++        return;
++      }
++      void runtime?.dispose?.();
++      process.exit(0);
++    };
++    eofExitTimer = setTimeout(attemptExit, 500);
++    eofExitTimer.unref?.();
++  };
+   try {
+     for await (const rawLine of createInterface({ input: process.stdin, crlfDelay: Infinity })) {
+       const line = rawLine.trim();
+@@ -1147,7 +1214,26 @@ async function runJsonl(argv) {
+         } else if (request.type === "start_sdk_runtime") {
+           await runtime?.dispose?.();
+           runtime = await createJsonlSDKRuntime({ ...baseOptions, cwd: resolve(request.cwd ?? baseOptions.cwd), agentDir: resolve(request.agentDir ?? baseOptions.agentDir), model: request.model, mode: request.mode, sessionId: request.sessionId });
+-          writeJsonl({ id: request.id, type: "response", command: "start_sdk_runtime", success: true, data: { cwd: runtime.cwd, agentDir: runtime.agentDir, sessionDir: runtime.sessionDir, sessionId: runtime.sessionId, sessionFile: runtime.sessionFile, resumed: runtime.resumed } });
++          writeJsonl({
++            id: request.id,
++            type: "response",
++            command: "start_sdk_runtime",
++            success: true,
++            data: {
++              cwd: runtime.cwd,
++              agentDir: runtime.agentDir,
++              sessionDir: runtime.sessionDir,
++              sessionId: runtime.sessionId,
++              sessionFile: runtime.sessionFile,
++              resumed: runtime.resumed,
++              model: runtime.model,
++              thinkingLevel: runtime.thinkingLevel,
++              extensionsReady: runtime.extensionsReady,
++              extensionsFailed: runtime.extensionsFailed,
++              extensionErrorCount: runtime.extensionErrors.length,
++              extensionErrors: runtime.extensionErrors,
++            },
++          });
+         } else if (request.type === "prompt") {
+           if (!runtime) {
+             throw new ProbeError("E_STATE", "runtime must be started before prompt");
+@@ -1172,9 +1258,14 @@ async function runJsonl(argv) {
+       } catch (error) {
+         writeJsonl(errorResponse(request.type ?? "jsonl", error, request.id));
+       }
++      scheduleEofExit();
+     }
+   } finally {
++    if (eofExitTimer) {
++      clearTimeout(eofExitTimer);
++    }
+     await runtime?.dispose?.();
++    process.exit(0);
+   }
+ }
+ 
+@@ -1185,6 +1276,19 @@ async function dispatchJsonlRuntimeControl(runtime, request) {
+     set_model: "setModel",
+     set_thinking_level: "setThinkingLevel",
+     get_commands: "getCommands",
++    steer: "steer",
++    follow_up: "followUp",
++    followup: "followUp",
++    compact: "compact",
++    abort_compaction: "abortCompaction",
++    get_active_tools: "getActiveTools",
++    get_all_tools: "getAllTools",
++    set_active_tools: "setActiveTools",
++    set_queue_modes: "setQueueModes",
++    set_auto_compaction: "setAutoCompaction",
++    set_auto_retry: "setAutoRetry",
++    abort_retry: "abortRetry",
++    answer_question: "answerQuestion",
+     abort: "abort",
+   };
+   const method = handlers[request.type];
+@@ -1214,6 +1318,21 @@ function createJsonlTestRuntime(scenario) {
+   if (scenario === "tool-events") {
+     return createJsonlToolRuntime();
+   }
++  if (scenario === "ask-user-todo") {
++    return createJsonlAskUserTodoRuntime();
++  }
++  if (scenario === "tool-multi-turn") {
++    return createJsonlToolMultiTurnRuntime();
++  }
++  if (scenario === "text-then-delayed-tool") {
++    return createJsonlTextThenDelayedToolRuntime();
++  }
++  if (scenario === "agent-end-retry") {
++    return createJsonlAgentEndRetryRuntime();
++  }
++  if (scenario === "prompt-done-after-agent-end") {
++    return createJsonlPromptDoneAfterAgentEndRuntime();
++  }
+   if (scenario === "turn-end-only") {
+     return createJsonlTurnEndOnlyRuntime();
+   }
+@@ -1229,6 +1348,10 @@ function createJsonlTestRuntime(scenario) {
+   throw new ProbeError("E_PARAM", `unsupported test runtime scenario: ${scenario}`);
+ }
+ 
++function delay(ms) {
++  return new Promise((resolve) => setTimeout(resolve, ms));
++}
++
+ function createJsonlUIRuntime() {
+   const runtime = {
+     kind: "extension-ui",
+@@ -1338,6 +1461,118 @@ function createJsonlMessageEndOnlyRuntime() {
+   };
+ }
+ 
++function createJsonlAskUserTodoRuntime() {
++  const runtime = {
++    kind: "ask-user-todo",
++    pendingQuestions: new Map(),
++    prompt: async function (request) {
++      const message = String(request.message ?? "").trim();
++      if (!message) {
++        throw new ProbeError("E_PARAM", "prompt message required");
++      }
++      writeJsonl(successResponse("prompt", { scenario: "ask-user-todo" }, request.id));
++      writeJsonl({ type: "agent_start" });
++      writeJsonl({
++        type: "tool_execution_start",
++        toolCallId: "todo-1",
++        toolName: "todo_write",
++        args: {
++          todos: [
++            { content: "Audit Pi SDK bridge", activeForm: "Auditing Pi SDK bridge", status: "in_progress" },
++            { content: "Wire ask user", activeForm: "Wiring ask user", status: "pending" },
++          ],
++        },
++      });
++      writeJsonl({
++        type: "tool_execution_end",
++        toolCallId: "todo-1",
++        toolName: "todo_write",
++        args: {
++          todos: [
++            { content: "Audit Pi SDK bridge", activeForm: "Auditing Pi SDK bridge", status: "completed" },
++            { content: "Wire ask user", activeForm: "Wiring ask user", status: "in_progress" },
++          ],
++        },
++        result: { content: [{ type: "text", text: "Todos updated" }] },
++        isError: false,
++      });
++      writeJsonl({
++        type: "tool_execution_start",
++        toolCallId: "ask-1",
++        toolName: "ask_user_question",
++        args: {
++          questions: [
++            {
++              question: "Which bridge route should MindFS use?",
++              header: "Route",
++              multiSelect: false,
++              options: [
++                { label: "SDK bridge", description: "Use Pi SDK runtime" },
++                { label: "RPC fallback", description: "Use legacy RPC runtime" },
++              ],
++            },
++          ],
++        },
++      });
++      runtime.pendingQuestions.set("ask-1", { promptId: request.id });
++    },
++    answerQuestion: async function (request) {
++      const toolUseId = String(request.toolUseId ?? "").trim();
++      const pending = runtime.pendingQuestions.get(toolUseId);
++      if (!pending) {
++        throw new ProbeError("E_PARAM", `unknown ask user question id: ${toolUseId || request.toolUseId}`);
++      }
++      runtime.pendingQuestions.delete(toolUseId);
++      const answers = request.answers && typeof request.answers === "object" ? request.answers : {};
++      const answerText = Object.values(answers).map((value) => String(value)).filter(Boolean).join(", ");
++      writeJsonl(successResponse("answer_question", { toolUseId, remaining: runtime.pendingQuestions.size }, request.id));
++      writeJsonl({
++        type: "tool_execution_end",
++        toolCallId: toolUseId,
++        toolName: "ask_user_question",
++        args: {
++          questions: [
++            {
++              question: "Which bridge route should MindFS use?",
++              header: "Route",
++              multiSelect: false,
++              options: [
++                { label: "SDK bridge", description: "Use Pi SDK runtime" },
++                { label: "RPC fallback", description: "Use legacy RPC runtime" },
++              ],
++            },
++          ],
++        },
++        result: { content: [{ type: "text", text: `Answer received: ${answerText}` }], details: { answers } },
++        isError: false,
++      });
++      writeJsonl({
++        type: "message_update",
++        message: { role: "assistant", content: [{ type: "text", text: `answer received: ${answerText}` }] },
++        assistantMessageEvent: { type: "text_delta", delta: `answer received: ${answerText}` },
++      });
++      writeJsonl({
++        type: "message_end",
++        message: {
++          role: "assistant",
++          stopReason: "end_turn",
++          content: [{ type: "text", text: `answer received: ${answerText}` }],
++          usage: { input: 4, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 9 },
++        },
++      });
++      writeJsonl({ type: "context_window", totalTokens: 9, modelContextWindow: 100 });
++      writeJsonl({ type: "agent_end", willRetry: false });
++    },
++    answerExtensionUI: async function (request) {
++      throw new ProbeError("E_PARAM", `unknown extension UI request id: ${request.id}`);
++    },
++    dispose: async function () {
++      runtime.pendingQuestions.clear();
++    },
++  };
++  return runtime;
++}
++
+ function createJsonlToolRuntime() {
+   return {
+     kind: "tool-events",
+@@ -1382,6 +1617,203 @@ function createJsonlToolRuntime() {
+   };
+ }
+ 
++function createJsonlToolMultiTurnRuntime() {
++  return {
++    kind: "tool-multi-turn",
++    prompt: async function (request) {
++      const message = String(request.message ?? "").trim();
++      if (!message) {
++        throw new ProbeError("E_PARAM", "prompt message required");
++      }
++      writeJsonl(successResponse("prompt", { scenario: "tool-multi-turn" }, request.id));
++      writeJsonl({ type: "agent_start" });
++      writeJsonl({ type: "message_start", message: { role: "assistant", content: [] } });
++      writeJsonl({
++        type: "message_end",
++        message: {
++          role: "assistant",
++          stopReason: "end_turn",
++          content: [{ type: "toolCall", id: "tool-1", name: "ls", arguments: { path: "." } }],
++          usage: { input: 2, output: 1, totalTokens: 3 },
++        },
++      });
++      writeJsonl({ type: "tool_execution_start", toolCallId: "tool-1", toolName: "ls", args: { path: "." } });
++      writeJsonl({
++        type: "tool_execution_end",
++        toolCallId: "tool-1",
++        toolName: "ls",
++        result: { content: [{ type: "text", text: "README.md" }] },
++        isError: false,
++      });
++      writeJsonl({ type: "turn_end", stopReason: "end_turn", willRetry: false });
++      await delay(SDK_PROMPT_IDLE_FALLBACK_MS + 200);
++      writeJsonl({ type: "turn_start" });
++      writeJsonl({ type: "message_start", message: { role: "assistant", content: [] } });
++      writeJsonl({
++        type: "message_update",
++        message: { role: "assistant", content: [{ type: "text", text: `final answer after tool: ${message}` }] },
++        assistantMessageEvent: { type: "text_delta", delta: `final answer after tool: ${message}` },
++      });
++      writeJsonl({
++        type: "message_end",
++        message: {
++          role: "assistant",
++          stopReason: "end_turn",
++          content: [{ type: "text", text: `final answer after tool: ${message}` }],
++          usage: { input: 4, output: 5, totalTokens: 9 },
++        },
++      });
++      writeJsonl({ type: "context_window", totalTokens: 9, modelContextWindow: 100 });
++      writeJsonl({ type: "agent_end", willRetry: false });
++    },
++    answerExtensionUI: async function (request) {
++      throw new ProbeError("E_PARAM", `unknown extension UI request id: ${request.id}`);
++    },
++    dispose: async function () {},
++  };
++}
++
++function createJsonlTextThenDelayedToolRuntime() {
++  return {
++    kind: "text-then-delayed-tool",
++    prompt: async function (request) {
++      const message = String(request.message ?? "").trim();
++      if (!message) {
++        throw new ProbeError("E_PARAM", "prompt message required");
++      }
++      writeJsonl(successResponse("prompt", { scenario: "text-then-delayed-tool" }, request.id));
++      writeJsonl({ type: "agent_start" });
++      writeJsonl({ type: "message_start", message: { role: "assistant", content: [] } });
++      writeJsonl({
++        type: "message_update",
++        message: { role: "assistant", content: [{ type: "text", text: `preparing tool: ${message}` }] },
++        assistantMessageEvent: { type: "text_delta", delta: `preparing tool: ${message}` },
++      });
++      writeJsonl({
++        type: "message_end",
++        message: {
++          role: "assistant",
++          stopReason: "end_turn",
++          content: [{ type: "text", text: `preparing tool: ${message}` }],
++          usage: { input: 2, output: 2, totalTokens: 4 },
++        },
++      });
++      await delay(SDK_PROMPT_IDLE_FALLBACK_MS + 750);
++      writeJsonl({ type: "tool_execution_start", toolCallId: "tool-1", toolName: "execute bash", args: { command: "pwd" } });
++      writeJsonl({
++        type: "tool_execution_end",
++        toolCallId: "tool-1",
++        toolName: "execute bash",
++        result: { content: [{ type: "text", text: "/root/mindfs" }] },
++        isError: false,
++      });
++      writeJsonl({ type: "turn_end", stopReason: "end_turn", willRetry: false });
++      writeJsonl({ type: "message_start", message: { role: "assistant", content: [] } });
++      writeJsonl({
++        type: "message_update",
++        message: { role: "assistant", content: [{ type: "text", text: `delayed tool complete: ${message}` }] },
++        assistantMessageEvent: { type: "text_delta", delta: `delayed tool complete: ${message}` },
++      });
++      writeJsonl({
++        type: "message_end",
++        message: {
++          role: "assistant",
++          stopReason: "end_turn",
++          content: [{ type: "text", text: `delayed tool complete: ${message}` }],
++          usage: { input: 3, output: 5, totalTokens: 8 },
++        },
++      });
++      writeJsonl({ type: "context_window", totalTokens: 8, modelContextWindow: 100 });
++      writeJsonl({ type: "agent_end", willRetry: false });
++    },
++    answerExtensionUI: async function (request) {
++      throw new ProbeError("E_PARAM", `unknown extension UI request id: ${request.id}`);
++    },
++    dispose: async function () {},
++  };
++}
++
++function createJsonlAgentEndRetryRuntime() {
++  return {
++    kind: "agent-end-retry",
++    prompt: async function (request) {
++      const message = String(request.message ?? "").trim();
++      if (!message) {
++        throw new ProbeError("E_PARAM", "prompt message required");
++      }
++      writeJsonl(successResponse("prompt", { scenario: "agent-end-retry" }, request.id));
++      writeJsonl({ type: "agent_start" });
++      writeJsonl({ type: "agent_end", willRetry: true });
++      await delay(100);
++      writeJsonl({ type: "message_start", message: { role: "assistant", content: [] } });
++      writeJsonl({
++        type: "message_update",
++        message: { role: "assistant", content: [{ type: "text", text: `retry finished: ${message}` }] },
++        assistantMessageEvent: { type: "text_delta", delta: `retry finished: ${message}` },
++      });
++      writeJsonl({
++        type: "message_end",
++        message: {
++          role: "assistant",
++          stopReason: "end_turn",
++          content: [{ type: "text", text: `retry finished: ${message}` }],
++          usage: { input: 1, output: 2, totalTokens: 3 },
++        },
++      });
++      writeJsonl({ type: "agent_end", willRetry: false });
++    },
++    answerExtensionUI: async function (request) {
++      throw new ProbeError("E_PARAM", `unknown extension UI request id: ${request.id}`);
++    },
++    dispose: async function () {},
++  };
++}
++
++function createJsonlPromptDoneAfterAgentEndRuntime() {
++  return {
++    kind: "prompt-done-after-agent-end",
++    prompt: async function (request) {
++      const message = String(request.message ?? "").trim();
++      if (!message) {
++        throw new ProbeError("E_PARAM", "prompt message required");
++      }
++      writeJsonl(successResponse("prompt", { scenario: "prompt-done-after-agent-end" }, request.id));
++      writeJsonl({ type: "agent_start" });
++      writeJsonl({ type: "message_start", message: { role: "assistant", content: [] } });
++      writeJsonl({
++        type: "message_update",
++        message: { role: "assistant", content: [{ type: "text", text: `answer before compaction: ${message}` }] },
++        assistantMessageEvent: { type: "text_delta", delta: `answer before compaction: ${message}` },
++      });
++      writeJsonl({
++        type: "message_end",
++        message: {
++          role: "assistant",
++          stopReason: "end_turn",
++          content: [{ type: "text", text: `answer before compaction: ${message}` }],
++          usage: { input: 80, output: 20, totalTokens: 100 },
++        },
++      });
++      writeJsonl({ type: "agent_end", willRetry: false, promptDone: false });
++      writeJsonl({ type: "compaction_start", reason: "threshold" });
++      await delay(SDK_PROMPT_IDLE_FALLBACK_MS + 200);
++      writeJsonl({
++        type: "compaction_end",
++        reason: "threshold",
++        result: { summary: "summary", firstKeptEntryId: "entry-1", tokensBefore: 100 },
++        aborted: false,
++        willRetry: false,
++      });
++      writeJsonl({ type: "context_window", totalTokens: 40, modelContextWindow: 100 });
++      writeJsonl({ type: "agent_end", willRetry: false, promptDone: true, synthetic: true, reason: "sdk_prompt_resolved" });
++    },
++    answerExtensionUI: async function (request) {
++      throw new ProbeError("E_PARAM", `unknown extension UI request id: ${request.id}`);
++    },
++    dispose: async function () {},
++  };
++}
++
+ function createJsonlTurnEndOnlyRuntime() {
+   return {
+     kind: "turn-end-only",
+@@ -1449,12 +1881,32 @@ function createJsonlControlsRuntime() {
+     { id: "model", name: "Fake Model", provider: "fake", reasoning: true, thinkingLevelMap: { off: "off", high: "high" } },
+     { id: "plain", name: "Plain Model", provider: "fake", reasoning: false },
+   ];
++  const allTools = [
++    { name: "read", description: "Read a file", parameters: { type: "object" }, promptGuidelines: ["Read before edit"], sourceInfo: { source: "builtin", scope: "test" } },
++    { name: "edit", description: "Edit a file", parameters: { type: "object" }, promptGuidelines: [], sourceInfo: { source: "builtin", scope: "test" } },
++  ];
+   const state = {
+     sessionId: "sdk-test",
+     model: { provider: "fake", id: "model" },
+     thinkingLevel: "off",
+     isStreaming: false,
++    steering: [],
++    followUp: [],
++    steeringMode: "all",
++    followUpMode: "all",
++    activeTools: ["read"],
++    autoCompactionEnabled: true,
++    autoRetryEnabled: true,
++    compactCount: 0,
++    abortCompactionCount: 0,
++    abortRetryCount: 0,
+   };
++  const emitQueueUpdate = () => writeJsonl({ type: "queue_update", steering: state.steering, followUp: state.followUp });
++  const deterministicQueueState = () => ({
++    pendingMessageCount: state.steering.length + state.followUp.length,
++    steering: [...state.steering],
++    followUp: [...state.followUp],
++  });
+   return {
+     kind: "runtime-controls",
+     prompt: async function (request) {
+@@ -1486,7 +1938,7 @@ function createJsonlControlsRuntime() {
+       writeJsonl({ type: "agent_end", willRetry: false });
+     },
+     getState: async function (request) {
+-      writeJsonl(successResponse("get_state", state, request.id));
++      writeJsonl(successResponse("get_state", { ...state, pendingMessageCount: state.steering.length + state.followUp.length }, request.id));
+     },
+     getAvailableModels: async function (request) {
+       writeJsonl(successResponse("get_available_models", { models }, request.id));
+@@ -1510,6 +1962,57 @@ function createJsonlControlsRuntime() {
+     getCommands: async function (request) {
+       writeJsonl(successResponse("get_commands", { commands: [] }, request.id));
+     },
++    steer: async function (request) {
++      state.steering.push(jsonlRequestText(request, "steer"));
++      emitQueueUpdate();
++      writeJsonl(successResponse("steer", deterministicQueueState(), request.id));
++    },
++    followUp: async function (request) {
++      state.followUp.push(jsonlRequestText(request, "follow_up"));
++      emitQueueUpdate();
++      writeJsonl(successResponse("follow_up", deterministicQueueState(), request.id));
++    },
++    compact: async function (request) {
++      state.compactCount += 1;
++      writeJsonl({ type: "compaction_start", reason: request.reason || "manual" });
++      writeJsonl({ type: "compaction_end", reason: request.reason || "manual", aborted: false, willRetry: false, result: { summary: "deterministic compaction" } });
++      writeJsonl(successResponse("compact", { compactCount: state.compactCount }, request.id));
++    },
++    abortCompaction: async function (request) {
++      state.abortCompactionCount += 1;
++      writeJsonl(successResponse("abort_compaction", { abortCompactionCount: state.abortCompactionCount }, request.id));
++    },
++    getActiveTools: async function (request) {
++      writeJsonl(successResponse("get_active_tools", { toolNames: [...state.activeTools] }, request.id));
++    },
++    getAllTools: async function (request) {
++      writeJsonl(successResponse("get_all_tools", { tools: allTools.map(sanitizeToolInfo) }, request.id));
++    },
++    setActiveTools: async function (request) {
++      state.activeTools = jsonlStringArray(request.toolNames ?? request.tools, "toolNames");
++      writeJsonl(successResponse("set_active_tools", { toolNames: [...state.activeTools] }, request.id));
++    },
++    setQueueModes: async function (request) {
++      if (request.steeringMode !== undefined) {
++        state.steeringMode = normalizeQueueMode(request.steeringMode, "steeringMode");
++      }
++      if (request.followUpMode !== undefined) {
++        state.followUpMode = normalizeQueueMode(request.followUpMode, "followUpMode");
++      }
++      writeJsonl(successResponse("set_queue_modes", { steeringMode: state.steeringMode, followUpMode: state.followUpMode }, request.id));
++    },
++    setAutoCompaction: async function (request) {
++      state.autoCompactionEnabled = jsonlBoolean(request.enabled, "enabled");
++      writeJsonl(successResponse("set_auto_compaction", { enabled: state.autoCompactionEnabled }, request.id));
++    },
++    setAutoRetry: async function (request) {
++      state.autoRetryEnabled = jsonlBoolean(request.enabled, "enabled");
++      writeJsonl(successResponse("set_auto_retry", { enabled: state.autoRetryEnabled }, request.id));
++    },
++    abortRetry: async function (request) {
++      state.abortRetryCount += 1;
++      writeJsonl(successResponse("abort_retry", { abortRetryCount: state.abortRetryCount }, request.id));
++    },
+     abort: async function (request) {
+       state.isStreaming = false;
+       writeJsonl(successResponse("abort", { aborted: true }, request.id));
+@@ -1550,6 +2053,7 @@ function createJsonlAbortHangsRuntime() {
+     },
+     abort: async function () {
+       writeJsonl({ type: "turn_end", stopReason: "aborted", willRetry: false });
++      writeJsonl({ type: "agent_end", stopReason: "aborted", willRetry: false });
+     },
+     answerExtensionUI: async function (request) {
+       throw new ProbeError("E_PARAM", `unknown extension UI request id: ${request.id}`);
+@@ -1558,6 +2062,219 @@ function createJsonlAbortHangsRuntime() {
+   };
+ }
+ 
++function createMindFSAskUserQuestionTool(pendingQuestions) {
++  return {
++    name: "ask_user_question",
++    label: "Ask User Question",
++    description: "Ask the MindFS user one or more structured questions and wait for their answer. Use this only when local evidence is exhausted or a product decision is required.",
++    promptSnippet: "Ask the user a structured question and wait for an answer",
++    executionMode: "sequential",
++    parameters: {
++      type: "object",
++      properties: {
++        questions: {
++          type: "array",
++          minItems: 1,
++          items: {
++            type: "object",
++            properties: {
++              question: { type: "string" },
++              header: { type: "string" },
++              multiSelect: { type: "boolean" },
++              options: {
++                type: "array",
++                items: {
++                  type: "object",
++                  properties: {
++                    label: { type: "string" },
++                    description: { type: "string" },
++                  },
++                  required: ["label"],
++                  additionalProperties: true,
++                },
++              },
++            },
++            required: ["question"],
++            additionalProperties: true,
++          },
++        },
++      },
++      required: ["questions"],
++      additionalProperties: true,
++    },
++    async execute(toolCallId, params, signal) {
++      const questions = Array.isArray(params?.questions) ? params.questions : [];
++      if (questions.length === 0) {
++        return {
++          content: [{ type: "text", text: "Error: questions required" }],
++          details: { cancelled: true, error: "questions required" },
++        };
++      }
++      return new Promise((resolve, reject) => {
++        const cleanup = () => {
++          pendingQuestions.delete(toolCallId);
++          signal?.removeEventListener?.("abort", onAbort);
++        };
++        const onAbort = () => {
++          cleanup();
++          reject(new Error("Ask user question aborted"));
++        };
++        pendingQuestions.set(toolCallId, {
++          questions,
++          resolve: (answers) => {
++            cleanup();
++            resolve({
++              content: [{ type: "text", text: formatAskUserAnswerResult(answers) }],
++              details: { questions, answers },
++            });
++          },
++          reject: (error) => {
++            cleanup();
++            reject(error);
++          },
++        });
++        if (signal?.aborted) {
++          onAbort();
++          return;
++        }
++        signal?.addEventListener?.("abort", onAbort, { once: true });
++      });
++    },
++  };
++}
++
++function normalizeAnswerMap(value) {
++  const answers = {};
++  if (!value || typeof value !== "object" || Array.isArray(value)) {
++    return answers;
++  }
++  for (const [key, rawValue] of Object.entries(value)) {
++    const normalizedKey = String(key ?? "").trim();
++    const normalizedValue = String(rawValue ?? "").trim();
++    if (normalizedKey && normalizedValue) {
++      answers[normalizedKey] = normalizedValue;
++    }
++  }
++  return answers;
++}
++
++function formatAskUserAnswerResult(answers) {
++  const values = Object.entries(answers ?? {})
++    .map(([key, value]) => `${key}: ${value}`)
++    .filter(Boolean);
++  return values.length > 0 ? `User answered:\n${values.join("\n")}` : "User answered.";
++}
++
++function jsonlRequestText(request, command) {
++  const text = String(request.message ?? request.content ?? request.text ?? "").trim();
++  if (!text) {
++    throw new ProbeError("E_PARAM", `${command} message required`);
++  }
++  return text;
++}
++
++function jsonlStringArray(value, fieldName) {
++  const source = Array.isArray(value) ? value : [];
++  const items = source.map((item) => String(item ?? "").trim()).filter(Boolean);
++  if (items.length === 0) {
++    throw new ProbeError("E_PARAM", `${fieldName} required`);
++  }
++  return items;
++}
++
++function jsonlBoolean(value, fieldName) {
++  if (typeof value === "boolean") {
++    return value;
++  }
++  if (typeof value === "string") {
++    const normalized = value.trim().toLowerCase();
++    if (normalized === "true") {
++      return true;
++    }
++    if (normalized === "false") {
++      return false;
++    }
++  }
++  throw new ProbeError("E_PARAM", `${fieldName} boolean required`);
++}
++
++function queueState(session) {
++  return {
++    pendingMessageCount: Number(session?.pendingMessageCount ?? 0) || 0,
++    steering: Array.from(session?.getSteeringMessages?.() ?? []),
++    followUp: Array.from(session?.getFollowUpMessages?.() ?? []),
++  };
++}
++
++function sanitizeToolInfo(tool) {
++  return {
++    name: tool?.name,
++    description: tool?.description,
++    parameters: tool?.parameters,
++    promptGuidelines: tool?.promptGuidelines,
++    sourceInfo: sanitizeSourceInfo(tool?.sourceInfo),
++  };
++}
++
++function sanitizeCompactionResult(result) {
++  if (!result || typeof result !== "object") {
++    return result;
++  }
++  return {
++    ...result,
++    summary: result.summary === undefined ? undefined : preview(String(result.summary), 4000),
++    details: result.details === undefined ? undefined : result.details,
++  };
++}
++
++function normalizeQueueMode(value, fieldName) {
++  const mode = String(value ?? "").trim();
++  if (mode === "all" || mode === "one-at-a-time") {
++    return mode;
++  }
++  throw new ProbeError("E_PARAM", `${fieldName} must be all or one-at-a-time`);
++}
++
++function installExtensionEventForwarding(session) {
++  const runner = session.extensionRunner;
++  if (!runner) {
++    return () => {};
++  }
++  const originalEmit = typeof runner.emit === "function" ? runner.emit.bind(runner) : undefined;
++  if (originalEmit) {
++    runner.emit = async (event) => {
++      if (event?.type === "model_select" || event?.type === "thinking_level_select") {
++        writeJsonl(sanitizeExtensionEvent(event));
++      }
++      return originalEmit(event);
++    };
++  }
++  return () => {
++    if (originalEmit) {
++      runner.emit = originalEmit;
++    }
++  };
++}
++
++function sanitizeExtensionEvent(event) {
++  if (event?.type === "model_select") {
++    return {
++      type: event.type,
++      model: sanitizeModel(event.model),
++      previousModel: sanitizeModel(event.previousModel),
++      source: event.source,
++    };
++  }
++  if (event?.type === "thinking_level_select") {
++    return {
++      type: event.type,
++      level: event.level,
++      previousLevel: event.previousLevel,
++    };
++  }
++  return event;
++}
++
+ async function createJsonlSDKRuntime(options) {
+   const cwd = options.cwd ?? DEFAULT_CWD;
+   const agentDir = options.agentDir ?? DEFAULT_AGENT_DIR;
+@@ -1568,15 +2285,32 @@ async function createJsonlSDKRuntime(options) {
+     agentDir,
+   });
+   const model = resolveJsonlModel(services.modelRegistry, options.model);
++  const pendingQuestions = new Map();
+   const { session } = await createAgentSessionFromServices({
+     services,
+     sessionManager: sessionState.sessionManager,
+     model,
+     thinkingLevel,
++    customTools: [createMindFSAskUserQuestionTool(pendingQuestions)],
+   });
++  const restoreExtensionForwarding = installExtensionEventForwarding(session);
+   const pendingUI = new Map();
+   const extensionErrors = [];
+-  await bindProbeExtensions(session, createJsonlBridgeUI(pendingUI), extensionErrors);
++  let bindingsSettled = false;
++  let bindingsFailed = false;
++  const bindingsReady = bindProbeExtensions(session, createJsonlBridgeUI(pendingUI), extensionErrors)
++    .then(() => {
++      bindingsSettled = true;
++    })
++    .catch((error) => {
++      bindingsSettled = true;
++      bindingsFailed = true;
++      extensionErrors.push(error);
++      writeJsonl({
++        type: "recovery",
++        message: `Pi SDK extension binding failed: ${error instanceof Error ? error.message : String(error)}`,
++      });
++    });
+   let activePrompt = undefined;
+   const clearPromptWatchdog = (state) => {
+     if (state?.timer) {
+@@ -1596,52 +2330,42 @@ async function createJsonlSDKRuntime(options) {
+     }
+     return [];
+   };
+-  const latestAssistantAfter = (state) => {
+-    const messages = messagesForSession();
+-    for (let index = messages.length - 1; index >= Math.max(0, state.baselineMessageCount); index--) {
+-      if (messages[index]?.role === "assistant") {
+-        return messages[index];
+-      }
+-    }
+-    return undefined;
+-  };
+-  const writePromptTerminalFallback = (state, reason) => {
+-    if (!state || state.done) {
+-      return false;
+-    }
+-    const assistant = latestAssistantAfter(state);
+-    if (!state.sawAssistantActivity && !assistant) {
+-      return false;
+-    }
+-    if (!state.seenMessageEnd && assistant) {
+-      writeJsonl({ type: "message_end", message: assistant, synthetic: true, reason });
+-      state.seenMessageEnd = true;
+-    }
+-    writeJsonl(contextWindowEnvelope(session));
+-    writeJsonl({ type: "agent_end", willRetry: false, synthetic: true, reason });
+-    state.done = true;
+-    state.seenAgentEnd = true;
+-    clearPromptWatchdog(state);
+-    return true;
+-  };
+   const startPromptWatchdog = (state) => {
+     state.timer = setInterval(() => {
+-      if (state.done || state.seenAgentEnd) {
++      if (state.done) {
+         clearPromptWatchdog(state);
+         return;
+       }
+-      const elapsed = Date.now() - state.startedAt;
++      const elapsed = Date.now() - (state.lastActivityAt ?? state.startedAt);
+       if (elapsed < SDK_PROMPT_IDLE_FALLBACK_MS) {
+         return;
+       }
+-      if (session.isStreaming === false) {
+-        writePromptTerminalFallback(state, "sdk_idle_without_terminal_event");
++      if (session.isRetrying === true || session.isCompacting === true || state.pendingToolCalls.size > 0 || pendingUI.size > 0) {
++        return;
++      }
++      if (elapsed < SDK_PROMPT_HARD_IDLE_TIMEOUT_MS) {
++        return;
++      }
++      const error = new ProbeError("E_TIMEOUT", `Pi SDK prompt idle timeout after ${SDK_PROMPT_HARD_IDLE_TIMEOUT_MS}ms`);
++      if (typeof session.abort === "function") {
++        void session.abort().catch(() => {});
++      }
++      if (!state.preflightSucceeded) {
++        writeJsonl(errorResponse("prompt", error, state.requestId));
++      } else {
++        writeJsonl({ type: "recovery", message: error.message });
++        writeJsonl(contextWindowEnvelope(session));
++        writeJsonl({ type: "agent_end", willRetry: false, promptDone: true, synthetic: true, reason: "sdk_prompt_idle_timeout" });
+       }
++      state.done = true;
++      state.seenAgentEnd = true;
++      clearPromptWatchdog(state);
+     }, SDK_PROMPT_IDLE_POLL_MS);
+   };
+   let unsubscribe = session.subscribe((event) => {
+     const state = activePrompt;
+     if (state && !state.done) {
++      state.lastActivityAt = Date.now();
+       if (event.type === "message_update") {
+         state.sawAssistantActivity = true;
+       } else if (event.type === "message_end") {
+@@ -1649,14 +2373,22 @@ async function createJsonlSDKRuntime(options) {
+         if (event.message?.role === "assistant") {
+           state.sawAssistantActivity = true;
+         }
++      } else if (event.type === "tool_execution_start") {
++        if (event.toolCallId) {
++          state.pendingToolCalls.add(event.toolCallId);
++        }
++      } else if (event.type === "tool_execution_end") {
++        if (event.toolCallId) {
++          state.pendingToolCalls.delete(event.toolCallId);
++        }
+       } else if (event.type === "agent_end") {
+         state.seenAgentEnd = true;
+-        state.done = true;
+-        clearPromptWatchdog(state);
+       }
+     }
+     if (event.type === "agent_end") {
+       writeJsonl(contextWindowEnvelope(session));
++      writeJsonl({ ...event, promptDone: false });
++      return;
+     }
+     writeJsonl(event);
+   });
+@@ -1668,17 +2400,38 @@ async function createJsonlSDKRuntime(options) {
+     sessionId: session.sessionId,
+     sessionFile: session.sessionFile,
+     resumed: sessionState.resumed,
++    get model() {
++      return session.model;
++    },
++    get thinkingLevel() {
++      return session.thinkingLevel;
++    },
++    get extensionsReady() {
++      return bindingsSettled && !bindingsFailed;
++    },
++    get extensionsFailed() {
++      return bindingsFailed;
++    },
++    get extensionErrors() {
++      return extensionErrors.map((error) => error instanceof Error ? error.message : String(error));
++    },
+     pending: new Map(),
+     responses: [],
++    isPromptActive: function () {
++      return Boolean(activePrompt && !activePrompt.done);
++    },
+     prompt: async function (request) {
+-      let preflightSucceeded = false;
++      await bindingsReady;
+       const state = {
+         requestId: request.id,
+         startedAt: Date.now(),
++        lastActivityAt: Date.now(),
+         baselineMessageCount: messagesForSession().length,
+         sawAssistantActivity: false,
+         seenMessageEnd: false,
+         seenAgentEnd: false,
++        preflightSucceeded: false,
++        pendingToolCalls: new Set(),
+         done: false,
+         timer: undefined,
+       };
+@@ -1688,36 +2441,57 @@ async function createJsonlSDKRuntime(options) {
+         .prompt(String(request.message ?? ""), {
+           source: "rpc",
+           preflightResult: (didSucceed) => {
+-            if (didSucceed) {
+-              preflightSucceeded = true;
++            if (didSucceed && !state.done && !state.preflightSucceeded) {
++              state.preflightSucceeded = true;
+               writeJsonl(successResponse("prompt", { runtime: "sdk" }, request.id));
+             }
+           },
+         })
+         .then(() => {
+-          if (!preflightSucceeded) {
+-            preflightSucceeded = true;
+-            writeJsonl(successResponse("prompt", { runtime: "sdk" }, request.id));
++          if (state.done) {
++            return;
+           }
+-          if (!state.done && !state.seenAgentEnd) {
+-            writeJsonl(contextWindowEnvelope(session));
+-            writeJsonl({ type: "agent_end", willRetry: false });
+-            state.done = true;
++          if (!state.preflightSucceeded) {
++            state.preflightSucceeded = true;
++            writeJsonl(successResponse("prompt", { runtime: "sdk" }, request.id));
+           }
++          writeJsonl(contextWindowEnvelope(session));
++          writeJsonl({ type: "agent_end", willRetry: false, promptDone: true, synthetic: true, reason: "sdk_prompt_resolved" });
++          state.done = true;
++          state.seenAgentEnd = true;
+           clearPromptWatchdog(state);
+         })
+         .catch((error) => {
++          if (state.done) {
++            return;
++          }
+           clearPromptWatchdog(state);
+-          if (!preflightSucceeded) {
++          if (!state.preflightSucceeded) {
++            state.done = true;
++            state.seenAgentEnd = true;
+             writeJsonl(errorResponse("prompt", error, request.id));
+             return;
+           }
+           writeJsonl({ type: "recovery", message: error instanceof Error ? error.message : String(error) });
+           writeJsonl(contextWindowEnvelope(session));
+-          writeJsonl({ type: "agent_end", willRetry: false });
++          writeJsonl({ type: "agent_end", willRetry: false, promptDone: true, synthetic: true, reason: "sdk_prompt_error" });
+           state.done = true;
++          state.seenAgentEnd = true;
+         });
+     },
++    answerQuestion: async function (request) {
++      const toolUseId = String(request.toolUseId ?? request.toolUseID ?? "").trim();
++      const pending = pendingQuestions.get(toolUseId);
++      if (!pending) {
++        throw new ProbeError("E_PARAM", `unknown ask user question id: ${toolUseId || request.toolUseId}`);
++      }
++      const answers = normalizeAnswerMap(request.answers);
++      if (Object.keys(answers).length === 0) {
++        throw new ProbeError("E_PARAM", "answers required");
++      }
++      writeJsonl(successResponse("answer_question", { toolUseId, remaining: Math.max(0, pendingQuestions.size - 1) }, request.id));
++      pending.resolve(answers);
++    },
+     answerExtensionUI: async function (request) {
+       const id = String(request.id ?? "").trim();
+       const pending = pendingUI.get(id);
+@@ -1746,6 +2520,10 @@ async function createJsonlSDKRuntime(options) {
+         autoCompactionEnabled: session.autoCompactionEnabled,
+         messageCount: session.messages?.length ?? 0,
+         pendingMessageCount: session.pendingMessageCount,
++        extensionsReady: bindingsSettled && !bindingsFailed,
++        extensionsFailed: bindingsFailed,
++        extensionErrorCount: extensionErrors.length,
++        extensionErrors: extensionErrors.map((error) => error instanceof Error ? error.message : String(error)),
+       }, request.id));
+     },
+     getAvailableModels: async function (request) {
+@@ -1766,6 +2544,7 @@ async function createJsonlSDKRuntime(options) {
+       writeJsonl(successResponse("set_thinking_level", { level: session.thinkingLevel }, request.id));
+     },
+     getCommands: async function (request) {
++      await bindingsReady;
+       const commands = [];
+       for (const command of session.extensionRunner?.getRegisteredCommands?.() ?? []) {
+         commands.push({
+@@ -1793,12 +2572,71 @@ async function createJsonlSDKRuntime(options) {
+       }
+       writeJsonl(successResponse("get_commands", { commands }, request.id));
+     },
++    steer: async function (request) {
++      await bindingsReady;
++      await session.steer(jsonlRequestText(request, "steer"));
++      writeJsonl(successResponse("steer", queueState(session), request.id));
++    },
++    followUp: async function (request) {
++      await bindingsReady;
++      await session.followUp(jsonlRequestText(request, "follow_up"));
++      writeJsonl(successResponse("follow_up", queueState(session), request.id));
++    },
++    compact: async function (request) {
++      await bindingsReady;
++      const instructions = String(request.customInstructions ?? request.instructions ?? "").trim() || undefined;
++      const result = await session.compact(instructions);
++      writeJsonl(successResponse("compact", { result: sanitizeCompactionResult(result), contextUsage: session.getContextUsage?.() }, request.id));
++    },
++    abortCompaction: async function (request) {
++      session.abortCompaction?.();
++      writeJsonl(successResponse("abort_compaction", {}, request.id));
++    },
++    getActiveTools: async function (request) {
++      writeJsonl(successResponse("get_active_tools", { toolNames: session.getActiveToolNames?.() ?? [] }, request.id));
++    },
++    getAllTools: async function (request) {
++      writeJsonl(successResponse("get_all_tools", { tools: (session.getAllTools?.() ?? []).map(sanitizeToolInfo) }, request.id));
++    },
++    setActiveTools: async function (request) {
++      const toolNames = jsonlStringArray(request.toolNames ?? request.tools, "toolNames");
++      session.setActiveToolsByName?.(toolNames);
++      writeJsonl(successResponse("set_active_tools", { toolNames: session.getActiveToolNames?.() ?? toolNames }, request.id));
++    },
++    setQueueModes: async function (request) {
++      if (request.steeringMode !== undefined) {
++        session.setSteeringMode?.(normalizeQueueMode(request.steeringMode, "steeringMode"));
++      }
++      if (request.followUpMode !== undefined) {
++        session.setFollowUpMode?.(normalizeQueueMode(request.followUpMode, "followUpMode"));
++      }
++      writeJsonl(successResponse("set_queue_modes", { steeringMode: session.steeringMode, followUpMode: session.followUpMode }, request.id));
++    },
++    setAutoCompaction: async function (request) {
++      const enabled = jsonlBoolean(request.enabled, "enabled");
++      session.setAutoCompactionEnabled?.(enabled);
++      writeJsonl(successResponse("set_auto_compaction", { enabled: session.autoCompactionEnabled }, request.id));
++    },
++    setAutoRetry: async function (request) {
++      const enabled = jsonlBoolean(request.enabled, "enabled");
++      session.setAutoRetryEnabled?.(enabled);
++      writeJsonl(successResponse("set_auto_retry", { enabled: session.autoRetryEnabled }, request.id));
++    },
++    abortRetry: async function (request) {
++      session.abortRetry?.();
++      writeJsonl(successResponse("abort_retry", {}, request.id));
++    },
+     abort: async function (request) {
+       await session.abort();
+       writeJsonl(successResponse("abort", {}, request.id));
+     },
+     dispose: async function () {
+       resolvePendingJsonlBridgeUI(pendingUI);
++      for (const pending of pendingQuestions.values()) {
++        pending.reject?.(new Error("Pi SDK runtime disposed"));
++      }
++      pendingQuestions.clear();
++      restoreExtensionForwarding();
+       unsubscribe?.();
+       unsubscribe = undefined;
+       session.dispose?.();
+diff --git a/server/internal/agent/pi_sdk_runtime/session.go b/server/internal/agent/pi_sdk_runtime/session.go
+index 61481b5..5b11a77 100644
+--- a/server/internal/agent/pi_sdk_runtime/session.go
++++ b/server/internal/agent/pi_sdk_runtime/session.go
+@@ -21,10 +21,11 @@ import (
+ )
+ 
+ const (
+-	defaultNodeCommand      = "node"
+-	defaultCommandTimeout   = 30 * time.Second
+-	startupTimeout          = 45 * time.Second
+-	messageEndFallbackDelay = 1500 * time.Millisecond
++	defaultNodeCommand                = "node"
++	defaultCommandTimeout             = 30 * time.Second
++	startupTimeout                    = 45 * time.Second
++	messageEndFallbackDelay           = 1500 * time.Millisecond
++	maxBufferedEventsBeforeSubscriber = 256
+ )
+ 
+ type OpenOptions struct {
+@@ -101,6 +102,7 @@ func (r *Runtime) OpenSession(ctx context.Context, opts OpenOptions) (agenttypes
+ 		mode:               strings.TrimSpace(opts.Mode),
+ 		pending:            make(map[string]chan bridgeResponse),
+ 		pendingExtensionUI: make(map[string]string),
++		pendingQuestions:   make(map[string]struct{}),
+ 		turnDone:           make(chan error, 1),
+ 		closed:             make(chan struct{}),
+ 	}
+@@ -141,25 +143,60 @@ func startPayloadForOptions(opts OpenOptions) map[string]any {
+ 	return payload
+ }
+ 
++// applyStartResponse mirrors SDK startup metadata into the runtime cache before the first prompt is persisted.
+ func (s *session) applyStartResponse(resp bridgeResponse) {
+ 	if len(resp.Data) == 0 {
+ 		return
+ 	}
+ 	var data struct {
+-		SessionID string `json:"sessionId"`
++		SessionID     string          `json:"sessionId"`
++		ThinkingLevel string          `json:"thinkingLevel"`
++		Model         json.RawMessage `json:"model"`
+ 	}
+ 	if err := json.Unmarshal(resp.Data, &data); err != nil {
+ 		return
+ 	}
+-	sessionID := strings.TrimSpace(data.SessionID)
+-	if sessionID == "" {
+-		return
+-	}
+ 	s.mu.Lock()
+-	s.sessionID = sessionID
++	if sessionID := strings.TrimSpace(data.SessionID); sessionID != "" {
++		s.sessionID = sessionID
++	}
++	if thinkingLevel := strings.TrimSpace(data.ThinkingLevel); thinkingLevel != "" {
++		s.mode = thinkingLevel
++	}
++	if model := parseStartResponseModel(data.Model); model != "" {
++		s.model = model
++	}
+ 	s.mu.Unlock()
+ }
+ 
++// parseStartResponseModel accepts both current object-shaped SDK models and older string-shaped model ids.
++func parseStartResponseModel(raw json.RawMessage) string {
++	if len(raw) == 0 || string(raw) == "null" {
++		return ""
++	}
++	var modelName string
++	if err := json.Unmarshal(raw, &modelName); err == nil {
++		return normalizeModelID(modelName)
++	}
++	var model struct {
++		ID       string `json:"id"`
++		Provider string `json:"provider"`
++	}
++	if err := json.Unmarshal(raw, &model); err != nil {
++		return ""
++	}
++	provider := strings.TrimSpace(model.Provider)
++	id := strings.TrimSpace(model.ID)
++	switch {
++	case provider != "" && id != "":
++		return normalizeModelID(provider + "/" + id)
++	case id != "":
++		return normalizeModelID(id)
++	default:
++		return ""
++	}
++}
++
+ func (r *Runtime) Close(agentName string) error {
+ 	if r == nil {
+ 		return nil
+@@ -215,12 +252,14 @@ type session struct {
+ 	mu                 sync.RWMutex
+ 	pending            map[string]chan bridgeResponse
+ 	pendingExtensionUI map[string]string
++	pendingQuestions   map[string]struct{}
+ 
+ 	onUpdate     func(agenttypes.Event)
+ 	sessionID    string
+ 	model        string
+ 	mode         string
+ 	contextStats agenttypes.ContextWindow
++	eventBacklog []agenttypes.Event
+ 	seenText     bool
+ 	seenThinking bool
+ 	lastTurnErr  string
+@@ -518,9 +557,9 @@ func isExtensionUIDialogMethod(method string) bool {
+ func (s *session) handleEvent(raw []byte, eventType string) {
+ 	switch eventType {
+ 	case "agent_start":
+-		s.resetDeltaState()
++		s.resetTurnState()
+ 	case "message_start":
+-		s.resetDeltaState()
++		s.resetMessageDeltaState()
+ 	case "message_update":
+ 		s.handleMessageUpdate(raw)
+ 	case "message_end":
+@@ -528,24 +567,28 @@ func (s *session) handleEvent(raw []byte, eventType string) {
+ 	case "context_window":
+ 		s.handleContextWindow(raw)
+ 	case "agent_end":
+-		s.handleAgentEnd()
++		s.handleAgentEnd(raw)
+ 	case "turn_end":
+ 		s.handleTurnEnd(raw)
++	case "thinking_level_changed", "thinking_level_select":
++		s.handleThinkingLevelChanged(raw)
++	case "model_select":
++		s.handleModelSelect(raw)
+ 	case "tool_execution_start":
+ 		s.handleToolExecutionStart(raw)
+ 	case "tool_execution_update":
+ 		s.handleToolExecutionUpdate(raw)
+ 	case "tool_execution_end":
+ 		s.handleToolExecutionEnd(raw)
+-	case "recovery", "auto_retry_start":
++	case "recovery", "auto_retry_start", "auto_retry_end", "compaction_start", "compaction_end":
+ 		s.handleRecovery(raw)
+-	case "queue_update", "turn_start", "session_info_changed", "thinking_level_changed":
++	case "queue_update", "turn_start", "session_info_changed":
+ 	default:
+ 		log.Printf("[agent/pi-sdk] stdout.ignored_event session=%s type=%q", s.sessionKey, eventType)
+ 	}
+ }
+ 
+-func (s *session) resetDeltaState() {
++func (s *session) resetTurnState() {
+ 	s.mu.Lock()
+ 	s.seenText = false
+ 	s.seenThinking = false
+@@ -554,6 +597,13 @@ func (s *session) resetDeltaState() {
+ 	s.mu.Unlock()
+ }
+ 
++func (s *session) resetMessageDeltaState() {
++	s.mu.Lock()
++	s.seenText = false
++	s.seenThinking = false
++	s.mu.Unlock()
++}
++
+ func (s *session) markTextSeen() {
+ 	s.mu.Lock()
+ 	s.seenText = true
+@@ -692,7 +742,6 @@ func (s *session) handleMessageEnd(raw []byte) {
+ 		s.contextStats.TotalTokens = total
+ 		s.mu.Unlock()
+ 	}
+-	s.scheduleMessageEndFallback()
+ }
+ 
+ func (s *session) handleContextWindow(raw []byte) {
+@@ -730,7 +779,33 @@ func (s *session) handleRecovery(raw []byte) {
+ 	s.emit(agenttypes.Event{Type: agenttypes.EventTypeRecovery, SessionID: s.SessionID(), Data: agenttypes.RecoveryStatus{Message: message}})
+ }
+ 
+-func (s *session) handleAgentEnd() {
++func (s *session) handleAgentEnd(raw []byte) {
++	var ev struct {
++		WillRetry     bool   `json:"willRetry"`
++		PromptDone    *bool  `json:"promptDone"`
++		Terminal      *bool  `json:"terminal"`
++		StopReason    string `json:"stopReason"`
++		ErrorMessage  string `json:"errorMessage"`
++		Error         string `json:"error"`
++		Cancelled     bool   `json:"cancelled"`
++		Canceled      bool   `json:"canceled"`
++		AbortReason   string `json:"abortReason"`
++		FailureReason string `json:"failureReason"`
++	}
++	_ = json.Unmarshal(raw, &ev)
++	if ev.WillRetry {
++		return
++	}
++	if ev.PromptDone != nil && !*ev.PromptDone {
++		return
++	}
++	if ev.Terminal != nil && !*ev.Terminal {
++		return
++	}
++	if message := terminalErrorMessage(ev.StopReason, ev.ErrorMessage, ev.Error, ev.AbortReason, ev.FailureReason, ev.Cancelled, ev.Canceled); message != "" {
++		s.setLastTurnErr(message)
++		s.emit(agenttypes.Event{Type: agenttypes.EventTypeRecovery, SessionID: s.SessionID(), Data: agenttypes.RecoveryStatus{Message: message}})
++	}
+ 	s.completeTurn()
+ }
+ 
+@@ -749,32 +824,77 @@ func (s *session) handleTurnEnd(raw []byte) {
+ 	if ev.WillRetry {
+ 		return
+ 	}
+-	message := strings.TrimSpace(ev.ErrorMessage)
++	if message := terminalErrorMessage(ev.StopReason, ev.ErrorMessage, ev.Error, ev.AbortReason, ev.FailureReason, ev.Cancelled, ev.Canceled); message != "" {
++		s.setLastTurnErr(message)
++		s.emit(agenttypes.Event{Type: agenttypes.EventTypeRecovery, SessionID: s.SessionID(), Data: agenttypes.RecoveryStatus{Message: message}})
++	}
++	// Pi SDK turn_end is one model/tool turn, not the whole agent run. Do not
++	// complete MindFS SendMessage here: tool-call turns and compaction/retry can
++	// legitimately continue with another LLM turn before the SDK prompt settles.
++}
++
++func (s *session) handleThinkingLevelChanged(raw []byte) {
++	var ev struct {
++		Level string `json:"level"`
++	}
++	if err := json.Unmarshal(raw, &ev); err != nil {
++		return
++	}
++	if level := strings.TrimSpace(ev.Level); level != "" {
++		s.mu.Lock()
++		s.mode = level
++		s.mu.Unlock()
++	}
++}
++
++func (s *session) handleModelSelect(raw []byte) {
++	var ev struct {
++		Model json.RawMessage `json:"model"`
++	}
++	if err := json.Unmarshal(raw, &ev); err != nil {
++		return
++	}
++	if model := parseStartResponseModel(ev.Model); model != "" {
++		s.mu.Lock()
++		s.model = model
++		s.mu.Unlock()
++	}
++}
++
++func terminalErrorMessage(stopReason, errorMessage, errText, abortReason, failureReason string, cancelled, canceled bool) string {
++	message := strings.TrimSpace(errorMessage)
+ 	if message == "" {
+-		message = strings.TrimSpace(ev.Error)
++		message = strings.TrimSpace(errText)
+ 	}
+ 	if message == "" {
+-		message = strings.TrimSpace(ev.AbortReason)
++		message = strings.TrimSpace(abortReason)
+ 	}
+ 	if message == "" {
+-		message = strings.TrimSpace(ev.FailureReason)
++		message = strings.TrimSpace(failureReason)
+ 	}
+-	stopReason := strings.ToLower(strings.TrimSpace(ev.StopReason))
+-	if message == "" && (stopReason == "error" || stopReason == "aborted" || stopReason == "cancelled" || ev.Cancelled || ev.Canceled) {
+-		message = "pi sdk prompt " + strings.TrimSpace(ev.StopReason)
++	stopReason = strings.TrimSpace(stopReason)
++	lowerStopReason := strings.ToLower(stopReason)
++	if message == "" && (lowerStopReason == "error" || lowerStopReason == "aborted" || lowerStopReason == "cancelled" || cancelled || canceled) {
++		message = "pi sdk prompt " + stopReason
+ 		if strings.TrimSpace(message) == "pi sdk prompt" {
+ 			message = "pi sdk prompt aborted"
+ 		}
+ 	}
+-	if message != "" {
+-		s.setLastTurnErr(message)
+-		s.emit(agenttypes.Event{Type: agenttypes.EventTypeRecovery, SessionID: s.SessionID(), Data: agenttypes.RecoveryStatus{Message: message}})
+-	}
+-	s.completeTurn()
++	return message
+ }
+ 
+ func (s *session) completeTurn() {
+-	if !s.markTurnComplete() {
++	s.completeTurnFor(nil)
++}
++
++func (s *session) completeTurnFor(ch chan error) {
++	completed := false
++	if ch == nil {
++		completed = s.markTurnComplete()
++	} else {
++		completed = s.markTurnCompleteFor(ch)
++	}
++	if !completed {
+ 		return
+ 	}
+ 	contextWindow := s.cachedContextWindow()
+@@ -783,10 +903,18 @@ func (s *session) completeTurn() {
+ 	lastErr := strings.TrimSpace(s.lastTurnErr)
+ 	s.mu.RUnlock()
+ 	if lastErr != "" {
+-		s.signalTurnDone(errors.New(lastErr))
++		if ch == nil {
++			s.signalTurnDone(errors.New(lastErr))
++		} else {
++			s.signalTurnDoneTo(ch, errors.New(lastErr))
++		}
+ 		return
+ 	}
+-	s.signalTurnDone(nil)
++	if ch == nil {
++		s.signalTurnDone(nil)
++	} else {
++		s.signalTurnDoneTo(ch, nil)
++	}
+ }
+ 
+ func (s *session) markTurnComplete() bool {
+@@ -818,13 +946,22 @@ func (s *session) handleToolExecutionStart(raw []byte) {
+ 	if err := json.Unmarshal(raw, &ev); err != nil {
+ 		return
+ 	}
++	kind := inferToolKind(ev.ToolName)
++	if kind == agenttypes.ToolKindAskUser {
++		s.trackPendingQuestion(ev.ToolCallID)
++	}
++	if kind == agenttypes.ToolKindTodo {
++		s.emitTodoUpdateFromArgs(ev.Args)
++	}
+ 	s.emit(agenttypes.Event{Type: agenttypes.EventTypeToolCall, SessionID: s.SessionID(), Data: agenttypes.ToolCall{
+-		CallID:  ev.ToolCallID,
+-		Title:   toolTitle(ev.ToolName, ev.Args),
+-		Status:  "running",
+-		Kind:    inferToolKind(ev.ToolName),
+-		RawType: "pi-sdk",
+-		Meta:    map[string]any{"input": rawValueString(ev.Args), "rawInput": ev.Args},
++		CallID:    ev.ToolCallID,
++		Title:     toolTitle(ev.ToolName, ev.Args),
++		Status:    "running",
++		Kind:      kind,
++		Content:   inputContentItems(ev.ToolName, ev.Args),
++		Locations: toolLocationsFromArgs(ev.Args),
++		RawType:   "pi-sdk",
++		Meta:      toolCallMeta(ev.ToolCallID, ev.ToolName, ev.Args),
+ 	}})
+ }
+ 
+@@ -838,14 +975,19 @@ func (s *session) handleToolExecutionUpdate(raw []byte) {
+ 	if err := json.Unmarshal(raw, &ev); err != nil {
+ 		return
+ 	}
++	kind := inferToolKind(ev.ToolName)
++	if kind == agenttypes.ToolKindTodo {
++		s.emitTodoUpdateFromArgs(ev.Args)
++	}
+ 	s.emit(agenttypes.Event{Type: agenttypes.EventTypeToolUpdate, SessionID: s.SessionID(), Data: agenttypes.ToolCall{
+-		CallID:  ev.ToolCallID,
+-		Title:   toolTitle(ev.ToolName, ev.Args),
+-		Status:  "running",
+-		Kind:    inferToolKind(ev.ToolName),
+-		Content: resultContentItems(ev.PartialResult),
+-		RawType: "pi-sdk",
+-		Meta:    resultMeta(ev.Args, ev.PartialResult),
++		CallID:    ev.ToolCallID,
++		Title:     toolTitle(ev.ToolName, ev.Args),
++		Status:    "running",
++		Kind:      kind,
++		Content:   toolResultContentItems(ev.ToolName, ev.Args, ev.PartialResult),
++		Locations: mergeToolLocations(toolLocationsFromArgs(ev.Args), resultLocations(ev.PartialResult)),
++		RawType:   "pi-sdk",
++		Meta:      resultMeta(ev.Args, ev.PartialResult),
+ 	}})
+ }
+ 
+@@ -853,6 +995,7 @@ func (s *session) handleToolExecutionEnd(raw []byte) {
+ 	var ev struct {
+ 		ToolCallID string          `json:"toolCallId"`
+ 		ToolName   string          `json:"toolName"`
++		Args       map[string]any  `json:"args"`
+ 		Result     json.RawMessage `json:"result"`
+ 		IsError    bool            `json:"isError"`
+ 	}
+@@ -863,17 +1006,101 @@ func (s *session) handleToolExecutionEnd(raw []byte) {
+ 	if ev.IsError {
+ 		status = "failed"
+ 	}
++	kind := inferToolKind(ev.ToolName)
++	if kind == agenttypes.ToolKindAskUser {
++		s.untrackPendingQuestion(ev.ToolCallID)
++	}
++	if kind == agenttypes.ToolKindTodo {
++		s.emitTodoUpdateFromArgs(ev.Args)
++	}
+ 	s.emit(agenttypes.Event{Type: agenttypes.EventTypeToolUpdate, SessionID: s.SessionID(), Data: agenttypes.ToolCall{
+-		CallID:  ev.ToolCallID,
+-		Title:   strings.TrimSpace(ev.ToolName),
+-		Status:  status,
+-		Kind:    inferToolKind(ev.ToolName),
+-		Content: resultContentItems(ev.Result),
+-		RawType: "pi-sdk",
+-		Meta:    resultMeta(nil, ev.Result),
++		CallID:    ev.ToolCallID,
++		Title:     strings.TrimSpace(ev.ToolName),
++		Status:    status,
++		Kind:      kind,
++		Content:   toolResultContentItems(ev.ToolName, ev.Args, ev.Result),
++		Locations: mergeToolLocations(toolLocationsFromArgs(ev.Args), resultLocations(ev.Result)),
++		RawType:   "pi-sdk",
++		Meta:      resultMeta(ev.Args, ev.Result),
+ 	}})
+ }
+ 
++func (s *session) trackPendingQuestion(callID string) {
++	callID = strings.TrimSpace(callID)
++	if callID == "" {
++		return
++	}
++	s.mu.Lock()
++	if s.pendingQuestions == nil {
++		s.pendingQuestions = make(map[string]struct{})
++	}
++	s.pendingQuestions[callID] = struct{}{}
++	s.mu.Unlock()
++}
++
++func (s *session) untrackPendingQuestion(callID string) {
++	callID = strings.TrimSpace(callID)
++	if callID == "" {
++		return
++	}
++	s.mu.Lock()
++	delete(s.pendingQuestions, callID)
++	s.mu.Unlock()
++}
++
++func (s *session) isPendingQuestion(callID string) bool {
++	callID = strings.TrimSpace(callID)
++	if callID == "" {
++		return false
++	}
++	s.mu.RLock()
++	_, ok := s.pendingQuestions[callID]
++	s.mu.RUnlock()
++	return ok
++}
++
++func (s *session) clearPendingQuestions() {
++	s.mu.Lock()
++	s.pendingQuestions = make(map[string]struct{})
++	s.mu.Unlock()
++}
++
++func (s *session) emitTodoUpdateFromArgs(args map[string]any) {
++	update, ok := todoUpdateFromArgs(args)
++	if !ok {
++		return
++	}
++	s.emit(agenttypes.Event{Type: agenttypes.EventTypeTodoUpdate, SessionID: s.SessionID(), Data: update})
++}
++
++func todoUpdateFromArgs(args map[string]any) (agenttypes.TodoUpdate, bool) {
++	todos, ok := args["todos"].([]any)
++	if !ok || len(todos) == 0 {
++		return agenttypes.TodoUpdate{}, false
++	}
++	items := make([]agenttypes.TodoItem, 0, len(todos))
++	for _, raw := range todos {
++		item, ok := raw.(map[string]any)
++		if !ok {
++			continue
++		}
++		content, _ := item["content"].(string)
++		activeForm, _ := item["activeForm"].(string)
++		status, _ := item["status"].(string)
++		content = strings.TrimSpace(content)
++		activeForm = strings.TrimSpace(activeForm)
++		status = strings.TrimSpace(status)
++		if content == "" && activeForm == "" {
++			continue
++		}
++		items = append(items, agenttypes.TodoItem{Content: content, ActiveForm: activeForm, Status: status})
++	}
++	if len(items) == 0 {
++		return agenttypes.TodoUpdate{}, false
++	}
++	return agenttypes.TodoUpdate{Items: items}, true
++}
++
+ func (s *session) setLastTurnErr(message string) {
+ 	s.mu.Lock()
+ 	s.lastTurnErr = strings.TrimSpace(message)
+@@ -897,19 +1124,6 @@ func (s *session) signalTurnDoneTo(ch chan error, err error) {
+ 	}
+ }
+ 
+-func (s *session) scheduleMessageEndFallback() {
+-	s.turnMu.Lock()
+-	ch := s.turnDone
+-	s.turnMu.Unlock()
+-	go func() {
+-		time.Sleep(messageEndFallbackDelay)
+-		if s.markTurnCompleteFor(ch) {
+-			s.emit(agenttypes.Event{Type: agenttypes.EventTypeMessageDone, SessionID: s.SessionID(), Data: agenttypes.MessageDone{ContextWindow: s.cachedContextWindow()}})
+-		}
+-		s.signalTurnDoneTo(ch, nil)
+-	}()
+-}
+-
+ func (s *session) resetTurnDone() chan error {
+ 	s.turnMu.Lock()
+ 	defer s.turnMu.Unlock()
+@@ -917,13 +1131,46 @@ func (s *session) resetTurnDone() chan error {
+ 	return s.turnDone
+ }
+ 
++// emit forwards runtime events to the registered subscriber, buffering startup events until the UI attaches.
+ func (s *session) emit(ev agenttypes.Event) {
+-	s.mu.RLock()
++	s.mu.Lock()
+ 	onUpdate := s.onUpdate
+-	s.mu.RUnlock()
+-	if onUpdate != nil {
+-		onUpdate(ev)
++	if onUpdate == nil {
++		s.appendEventBacklogLocked(ev)
++		s.mu.Unlock()
++		return
++	}
++	s.mu.Unlock()
++	onUpdate(ev)
++}
++
++// appendEventBacklogLocked caps pre-subscriber buffering while preserving blocking extension UI requests first.
++func (s *session) appendEventBacklogLocked(ev agenttypes.Event) {
++	if len(s.eventBacklog) < maxBufferedEventsBeforeSubscriber {
++		s.eventBacklog = append(s.eventBacklog, ev)
++		return
++	}
++	newIsBlocking := isBlockingExtensionUIEvent(ev)
++	for idx, old := range s.eventBacklog {
++		if !isBlockingExtensionUIEvent(old) {
++			copy(s.eventBacklog[idx:], s.eventBacklog[idx+1:])
++			s.eventBacklog[len(s.eventBacklog)-1] = ev
++			return
++		}
++	}
++	if newIsBlocking {
++		copy(s.eventBacklog, s.eventBacklog[1:])
++		s.eventBacklog[len(s.eventBacklog)-1] = ev
++	}
++}
++
++// isBlockingExtensionUIEvent reports whether losing the event would leave a pending UI request unanswerable.
++func isBlockingExtensionUIEvent(ev agenttypes.Event) bool {
++	if ev.Type != agenttypes.EventTypeExtensionUI {
++		return false
+ 	}
++	req, ok := ev.Data.(agenttypes.ExtensionUIRequest)
++	return ok && isExtensionUIDialogMethod(req.Method)
+ }
+ 
+ func (s *session) SendMessage(ctx context.Context, content string) error {
+@@ -934,7 +1181,7 @@ func (s *session) SendMessage(ctx context.Context, content string) error {
+ 	turnCtx, turnID := s.turn.Begin(ctx)
+ 	defer s.turn.End(turnID)
+ 	turnDone := s.resetTurnDone()
+-	s.resetDeltaState()
++	s.resetTurnState()
+ 	if _, err := s.request(turnCtx, "prompt", map[string]any{"type": "prompt", "message": content}); err != nil {
+ 		return err
+ 	}
+@@ -955,8 +1202,35 @@ func (s *session) SendMessage(ctx context.Context, content string) error {
+ 	}
+ }
+ 
+-func (s *session) AnswerQuestion(context.Context, agenttypes.AskUserAnswer) error {
+-	return errors.New("ask user question is not supported by pi-sdk runtime foundation")
++func (s *session) AnswerQuestion(ctx context.Context, answer agenttypes.AskUserAnswer) error {
++	callID := strings.TrimSpace(answer.ToolUseID)
++	if callID == "" {
++		return errors.New("toolUseId required")
++	}
++	answers := make(map[string]string, len(answer.Answers))
++	for key, value := range answer.Answers {
++		key = strings.TrimSpace(key)
++		value = strings.TrimSpace(value)
++		if key != "" && value != "" {
++			answers[key] = value
++		}
++	}
++	if len(answers) == 0 {
++		return errors.New("answers required")
++	}
++	if !s.isPendingQuestion(callID) {
++		return errors.New("question is not pending: " + callID)
++	}
++	_, err := s.request(withDefaultTimeout(ctx), "answer-question", map[string]any{
++		"type":      "answer_question",
++		"toolUseId": callID,
++		"answers":   answers,
++	})
++	if err != nil {
++		return err
++	}
++	s.untrackPendingQuestion(callID)
++	return nil
+ }
+ 
+ func (s *session) AnswerExtensionUI(ctx context.Context, response agenttypes.ExtensionUIResponse) error {
+@@ -1118,6 +1392,7 @@ func (s *session) ListCommands(ctx context.Context) (agenttypes.CommandList, err
+ }
+ 
+ func (s *session) CancelCurrentTurn() error {
++	s.clearPendingQuestions()
+ 	abortID := s.nextID("abort")
+ 	err := s.writeJSON(map[string]any{"type": "abort", "id": abortID})
+ 	s.turn.Cancel()
+@@ -1128,10 +1403,29 @@ func (s *session) CancelCurrentTurn() error {
+ 	return nil
+ }
+ 
++// OnUpdate registers the session event sink and replays events captured before subscription in order.
+ func (s *session) OnUpdate(onUpdate func(agenttypes.Event)) {
+-	s.mu.Lock()
+-	s.onUpdate = onUpdate
+-	s.mu.Unlock()
++	if onUpdate == nil {
++		s.mu.Lock()
++		s.onUpdate = nil
++		s.eventBacklog = nil
++		s.mu.Unlock()
++		return
++	}
++	for {
++		s.mu.Lock()
++		backlog := append([]agenttypes.Event(nil), s.eventBacklog...)
++		s.eventBacklog = nil
++		if len(backlog) == 0 {
++			s.onUpdate = onUpdate
++			s.mu.Unlock()
++			return
++		}
++		s.mu.Unlock()
++		for _, ev := range backlog {
++			onUpdate(ev)
++		}
++	}
+ }
+ 
+ func (s *session) SessionID() string {
+@@ -1156,12 +1450,9 @@ func (s *session) refreshState(ctx context.Context) error {
+ 		return err
+ 	}
+ 	var data struct {
+-		SessionID     string `json:"sessionId"`
+-		ThinkingLevel string `json:"thinkingLevel"`
+-		Model         *struct {
+-			ID       string `json:"id"`
+-			Provider string `json:"provider"`
+-		} `json:"model"`
++		SessionID     string          `json:"sessionId"`
++		ThinkingLevel string          `json:"thinkingLevel"`
++		Model         json.RawMessage `json:"model"`
+ 	}
+ 	if err := json.Unmarshal(resp.Data, &data); err != nil {
+ 		return err
+@@ -1173,10 +1464,8 @@ func (s *session) refreshState(ctx context.Context) error {
+ 	if strings.TrimSpace(data.ThinkingLevel) != "" {
+ 		s.mode = strings.TrimSpace(data.ThinkingLevel)
+ 	}
+-	if data.Model != nil {
+-		if id := normalizeModelID(data.Model.Provider + "/" + data.Model.ID); strings.Trim(id, "/") != "" {
+-			s.model = id
+-		}
++	if model := parseStartResponseModel(data.Model); model != "" {
++		s.model = model
+ 	}
+ 	s.mu.Unlock()
+ 	return nil
+@@ -1212,14 +1501,16 @@ func inferToolKind(name string) agenttypes.ToolKind {
+ 	switch strings.ToLower(strings.TrimSpace(name)) {
+ 	case "read", "read_file", "grep", "find", "ls":
+ 		return agenttypes.ToolKindRead
+-	case "edit", "write", "write_file":
++	case "edit", "multiedit", "multi_edit", "write", "write_file":
+ 		return agenttypes.ToolKindEdit
+ 	case "bash", "shell", "run_command":
+ 		return agenttypes.ToolKindExecute
+ 	case "web_search", "search_web":
+ 		return agenttypes.ToolKindWebSearch
+-	case "ask_user_question":
++	case "ask_user_question", "askuserquestion":
+ 		return agenttypes.ToolKindAskUser
++	case "todowrite", "todo_write", "todos":
++		return agenttypes.ToolKindTodo
+ 	default:
+ 		return agenttypes.ToolKindOther
+ 	}
+@@ -1230,12 +1521,173 @@ func toolTitle(name string, args map[string]any) string {
+ 	if cmd, ok := args["command"].(string); ok && strings.TrimSpace(cmd) != "" {
+ 		return name + ": " + strings.TrimSpace(cmd)
+ 	}
+-	if path, ok := args["path"].(string); ok && strings.TrimSpace(path) != "" {
+-		return name + ": " + filepath.Base(strings.TrimSpace(path))
++	if path := pathFromArgs(args); path != "" {
++		return name + ": " + filepath.Base(path)
++	}
++	if pattern, ok := args["pattern"].(string); ok && strings.TrimSpace(pattern) != "" {
++		return name + ": " + strings.TrimSpace(pattern)
++	}
++	if query, ok := args["query"].(string); ok && strings.TrimSpace(query) != "" {
++		return name + ": " + strings.TrimSpace(query)
+ 	}
+ 	return name
+ }
+ 
++func inputContentItems(name string, args map[string]any) []agenttypes.ToolCallContentItem {
++	path := pathFromArgs(args)
++	switch strings.ToLower(strings.TrimSpace(name)) {
++	case "edit", "multiedit", "multi_edit":
++		return editInputContentItems(path, args)
++	case "write", "write_file":
++		if content, ok := args["content"].(string); ok && content != "" {
++			return []agenttypes.ToolCallContentItem{{Type: "text", Text: content, Path: path, ChangeKind: "add"}}
++		}
++	case "todowrite", "todo_write", "todos":
++		if text := todoInputText(args); text != "" {
++			return []agenttypes.ToolCallContentItem{{Type: "text", Text: text}}
++		}
++	case "ask_user_question", "askuserquestion":
++		if text := askUserInputText(args); text != "" {
++			return []agenttypes.ToolCallContentItem{{Type: "text", Text: text}}
++		}
++	}
++	return nil
++}
++
++func editInputContentItems(path string, args map[string]any) []agenttypes.ToolCallContentItem {
++	var items []agenttypes.ToolCallContentItem
++	appendEdit := func(oldText, newText string) {
++		if oldText == "" && newText == "" {
++			return
++		}
++		old := oldText
++		items = append(items, agenttypes.ToolCallContentItem{Type: "diff", Path: path, OldText: &old, NewText: newText})
++	}
++	if edits, ok := args["edits"].([]any); ok {
++		for _, raw := range edits {
++			edit, ok := raw.(map[string]any)
++			if !ok {
++				continue
++			}
++			oldText, _ := edit["oldText"].(string)
++			newText, _ := edit["newText"].(string)
++			appendEdit(oldText, newText)
++		}
++	}
++	if len(items) == 0 {
++		oldText, _ := args["oldText"].(string)
++		newText, _ := args["newText"].(string)
++		appendEdit(oldText, newText)
++	}
++	return items
++}
++
++func todoInputText(args map[string]any) string {
++	todos, ok := args["todos"].([]any)
++	if !ok || len(todos) == 0 {
++		return ""
++	}
++	lines := make([]string, 0, len(todos))
++	for _, raw := range todos {
++		item, ok := raw.(map[string]any)
++		if !ok {
++			continue
++		}
++		content, _ := item["content"].(string)
++		activeForm, _ := item["activeForm"].(string)
++		status, _ := item["status"].(string)
++		label := strings.TrimSpace(content)
++		if strings.TrimSpace(activeForm) != "" && strings.EqualFold(strings.TrimSpace(status), "in_progress") {
++			label = strings.TrimSpace(activeForm)
++		}
++		if label == "" {
++			continue
++		}
++		if strings.EqualFold(strings.TrimSpace(status), "completed") {
++			lines = append(lines, "- [x] "+label)
++		} else {
++			lines = append(lines, "- [ ] "+label)
++		}
++	}
++	return strings.Join(lines, "\n")
++}
++
++func askUserInputText(args map[string]any) string {
++	questions, ok := args["questions"].([]any)
++	if !ok || len(questions) == 0 {
++		return ""
++	}
++	sections := make([]string, 0, len(questions))
++	for idx, raw := range questions {
++		question, ok := raw.(map[string]any)
++		if !ok {
++			continue
++		}
++		var lines []string
++		if header, _ := question["header"].(string); strings.TrimSpace(header) != "" {
++			lines = append(lines, fmt.Sprintf("**Q%d · %s**", idx+1, strings.TrimSpace(header)))
++		} else {
++			lines = append(lines, fmt.Sprintf("**Q%d**", idx+1))
++		}
++		if text, _ := question["question"].(string); strings.TrimSpace(text) != "" {
++			lines = append(lines, strings.TrimSpace(text))
++		}
++		if multi, _ := question["multiSelect"].(bool); multi {
++			lines = append(lines, "_Multiple selection allowed._")
++		}
++		if options, ok := question["options"].([]any); ok {
++			for _, rawOption := range options {
++				option, ok := rawOption.(map[string]any)
++				if !ok {
++					continue
++				}
++				label, _ := option["label"].(string)
++				label = strings.TrimSpace(label)
++				if label == "" {
++					continue
++				}
++				description, _ := option["description"].(string)
++				if strings.TrimSpace(description) != "" {
++					lines = append(lines, fmt.Sprintf("- **%s**: %s", label, strings.TrimSpace(description)))
++				} else {
++					lines = append(lines, "- "+label)
++				}
++			}
++		}
++		if len(lines) > 0 {
++			sections = append(sections, strings.Join(lines, "\n"))
++		}
++	}
++	return strings.Join(sections, "\n\n")
++}
++
++func toolResultContentItems(name string, args map[string]any, raw json.RawMessage) []agenttypes.ToolCallContentItem {
++	resultItems := resultContentItems(raw)
++	if inferToolKind(name) != agenttypes.ToolKindEdit {
++		return resultItems
++	}
++	inputItems := inputContentItems(name, args)
++	if len(inputItems) == 0 || hasStructuredChangeContent(resultItems) {
++		return resultItems
++	}
++	if len(resultItems) == 0 {
++		return inputItems
++	}
++	items := make([]agenttypes.ToolCallContentItem, 0, len(inputItems)+len(resultItems))
++	items = append(items, inputItems...)
++	items = append(items, resultItems...)
++	return items
++}
++
++func hasStructuredChangeContent(items []agenttypes.ToolCallContentItem) bool {
++	for _, item := range items {
++		if item.Type == "diff" || strings.TrimSpace(item.ChangeKind) != "" || isUnifiedDiffText(item.Text) {
++			return true
++		}
++	}
++	return false
++}
++
+ func resultContentItems(raw json.RawMessage) []agenttypes.ToolCallContentItem {
+ 	if len(raw) == 0 || string(raw) == "null" {
+ 		return nil
+@@ -1245,9 +1697,20 @@ func resultContentItems(raw json.RawMessage) []agenttypes.ToolCallContentItem {
+ 			Type string `json:"type"`
+ 			Text string `json:"text"`
+ 		} `json:"content"`
+-	}
+-	if err := json.Unmarshal(raw, &result); err == nil && len(result.Content) > 0 {
+-		items := make([]agenttypes.ToolCallContentItem, 0, len(result.Content))
++		Details struct {
++			Patch string `json:"patch"`
++			Diff  string `json:"diff"`
++		} `json:"details"`
++	}
++	items := make([]agenttypes.ToolCallContentItem, 0, len(result.Content)+1)
++	if err := json.Unmarshal(raw, &result); err == nil {
++		diffText := result.Details.Patch
++		if strings.TrimSpace(diffText) == "" && strings.TrimSpace(result.Details.Diff) != "" {
++			diffText = result.Details.Diff
++		}
++		if strings.TrimSpace(diffText) != "" {
++			items = append(items, agenttypes.ToolCallContentItem{Type: "text", Text: diffText, Path: firstPatchPath(diffText)})
++		}
+ 		for _, item := range result.Content {
+ 			if strings.TrimSpace(item.Text) != "" {
+ 				items = append(items, agenttypes.ToolCallContentItem{Type: "text", Text: item.Text})
+@@ -1264,6 +1727,151 @@ func resultContentItems(raw json.RawMessage) []agenttypes.ToolCallContentItem {
+ 	return []agenttypes.ToolCallContentItem{{Type: "text", Text: text}}
+ }
+ 
++func isUnifiedDiffText(text string) bool {
++	text = strings.TrimSpace(text)
++	if text == "" {
++		return false
++	}
++	for _, line := range strings.Split(text, "\n") {
++		line = strings.TrimSpace(line)
++		if strings.HasPrefix(line, "diff --git ") || strings.HasPrefix(line, "--- ") || strings.HasPrefix(line, "+++ ") || strings.HasPrefix(line, "@@ ") {
++			return true
++		}
++	}
++	return false
++}
++
++func resultLocations(raw json.RawMessage) []agenttypes.ToolCallLocation {
++	if len(raw) == 0 || string(raw) == "null" {
++		return nil
++	}
++	var result struct {
++		Details struct {
++			Patch string `json:"patch"`
++		} `json:"details"`
++	}
++	if err := json.Unmarshal(raw, &result); err != nil {
++		return nil
++	}
++	paths := patchPaths(result.Details.Patch)
++	locations := make([]agenttypes.ToolCallLocation, 0, len(paths))
++	for _, path := range paths {
++		locations = append(locations, agenttypes.ToolCallLocation{Path: path})
++	}
++	return locations
++}
++
++func toolLocationsFromArgs(args map[string]any) []agenttypes.ToolCallLocation {
++	path := pathFromArgs(args)
++	if path == "" {
++		return nil
++	}
++	return []agenttypes.ToolCallLocation{{Path: path}}
++}
++
++func pathFromArgs(args map[string]any) string {
++	if len(args) == 0 {
++		return ""
++	}
++	for _, key := range []string{"path", "file_path", "filePath"} {
++		path, ok := args[key].(string)
++		if ok && strings.TrimSpace(path) != "" {
++			return strings.TrimSpace(path)
++		}
++	}
++	return ""
++}
++
++func mergeToolLocations(groups ...[]agenttypes.ToolCallLocation) []agenttypes.ToolCallLocation {
++	seen := make(map[string]struct{})
++	var merged []agenttypes.ToolCallLocation
++	for _, group := range groups {
++		for _, loc := range group {
++			path := strings.TrimSpace(loc.Path)
++			if path == "" {
++				continue
++			}
++			if _, ok := seen[path]; ok {
++				continue
++			}
++			seen[path] = struct{}{}
++			loc.Path = path
++			merged = append(merged, loc)
++		}
++	}
++	return merged
++}
++
++func firstPatchPath(patch string) string {
++	paths := patchPaths(patch)
++	if len(paths) == 0 {
++		return ""
++	}
++	return paths[0]
++}
++
++func patchPaths(patch string) []string {
++	var paths []string
++	seen := make(map[string]struct{})
++	for _, line := range strings.Split(patch, "\n") {
++		path := ""
++		switch {
++		case strings.HasPrefix(line, "+++ "):
++			path = strings.TrimSpace(strings.TrimPrefix(line, "+++ "))
++		case strings.HasPrefix(line, "diff --git "):
++			fields := strings.Fields(line)
++			if len(fields) >= 4 {
++				path = fields[3]
++			}
++		}
++		path = cleanPatchPath(path)
++		if path == "" {
++			continue
++		}
++		if _, ok := seen[path]; ok {
++			continue
++		}
++		seen[path] = struct{}{}
++		paths = append(paths, path)
++	}
++	return paths
++}
++
++func cleanPatchPath(path string) string {
++	path = strings.TrimSpace(path)
++	if beforeTab, _, ok := strings.Cut(path, "\t"); ok {
++		path = strings.TrimSpace(beforeTab)
++	}
++	path = strings.Trim(path, "\"'")
++	if path == "" || path == "/dev/null" {
++		return ""
++	}
++	path = strings.TrimPrefix(path, "a/")
++	path = strings.TrimPrefix(path, "b/")
++	return strings.TrimSpace(path)
++}
++
++func toolCallMeta(callID, name string, args map[string]any) map[string]any {
++	meta := map[string]any{
++		"input":    rawValueString(args),
++		"rawInput": args,
++	}
++	switch inferToolKind(name) {
++	case agenttypes.ToolKindAskUser:
++		if strings.TrimSpace(callID) != "" {
++			meta["toolUseId"] = strings.TrimSpace(callID)
++		}
++		if questions, ok := args["questions"].([]any); ok {
++			meta["questions"] = questions
++		}
++	case agenttypes.ToolKindTodo:
++		if todos, ok := args["todos"].([]any); ok {
++			meta["todos"] = todos
++		}
++	}
++	return meta
++}
++
+ func resultMeta(input map[string]any, raw json.RawMessage) map[string]any {
+ 	meta := make(map[string]any)
+ 	if len(input) > 0 {
+diff --git a/server/internal/agent/pi_sdk_runtime/session_test.go b/server/internal/agent/pi_sdk_runtime/session_test.go
+index 46ce521..04fba90 100644
+--- a/server/internal/agent/pi_sdk_runtime/session_test.go
++++ b/server/internal/agent/pi_sdk_runtime/session_test.go
+@@ -95,16 +95,90 @@ func TestStartPayloadForOptionsUsesExplicitTestScenario(t *testing.T) {
+ 	}
+ }
+ 
+-func TestApplyStartResponseUpdatesSessionID(t *testing.T) {
+-	data, err := json.Marshal(map[string]any{"sessionId": "019eb637-77d1-7567-ab40-4e22386a40c1"})
++func TestApplyStartResponseUpdatesSessionState(t *testing.T) {
++	data, err := json.Marshal(map[string]any{
++		"sessionId":     "019eb637-77d1-7567-ab40-4e22386a40c1",
++		"thinkingLevel": "high",
++		"model": map[string]any{
++			"provider": "fake",
++			"id":       "model",
++		},
++	})
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+-	sess := &session{sessionID: "synthetic-session"}
++	sess := &session{sessionID: "synthetic-session", model: "old/model", mode: "off"}
+ 	sess.applyStartResponse(bridgeResponse{Data: data})
+ 	if got := sess.SessionID(); got != "019eb637-77d1-7567-ab40-4e22386a40c1" {
+ 		t.Fatalf("SessionID = %q, want real SDK session id", got)
+ 	}
++	if got := sess.CurrentModel(); got != "fake/model" {
++		t.Fatalf("CurrentModel = %q, want fake/model", got)
++	}
++	if got := sess.mode; got != "high" {
++		t.Fatalf("mode = %q, want high", got)
++	}
++}
++
++func TestApplyStartResponseAcceptsStringModel(t *testing.T) {
++	data, err := json.Marshal(map[string]any{
++		"sessionId":     "real-session",
++		"thinkingLevel": "medium",
++		"model":         "provider/string-model",
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	sess := &session{sessionID: "synthetic-session", model: "old/model", mode: "off"}
++	sess.applyStartResponse(bridgeResponse{Data: data})
++	if got := sess.SessionID(); got != "real-session" {
++		t.Fatalf("SessionID = %q, want real-session", got)
++	}
++	if got := sess.CurrentModel(); got != "provider/string-model" {
++		t.Fatalf("CurrentModel = %q, want provider/string-model", got)
++	}
++	if got := sess.mode; got != "medium" {
++		t.Fatalf("mode = %q, want medium", got)
++	}
++}
++
++func TestSessionOnUpdateReplaysBacklog(t *testing.T) {
++	sess := &session{sessionID: "synthetic-session"}
++	sess.emit(agenttypes.Event{Type: agenttypes.EventTypeRecovery, SessionID: sess.SessionID(), Data: agenttypes.RecoveryStatus{Message: "booting"}})
++	sess.emit(agenttypes.Event{Type: agenttypes.EventTypeMessageChunk, SessionID: sess.SessionID(), Data: agenttypes.MessageChunk{Content: "boot"}})
++
++	var got []agenttypes.Event
++	sess.OnUpdate(func(ev agenttypes.Event) {
++		got = append(got, ev)
++	})
++	if len(got) != 2 {
++		t.Fatalf("replayed events = %#v, want 2", got)
++	}
++	if got[0].Type != agenttypes.EventTypeRecovery || got[1].Type != agenttypes.EventTypeMessageChunk {
++		t.Fatalf("replayed event order = %#v", got)
++	}
++}
++
++func TestSessionBacklogPreservesBlockingExtensionUI(t *testing.T) {
++	sess := &session{sessionID: "synthetic-session"}
++	sess.emit(agenttypes.Event{Type: agenttypes.EventTypeExtensionUI, SessionID: sess.SessionID(), Data: agenttypes.ExtensionUIRequest{ID: "ui-1", Method: "select"}})
++	for i := 0; i < maxBufferedEventsBeforeSubscriber+10; i++ {
++		sess.emit(agenttypes.Event{Type: agenttypes.EventTypeRecovery, SessionID: sess.SessionID(), Data: agenttypes.RecoveryStatus{Message: "status"}})
++	}
++
++	var got []agenttypes.Event
++	sess.OnUpdate(func(ev agenttypes.Event) {
++		got = append(got, ev)
++	})
++	if len(got) != maxBufferedEventsBeforeSubscriber {
++		t.Fatalf("replayed events = %d, want capped %d", len(got), maxBufferedEventsBeforeSubscriber)
++	}
++	for _, ev := range got {
++		if isBlockingExtensionUIEvent(ev) {
++			return
++		}
++	}
++	t.Fatalf("blocking extension UI was evicted from backlog: %#v", got[:3])
+ }
+ 
+ func collectSessionEvents(sess agenttypes.Session) (*[]agenttypes.Event, *sync.Mutex) {
+@@ -175,6 +249,36 @@ func toolCalls(events []agenttypes.Event, typ agenttypes.EventType) []agenttypes
+ 	return calls
+ }
+ 
++func todoUpdates(events []agenttypes.Event) []agenttypes.TodoUpdate {
++	updates := make([]agenttypes.TodoUpdate, 0)
++	for _, ev := range events {
++		if ev.Type != agenttypes.EventTypeTodoUpdate {
++			continue
++		}
++		update, ok := ev.Data.(agenttypes.TodoUpdate)
++		if ok {
++			updates = append(updates, update)
++		}
++	}
++	return updates
++}
++
++func waitForToolCallKind(t *testing.T, events *[]agenttypes.Event, mu *sync.Mutex, kind agenttypes.ToolKind) agenttypes.ToolCall {
++	t.Helper()
++	deadline := time.Now().Add(2 * time.Second)
++	for time.Now().Before(deadline) {
++		calls := toolCalls(snapshotEvents(events, mu), agenttypes.EventTypeToolCall)
++		for _, call := range calls {
++			if call.Kind == kind {
++				return call
++			}
++		}
++		time.Sleep(10 * time.Millisecond)
++	}
++	t.Fatalf("tool call kind %q not observed: %#v", kind, snapshotEvents(events, mu))
++	return agenttypes.ToolCall{}
++}
++
+ func waitForEvent(t *testing.T, events *[]agenttypes.Event, mu *sync.Mutex, typ agenttypes.EventType) {
+ 	t.Helper()
+ 	deadline := time.Now().Add(2 * time.Second)
+@@ -350,26 +454,23 @@ func TestRuntimePromptStreamEmitsMessageDoneAndContextWindow(t *testing.T) {
+ 	}
+ }
+ 
+-func TestRuntimeMessageEndFallbackCompletesTurn(t *testing.T) {
++func TestRuntimeMessageEndOnlyDoesNotCompleteTurn(t *testing.T) {
+ 	sess := openTestSession(t, "message-end-only")
+ 	events, mu := collectSessionEvents(sess)
+ 
+-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+ 	defer cancel()
+-	if err := sess.SendMessage(ctx, "hello sdk"); err != nil {
+-		t.Fatal(err)
++	err := sess.SendMessage(ctx, "hello sdk")
++	if !errors.Is(err, context.DeadlineExceeded) {
++		t.Fatalf("SendMessage error = %v, want context deadline because message_end is not terminal", err)
+ 	}
+ 
+ 	gotEvents := snapshotEvents(events, mu)
+ 	if got := joinedMessageChunks(gotEvents); got != "sdk prompt: hello sdk" {
+ 		t.Fatalf("message chunks = %q, want deterministic sdk prompt", got)
+ 	}
+-	window, err := sess.ContextWindow(ctx)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	if window.TotalTokens != 7 || window.ModelContextWindow != 100 {
+-		t.Fatalf("context window = %+v, want total=7 window=100", window)
++	if hasEvent(gotEvents, agenttypes.EventTypeMessageDone) {
++		t.Fatalf("message_done emitted for message_end-only runtime: %#v", gotEvents)
+ 	}
+ }
+ 
+@@ -412,22 +513,272 @@ func TestRuntimeToolEventsMapToMindFSToolCalls(t *testing.T) {
+ 	}
+ }
+ 
+-func TestRuntimeTurnEndOnlyCompletesEmptyTurn(t *testing.T) {
+-	sess := openTestSession(t, "turn-end-only")
++func TestRuntimeAskUserQuestionAnswerRoundTripAndTodoUpdate(t *testing.T) {
++	sess := openTestSession(t, "ask-user-todo")
++	events, mu := collectSessionEvents(sess)
++
++	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++	defer cancel()
++	done := make(chan error, 1)
++	go func() {
++		done <- sess.SendMessage(ctx, "ask user and update todos")
++	}()
++
++	askCall := waitForToolCallKind(t, events, mu, agenttypes.ToolKindAskUser)
++	if askCall.CallID != "ask-1" || askCall.Status != "running" {
++		t.Fatalf("ask user tool call = %+v", askCall)
++	}
++	if _, ok := askCall.Meta["questions"]; !ok {
++		t.Fatalf("ask user tool call missing questions meta: %+v", askCall.Meta)
++	}
++	waitForEvent(t, events, mu, agenttypes.EventTypeTodoUpdate)
++
++	if err := sess.AnswerQuestion(ctx, agenttypes.AskUserAnswer{
++		ToolUseID: "ask-1",
++		Answers:   map[string]string{"Which bridge route should MindFS use?": "SDK bridge"},
++	}); err != nil {
++		t.Fatalf("AnswerQuestion: %v", err)
++	}
++
++	select {
++	case err := <-done:
++		if err != nil {
++			t.Fatalf("SendMessage: %v", err)
++		}
++	case <-ctx.Done():
++		t.Fatalf("SendMessage did not finish after AnswerQuestion: %v", ctx.Err())
++	}
++
++	gotEvents := snapshotEvents(events, mu)
++	updates := todoUpdates(gotEvents)
++	if len(updates) < 2 {
++		t.Fatalf("todo updates = %#v, want start and completion updates", updates)
++	}
++	if len(updates[0].Items) != 2 || updates[0].Items[0].Status != "in_progress" {
++		t.Fatalf("first todo update = %#v", updates[0])
++	}
++	askUpdates := toolCalls(gotEvents, agenttypes.EventTypeToolUpdate)
++	foundAskComplete := false
++	for _, update := range askUpdates {
++		if update.CallID == "ask-1" && update.Status == "complete" {
++			foundAskComplete = true
++			break
++		}
++	}
++	if !foundAskComplete {
++		t.Fatalf("ask completion update missing: %#v", askUpdates)
++	}
++	if got := joinedMessageChunks(gotEvents); !strings.Contains(got, "SDK bridge") {
++		t.Fatalf("message chunks = %q, want answered route", got)
++	}
++}
++
++func TestPiSDKEditInputMapsToDiffContent(t *testing.T) {
++	items := inputContentItems("edit", map[string]any{
++		"path":  "server/file.go",
++		"edits": []any{map[string]any{"oldText": "old", "newText": "new"}},
++	})
++	if len(items) != 1 {
++		t.Fatalf("inputContentItems = %#v, want one diff", items)
++	}
++	if items[0].Type != "diff" || items[0].Path != "server/file.go" || items[0].OldText == nil || *items[0].OldText != "old" || items[0].NewText != "new" {
++		t.Fatalf("edit diff item = %#v", items[0])
++	}
++}
++
++func TestPiSDKWriteInputMapsToAddContent(t *testing.T) {
++	items := inputContentItems("write", map[string]any{"path": "server/new.go", "content": "package main\n"})
++	if len(items) != 1 {
++		t.Fatalf("inputContentItems = %#v, want one add", items)
++	}
++	if items[0].Type != "text" || items[0].Path != "server/new.go" || items[0].ChangeKind != "add" || items[0].Text != "package main\n" {
++		t.Fatalf("write add item = %#v", items[0])
++	}
++}
++
++func TestPiSDKEditResultMapsPatchToDiffContent(t *testing.T) {
++	patch := "--- server/file.go\n+++ server/file.go\n@@ -1 +1 @@\n-old\n+new\n"
++	raw, err := json.Marshal(map[string]any{
++		"content": []map[string]any{{"type": "text", "text": "Successfully replaced 1 block(s) in server/file.go."}},
++		"details": map[string]any{"patch": patch, "diff": "-1 old\n+1 new", "firstChangedLine": 1},
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	items := resultContentItems(raw)
++	if len(items) < 2 {
++		t.Fatalf("resultContentItems = %#v, want patch plus text", items)
++	}
++	if items[0].Type != "text" || items[0].Text != patch || items[0].Path != "server/file.go" {
++		t.Fatalf("patch content item = %#v", items[0])
++	}
++	locations := resultLocations(raw)
++	if len(locations) != 1 || locations[0].Path != "server/file.go" {
++		t.Fatalf("resultLocations = %#v, want server/file.go", locations)
++	}
++}
++
++func TestPiSDKWriteFinalResultPreservesAddPreview(t *testing.T) {
++	raw, err := json.Marshal(map[string]any{
++		"content": []map[string]any{{"type": "text", "text": "Successfully wrote 13 bytes to server/new.go"}},
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	items := toolResultContentItems("write", map[string]any{
++		"path":    "server/new.go",
++		"content": "package main\n",
++	}, raw)
++	if len(items) != 2 {
++		t.Fatalf("toolResultContentItems = %#v, want add preview plus success text", items)
++	}
++	if items[0].Type != "text" || items[0].Path != "server/new.go" || items[0].ChangeKind != "add" || items[0].Text != "package main\n" {
++		t.Fatalf("add preview item = %#v", items[0])
++	}
++	if items[1].Text != "Successfully wrote 13 bytes to server/new.go" {
++		t.Fatalf("success item = %#v", items[1])
++	}
++}
++
++func TestPiSDKEditResultMapsDiffDetailWhenPatchMissing(t *testing.T) {
++	diff := "+1 new line\n-1 old line"
++	raw, err := json.Marshal(map[string]any{
++		"content": []map[string]any{{"type": "text", "text": "Successfully replaced 1 block(s) in server/file.go."}},
++		"details": map[string]any{"diff": diff, "firstChangedLine": 1},
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	items := resultContentItems(raw)
++	if len(items) < 2 {
++		t.Fatalf("resultContentItems = %#v, want diff plus text", items)
++	}
++	if items[0].Type != "text" || items[0].Text != diff {
++		t.Fatalf("diff detail item = %#v", items[0])
++	}
++}
++
++func TestPiSDKThinkingLevelChangedUpdatesMode(t *testing.T) {
++	sess := &session{mode: "off"}
++	sess.handleThinkingLevelChanged([]byte(`{"type":"thinking_level_changed","level":"high"}`))
++	if got := sess.mode; got != "high" {
++		t.Fatalf("mode = %q, want high", got)
++	}
++}
++
++func TestRuntimeWaitsAcrossToolTurnUntilAgentEnd(t *testing.T) {
++	sess := openTestSession(t, "tool-multi-turn")
+ 	events, mu := collectSessionEvents(sess)
+ 
+ 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+ 	defer cancel()
+ 	started := time.Now()
+-	if err := sess.SendMessage(ctx, "empty answer"); err != nil {
++	if err := sess.SendMessage(ctx, "list files"); err != nil {
+ 		t.Fatal(err)
+ 	}
+-	if elapsed := time.Since(started); elapsed > time.Second {
+-		t.Fatalf("SendMessage took %s, want turn_end to unblock promptly", elapsed)
++	if elapsed := time.Since(started); elapsed < messageEndFallbackDelay {
++		t.Fatalf("SendMessage returned after %s; want it to wait past delayed next LLM turn until final agent_end", elapsed)
+ 	}
++
+ 	gotEvents := snapshotEvents(events, mu)
++	if got := joinedMessageChunks(gotEvents); got != "final answer after tool: list files" {
++		t.Fatalf("message chunks = %q, want final post-tool answer; events=%#v", got, gotEvents)
++	}
+ 	if !hasEvent(gotEvents, agenttypes.EventTypeMessageDone) {
+-		t.Fatalf("message_done not emitted for turn_end-only runtime: %#v", gotEvents)
++		t.Fatalf("message_done event missing: %#v", gotEvents)
++	}
++}
++
++func TestRuntimeWaitsAcrossTextThenDelayedTool(t *testing.T) {
++	sess := openTestSession(t, "text-then-delayed-tool")
++	events, mu := collectSessionEvents(sess)
++
++	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++	defer cancel()
++	started := time.Now()
++	if err := sess.SendMessage(ctx, "run bash"); err != nil {
++		t.Fatal(err)
++	}
++	if elapsed := time.Since(started); elapsed < messageEndFallbackDelay+400*time.Millisecond {
++		t.Fatalf("SendMessage returned after %s; want it to wait across delayed tool execution", elapsed)
++	}
++
++	gotEvents := snapshotEvents(events, mu)
++	if got := joinedMessageChunks(gotEvents); got != "preparing tool: run bashdelayed tool complete: run bash" {
++		t.Fatalf("message chunks = %q, want pre-tool and final text; events=%#v", got, gotEvents)
++	}
++	starts := toolCalls(gotEvents, agenttypes.EventTypeToolCall)
++	if len(starts) != 1 || starts[0].Status != "running" {
++		t.Fatalf("tool_call events = %#v, want one running delayed tool", starts)
++	}
++	updates := toolCalls(gotEvents, agenttypes.EventTypeToolUpdate)
++	if len(updates) != 1 || updates[0].Status != "complete" {
++		t.Fatalf("tool_update events = %#v, want one complete delayed tool", updates)
++	}
++	if !hasEvent(gotEvents, agenttypes.EventTypeMessageDone) {
++		t.Fatalf("message_done event missing: %#v", gotEvents)
++	}
++}
++
++func TestRuntimeAgentEndWillRetryDoesNotCompleteTurn(t *testing.T) {
++	sess := openTestSession(t, "agent-end-retry")
++	events, mu := collectSessionEvents(sess)
++
++	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++	defer cancel()
++	started := time.Now()
++	if err := sess.SendMessage(ctx, "after retry"); err != nil {
++		t.Fatal(err)
++	}
++	if elapsed := time.Since(started); elapsed < 75*time.Millisecond {
++		t.Fatalf("SendMessage returned after %s; want willRetry=true agent_end to be ignored", elapsed)
++	}
++
++	gotEvents := snapshotEvents(events, mu)
++	if got := joinedMessageChunks(gotEvents); got != "retry finished: after retry" {
++		t.Fatalf("message chunks = %q, want retry output; events=%#v", got, gotEvents)
++	}
++}
++
++func TestRuntimeWaitsForPromptDoneAfterRawAgentEnd(t *testing.T) {
++	sess := openTestSession(t, "prompt-done-after-agent-end")
++	events, mu := collectSessionEvents(sess)
++
++	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++	defer cancel()
++	started := time.Now()
++	if err := sess.SendMessage(ctx, "compact first"); err != nil {
++		t.Fatal(err)
++	}
++	if elapsed := time.Since(started); elapsed < messageEndFallbackDelay {
++		t.Fatalf("SendMessage returned after %s; want raw agent_end promptDone=false to wait for SDK prompt resolution", elapsed)
++	}
++
++	gotEvents := snapshotEvents(events, mu)
++	if got := joinedMessageChunks(gotEvents); got != "answer before compaction: compact first" {
++		t.Fatalf("message chunks = %q, want answer before compaction; events=%#v", got, gotEvents)
++	}
++	if !hasEvent(gotEvents, agenttypes.EventTypeMessageDone) {
++		t.Fatalf("message_done event missing: %#v", gotEvents)
++	}
++}
++
++func TestRuntimeTurnEndOnlyDoesNotCompleteTurn(t *testing.T) {
++	sess := openTestSession(t, "turn-end-only")
++	events, mu := collectSessionEvents(sess)
++
++	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
++	defer cancel()
++	err := sess.SendMessage(ctx, "empty answer")
++	if !errors.Is(err, context.DeadlineExceeded) {
++		t.Fatalf("SendMessage error = %v, want context deadline because turn_end is not terminal", err)
++	}
++	gotEvents := snapshotEvents(events, mu)
++	if hasEvent(gotEvents, agenttypes.EventTypeMessageDone) {
++		t.Fatalf("message_done emitted for turn_end-only runtime: %#v", gotEvents)
+ 	}
+ 	if got := joinedMessageChunks(gotEvents); got != "" {
+ 		t.Fatalf("message chunks = %q, want empty", got)
+diff --git a/server/internal/agent/pool_test.go b/server/internal/agent/pool_test.go
+index 1c5554c..b895c93 100644
+--- a/server/internal/agent/pool_test.go
++++ b/server/internal/agent/pool_test.go
+@@ -108,6 +108,19 @@ func TestBundledAgentsJSONPiUsesPiSDK(t *testing.T) {
+ 	}
+ }
+ 
++func TestExternalSessionImporterSupportsPiSDKProtocol(t *testing.T) {
++	importer, err := NewExternalSessionImporter(Definition{Name: "pi", Protocol: ProtocolPiSDK})
++	if err != nil {
++		t.Fatalf("NewExternalSessionImporter(pi-sdk) error = %v", err)
++	}
++	if importer == nil {
++		t.Fatalf("NewExternalSessionImporter(pi-sdk) returned nil")
++	}
++	if got := importer.AgentName(); got != "pi" {
++		t.Fatalf("importer.AgentName() = %q, want pi", got)
++	}
++}
++
+ func TestPoolRoutesPiSDKProtocol(t *testing.T) {
+ 	cfg := Config{Agents: []Definition{{
+ 		Name:     "pi-sdk-test",
+diff --git a/server/internal/api/usecase/session.go b/server/internal/api/usecase/session.go
+index e389ca8..2903e85 100644
+--- a/server/internal/api/usecase/session.go
++++ b/server/internal/api/usecase/session.go
+@@ -746,16 +746,25 @@ func isCanceledTurnError(err error) bool {
+ 		strings.Contains(value, "cancelled")
+ }
+ 
+-func isStaleAgentSessionError(err error) bool {
++func compactAgentError(err error) string {
+ 	if err == nil {
++		return ""
++	}
++	return strings.Join(strings.Fields(strings.ToLower(strings.TrimSpace(err.Error()))), "")
++}
++
++func isAgentAlreadyProcessingError(err error) bool {
++	return strings.Contains(compactAgentError(err), "agentisalreadyprocessing")
++}
++
++func isStaleAgentSessionError(err error) bool {
++	compact := compactAgentError(err)
++	if compact == "" {
+ 		return false
+ 	}
+-	value := strings.ToLower(strings.TrimSpace(err.Error()))
+-	compact := strings.ReplaceAll(value, " ", "")
+ 	return strings.Contains(compact, "unknownsessionid") ||
+ 		strings.Contains(compact, "unknownsession") ||
+ 		strings.Contains(compact, "sessionnotfound") ||
+-		strings.Contains(compact, "agentisalreadyprocessing") ||
+ 		(strings.Contains(compact, "invalidparams") && strings.Contains(compact, "sessionid"))
+ }
+ 
+@@ -1271,6 +1280,7 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
+ 	})
+ 	var responseText string
+ 	sawAssistantChunk := false
++	var recoveryText string
+ 	plannedAssistantSeq := len(current.Exchanges) + 2
+ 	auxBuffer := make([]session.ExchangeAux, 0, 8)
+ 	var thoughtBuffer strings.Builder
+@@ -1344,6 +1354,23 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
+ 					responseText = appendResponseChunk(responseText, lastResponseUpdateType, chunk.Content)
+ 					lastResponseUpdateType = string(update.Type)
+ 				}
++			} else if update.Type == agenttypes.EventTypeRecovery {
++				if recovery, ok := update.Data.(agenttypes.RecoveryStatus); ok {
++					recoveryText = strings.TrimSpace(recovery.Message)
++				}
++			} else if update.Type == agenttypes.EventTypeMessageDone {
++				if !sawAssistantChunk && strings.TrimSpace(responseText) == "" {
++					responseText = emptyAssistantFallbackMessage(in.Agent, lastResponseUpdateType, recoveryText)
++					sawAssistantChunk = true
++					lastResponseUpdateType = string(agenttypes.EventTypeMessageChunk)
++					if in.OnUpdate != nil {
++						in.OnUpdate(agenttypes.Event{
++							Type:      agenttypes.EventTypeMessageChunk,
++							SessionID: update.SessionID,
++							Data:      agenttypes.MessageChunk{Content: responseText},
++						})
++					}
++				}
+ 			} else if update.Type == agenttypes.EventTypeThoughtChunk ||
+ 				update.Type == agenttypes.EventTypeToolCall ||
+ 				update.Type == agenttypes.EventTypeToolUpdate ||
+@@ -1584,6 +1611,8 @@ func attachBackgroundSessionUpdates(ctx context.Context, in subagentSessionInput
+ 	auxBuffer := make([]session.ExchangeAux, 0, 8)
+ 	var thoughtBuffer strings.Builder
+ 	lastResponseUpdateType := ""
++	sawAssistantChunk := false
++	var recoveryText string
+ 	var doneMu sync.Mutex
+ 	doneSent := false
+ 	flushThought := func() {
+@@ -1647,9 +1676,27 @@ func attachBackgroundSessionUpdates(ctx context.Context, in subagentSessionInput
+ 		}
+ 		if update.Type == agenttypes.EventTypeMessageChunk {
+ 			if chunk, ok := update.Data.(agenttypes.MessageChunk); ok {
++				sawAssistantChunk = true
+ 				responseText = appendResponseChunk(responseText, lastResponseUpdateType, chunk.Content)
+ 				lastResponseUpdateType = string(update.Type)
+ 			}
++		} else if update.Type == agenttypes.EventTypeRecovery {
++			if recovery, ok := update.Data.(agenttypes.RecoveryStatus); ok {
++				recoveryText = strings.TrimSpace(recovery.Message)
++			}
++		} else if update.Type == agenttypes.EventTypeMessageDone {
++			if !sawAssistantChunk && strings.TrimSpace(responseText) == "" {
++				responseText = emptyAssistantFallbackMessage(in.Agent, lastResponseUpdateType, recoveryText)
++				sawAssistantChunk = true
++				lastResponseUpdateType = string(agenttypes.EventTypeMessageChunk)
++				if in.OnUpdate != nil {
++					in.OnUpdate(child.Key, agenttypes.Event{
++						Type:      agenttypes.EventTypeMessageChunk,
++						SessionID: update.SessionID,
++						Data:      agenttypes.MessageChunk{Content: responseText},
++					})
++				}
++			}
+ 		} else if update.Type == agenttypes.EventTypeThoughtChunk ||
+ 			update.Type == agenttypes.EventTypeToolCall ||
+ 			update.Type == agenttypes.EventTypeToolUpdate ||
+@@ -1975,6 +2022,10 @@ func (s *Service) recoverAgentTurn(ctx context.Context, in SendRecoveryInput) (a
+ 			}
+ 			lastErr = err
+ 			log.Printf("[session/recovery] send.failed root=%s session=%s agent=%s attempt=%d/%d action=%s err=%v", in.RootID, in.SessionKey, in.AgentName, attempt, sessionRecoveryAttempts, recoveryAction, err)
++			if isAgentAlreadyProcessingError(err) {
++				log.Printf("[session/recovery] active_turn root=%s session=%s agent=%s attempt=%d/%d action=%s decision=stop_recovery err=%v", in.RootID, in.SessionKey, in.AgentName, attempt, sessionRecoveryAttempts, recoveryAction, err)
++				return nil, err
++			}
+ 			if isStaleAgentSessionError(err) {
+ 				pool := s.Registry.GetAgentPool()
+ 				if pool == nil {
+@@ -2117,6 +2168,24 @@ func appendResponseChunk(responseText, lastResponseUpdateType, chunk string) str
+ 	return responseText + chunk
+ }
+ 
++func emptyAssistantFallbackMessage(agentName, lastResponseUpdateType, recoveryText string) string {
++	if recoveryText = strings.TrimSpace(recoveryText); recoveryText != "" {
++		return recoveryText
++	}
++	agentName = strings.TrimSpace(agentName)
++	if agentName == "" {
++		agentName = "agent"
++	}
++	switch lastResponseUpdateType {
++	case string(agenttypes.EventTypeToolCall), string(agenttypes.EventTypeToolUpdate), string(agenttypes.EventTypeTodoUpdate):
++		return fmt.Sprintf("%s 本轮已完成工具调用，但没有返回可见文本。请重试或继续。", agentName)
++	case string(agenttypes.EventTypeThoughtChunk):
++		return fmt.Sprintf("%s 本轮只有思考内容，没有返回可见文本。请重试或继续。", agentName)
++	default:
++		return fmt.Sprintf("%s 本轮没有返回可见文本。请重试或继续。", agentName)
++	}
++}
++
+ func subagentSessionName(toolCall agenttypes.ToolCall, receiverThreadID string) string {
+ 	if prompt := stringMeta(toolCall.Meta, "prompt"); prompt != "" {
+ 		return truncateRunes(prompt, 48)
+diff --git a/server/internal/api/usecase/usecase_test.go b/server/internal/api/usecase/usecase_test.go
+index d7b5c8f..4cd7043 100644
+--- a/server/internal/api/usecase/usecase_test.go
++++ b/server/internal/api/usecase/usecase_test.go
+@@ -280,6 +280,74 @@ func TestSubSessionSyntheticDonePersistsPartialResponse(t *testing.T) {
+ 	}
+ }
+ 
++func TestSendMessageSynthesizesFallbackWhenAgentReturnsOnlyToolEvents(t *testing.T) {
++	ctx := context.Background()
++	rootDir := t.TempDir()
++	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
++	manager := session.NewManager(root)
++	created, err := manager.Create(ctx, session.CreateInput{Type: session.TypeChat, Agent: "pi", Name: "chat"})
++	if err != nil {
++		t.Fatalf("create chat session: %v", err)
++	}
++
++	pool := agent.NewPool(agent.Config{Agents: []agent.Definition{{
++		Name:     "pi",
++		Command:  writeFakePiSDKNoTextForUsecase(t),
++		Protocol: agent.ProtocolPiSDK,
++	}}})
++	defer pool.CloseAll()
++	service := Service{Registry: &chatAgentTestRegistry{
++		commandTestRegistry: &commandTestRegistry{root: root, manager: manager},
++		pool:                pool,
++	}}
++
++	var chunks []string
++	var sawDone bool
++	if err := service.SendMessage(ctx, SendMessageInput{
++		RootID:  root.ID,
++		Key:     created.Key,
++		Agent:   "pi",
++		Content: "run a tool",
++		OnUpdate: func(event agenttypes.Event) {
++			switch event.Type {
++			case agenttypes.EventTypeMessageChunk:
++				if chunk, ok := event.Data.(agenttypes.MessageChunk); ok {
++					chunks = append(chunks, chunk.Content)
++				}
++			case agenttypes.EventTypeMessageDone:
++				sawDone = true
++			}
++		},
++	}); err != nil {
++		t.Fatalf("SendMessage returned error: %v", err)
++	}
++	if !sawDone {
++		t.Fatalf("message_done was not emitted")
++	}
++	fallback := strings.Join(chunks, "")
++	if !strings.Contains(fallback, "已完成工具调用") || !strings.Contains(fallback, "没有返回可见文本") {
++		t.Fatalf("fallback chunk = %q", fallback)
++	}
++
++	loaded, err := manager.Get(ctx, created.Key, 0)
++	if err != nil {
++		t.Fatalf("get session: %v", err)
++	}
++	if len(loaded.Exchanges) != 2 {
++		t.Fatalf("exchanges = %d, want user and agent", len(loaded.Exchanges))
++	}
++	if loaded.Exchanges[1].Content != fallback {
++		t.Fatalf("persisted agent content = %q, want fallback %q", loaded.Exchanges[1].Content, fallback)
++	}
++	aux, err := manager.GetExchangeAux(ctx, created.Key, 0)
++	if err != nil {
++		t.Fatalf("get aux: %v", err)
++	}
++	if len(aux[2]) == 0 || aux[2][0].ToolCall == nil || aux[2][0].ToolCall.Status != "complete" {
++		t.Fatalf("aux[2] = %#v, want completed tool call", aux[2])
++	}
++}
++
+ func TestStaleAgentSessionErrorDetection(t *testing.T) {
+ 	cases := []struct {
+ 		name string
+@@ -288,6 +356,7 @@ func TestStaleAgentSessionErrorDetection(t *testing.T) {
+ 	}{
+ 		{name: "unknown session id", err: errors.New("Invalid params: Unknown sessionId: 019ea739"), want: true},
+ 		{name: "session not found", err: errors.New("session not found"), want: true},
++		{name: "agent already processing", err: errors.New("Agent is already processing"), want: false},
+ 		{name: "invalid unrelated params", err: errors.New("Invalid params: model required"), want: false},
+ 		{name: "ordinary upstream failure", err: errors.New("rate limit exceeded"), want: false},
+ 		{name: "nil", err: nil, want: false},
+@@ -301,6 +370,27 @@ func TestStaleAgentSessionErrorDetection(t *testing.T) {
+ 	}
+ }
+ 
++func TestAgentAlreadyProcessingErrorDetection(t *testing.T) {
++	cases := []struct {
++		name string
++		err  error
++		want bool
++	}{
++		{name: "plain", err: errors.New("Agent is already processing"), want: true},
++		{name: "compact", err: errors.New("agentisalreadyprocessing"), want: true},
++		{name: "with newline", err: errors.New("Agent is\nalready processing"), want: true},
++		{name: "unknown session", err: errors.New("Unknown sessionId"), want: false},
++		{name: "nil", err: nil, want: false},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			if got := isAgentAlreadyProcessingError(tc.err); got != tc.want {
++				t.Fatalf("isAgentAlreadyProcessingError(%v) = %v, want %v", tc.err, got, tc.want)
++			}
++		})
++	}
++}
++
+ func TestBuildPromptReadsHistoryWhenAgentContextReset(t *testing.T) {
+ 	ctx := context.Background()
+ 	rootDir := t.TempDir()
+@@ -1136,6 +1226,54 @@ for line in sys.stdin:
+ 	return path
+ }
+ 
++func writeFakePiSDKNoTextForUsecase(t *testing.T) string {
++	t.Helper()
++	path := filepath.Join(t.TempDir(), "fake-node")
++	script := `#!/usr/bin/env python3
++import json
++import sys
++
++def send(obj):
++    print(json.dumps(obj, ensure_ascii=False), flush=True)
++
++for line in sys.stdin:
++    req = json.loads(line)
++    req_id = req.get("id")
++    typ = req.get("type")
++    if typ == "start_sdk_runtime":
++        send({
++            "id": req_id,
++            "type": "response",
++            "command": "start_sdk_runtime",
++            "success": True,
++            "data": {"sessionId": "fake-pi-sdk-session"},
++        })
++    elif typ == "prompt":
++        send({"id": req_id, "type": "response", "command": "prompt", "success": True, "data": {"runtime": "sdk"}})
++        send({"type": "agent_start"})
++        send({
++            "type": "tool_execution_start",
++            "toolCallId": "tool-1",
++            "toolName": "fffind",
++            "args": {"pattern": "AGENTS.md"},
++        })
++        send({
++            "type": "tool_execution_end",
++            "toolCallId": "tool-1",
++            "toolName": "fffind",
++            "result": {"content": [{"type": "text", "text": "AGENTS.md"}]},
++            "isError": False,
++        })
++        send({"type": "agent_end", "willRetry": False})
++    else:
++        send({"id": req_id, "type": "response", "command": typ, "success": True, "data": {}})
++`
++	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
++		t.Fatalf("write fake pi sdk: %v", err)
++	}
++	return path
++}
++
+ func selectRunnableAgent(cfg agent.Config) (string, bool) {
+ 	want := strings.TrimSpace(os.Getenv("MINDFS_IT_AGENT_NAME"))
+ 	if want != "" {
+@@ -1277,6 +1415,15 @@ type commandTestRegistry struct {
+ 	manager *session.Manager
+ }
+ 
++type chatAgentTestRegistry struct {
++	*commandTestRegistry
++	pool *agent.Pool
++}
++
++func (r *chatAgentTestRegistry) GetAgentPool() *agent.Pool {
++	return r.pool
++}
++
+ func (r *commandTestRegistry) GetRoot(rootID string) (rootfs.RootInfo, error) {
+ 	if rootID != r.root.ID {
+ 		return rootfs.RootInfo{}, errors.New("root not found")
+diff --git a/server/internal/api/ws.go b/server/internal/api/ws.go
+index 0508f2e..ff22a43 100644
+--- a/server/internal/api/ws.go
++++ b/server/internal/api/ws.go
+@@ -514,8 +514,8 @@ func (h *WSHandler) handleSessionMessage(ctx context.Context, conn *websocket.Co
+ 			}
+ 			streamHub.BroadcastSessionStream(rootID, sessionKey, event)
+ 			if update.Type == agenttypes.EventTypeMessageDone {
+-				streamHub.ClearSessionPending(sessionKey)
+ 				streamHub.BroadcastSessionDone(rootID, sessionKey, "")
++				streamHub.ClearSessionPending(sessionKey)
+ 			}
+ 		},
+ 	})
+@@ -535,10 +535,9 @@ func (h *WSHandler) handleSessionMessage(ctx context.Context, conn *websocket.Co
+ 			streamHub.BroadcastSessionStream(rootID, key, event)
+ 		}
+ 	}
+-	streamHub.ClearSessionPending(key)
+-
+ 	log.Printf("[ws] session.done root=%s session=%s request=%s", rootID, key, req.ID)
+ 	streamHub.BroadcastSessionDone(rootID, key, req.ID)
++	streamHub.ClearSessionPending(key)
+ }
+ 
+ func (h *WSHandler) handleSessionReady(clientID string, req WSRequest) {
+@@ -586,8 +585,8 @@ func (h *WSHandler) handleSessionCancel(ctx context.Context, conn *websocket.Con
+ 	h.sendWSCancelled(conn, clientID, req.ID, rootID, key)
+ 	if h.AppContext != nil {
+ 		streamHub := h.AppContext.GetSessionStreamHub()
+-		streamHub.ClearSessionPending(key)
+ 		streamHub.BroadcastSessionDone(rootID, key, req.ID)
++		streamHub.ClearSessionPending(key)
+ 	}
+ }
+ 
+diff --git a/start.sh b/start.sh
+index 7937628..ac555f4 100755
+--- a/start.sh
++++ b/start.sh
+@@ -1,13 +1,29 @@
+ #!/usr/bin/env bash
+ set -euo pipefail
+ 
++ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++COMPOSE_FILE="${MINDFS_COMPOSE_FILE:-${ROOT_DIR}/docker-compose.yml}"
++COMPOSE_SERVICE="${MINDFS_COMPOSE_SERVICE:-mindfs}"
+ SERVICE_NAME="mindfs.service"
+ 
+-if ! command -v systemctl >/dev/null 2>&1; then
+-  echo "systemctl not found; this script expects mindfs to be managed by systemd" >&2
+-  exit 1
++if [[ -f "${COMPOSE_FILE}" ]] && command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
++  docker compose -f "${COMPOSE_FILE}" up -d --build "${COMPOSE_SERVICE}"
++  docker compose -f "${COMPOSE_FILE}" ps "${COMPOSE_SERVICE}"
++  exit 0
+ fi
+ 
+-systemctl daemon-reload
+-systemctl start "${SERVICE_NAME}"
+-systemctl --no-pager --full status "${SERVICE_NAME}" --lines=20
++if [[ -f "${COMPOSE_FILE}" ]] && command -v docker-compose >/dev/null 2>&1; then
++  docker-compose -f "${COMPOSE_FILE}" up -d --build "${COMPOSE_SERVICE}"
++  docker-compose -f "${COMPOSE_FILE}" ps "${COMPOSE_SERVICE}"
++  exit 0
++fi
++
++if command -v systemctl >/dev/null 2>&1; then
++  systemctl daemon-reload
++  systemctl start "${SERVICE_NAME}"
++  systemctl --no-pager --full status "${SERVICE_NAME}" --lines=20
++  exit 0
++fi
++
++echo "docker compose/docker-compose and systemctl are not available" >&2
++exit 1
+diff --git a/status.sh b/status.sh
+index 92e077a..a84fbbb 100755
+--- a/status.sh
++++ b/status.sh
+@@ -1,10 +1,19 @@
+ #!/usr/bin/env bash
+ set -euo pipefail
+ 
++ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++COMPOSE_FILE="${MINDFS_COMPOSE_FILE:-${ROOT_DIR}/docker-compose.yml}"
++COMPOSE_SERVICE="${MINDFS_COMPOSE_SERVICE:-mindfs}"
+ SERVICE_NAME="mindfs.service"
+ ADDR="10.23.50.137:7331"
+ 
+-systemctl --no-pager --full status "${SERVICE_NAME}" --lines=30 || true
++if [[ -f "${COMPOSE_FILE}" ]] && command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
++  docker compose -f "${COMPOSE_FILE}" ps "${COMPOSE_SERVICE}" || true
++elif [[ -f "${COMPOSE_FILE}" ]] && command -v docker-compose >/dev/null 2>&1; then
++  docker-compose -f "${COMPOSE_FILE}" ps "${COMPOSE_SERVICE}" || true
++elif command -v systemctl >/dev/null 2>&1; then
++  systemctl --no-pager --full status "${SERVICE_NAME}" --lines=30 || true
++fi
+ 
+ echo
+ /root/mindfs/mindfs -addr "${ADDR}" -status || true
+diff --git a/stop.sh b/stop.sh
+index 09a6e4a..52c565c 100755
+--- a/stop.sh
++++ b/stop.sh
+@@ -1,20 +1,34 @@
+ #!/usr/bin/env bash
+ set -euo pipefail
+ 
++ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++COMPOSE_FILE="${MINDFS_COMPOSE_FILE:-${ROOT_DIR}/docker-compose.yml}"
++COMPOSE_SERVICE="${MINDFS_COMPOSE_SERVICE:-mindfs}"
+ SERVICE_NAME="mindfs.service"
+ ADDR="10.23.50.137:7331"
+ 
+-if ! command -v systemctl >/dev/null 2>&1; then
+-  echo "systemctl not found; this script expects mindfs to be managed by systemd" >&2
+-  exit 1
++if [[ -f "${COMPOSE_FILE}" ]] && command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
++  docker compose -f "${COMPOSE_FILE}" stop "${COMPOSE_SERVICE}"
++  exit 0
+ fi
+ 
+-systemctl stop "${SERVICE_NAME}"
++if [[ -f "${COMPOSE_FILE}" ]] && command -v docker-compose >/dev/null 2>&1; then
++  docker-compose -f "${COMPOSE_FILE}" stop "${COMPOSE_SERVICE}"
++  exit 0
++fi
++
++if command -v systemctl >/dev/null 2>&1; then
++  systemctl stop "${SERVICE_NAME}"
++
++  if command -v ss >/dev/null 2>&1 && ss -ltnp 2>/dev/null | grep -q "${ADDR}"; then
++    echo "warning: ${ADDR} is still listening after stopping ${SERVICE_NAME}" >&2
++    ss -ltnp | grep "${ADDR}" >&2 || true
++    exit 1
++  fi
+ 
+-if command -v ss >/dev/null 2>&1 && ss -ltnp 2>/dev/null | grep -q "${ADDR}"; then
+-  echo "warning: ${ADDR} is still listening after stopping ${SERVICE_NAME}" >&2
+-  ss -ltnp | grep "${ADDR}" >&2 || true
+-  exit 1
++  echo "${SERVICE_NAME} stopped"
++  exit 0
+ fi
+ 
+-echo "${SERVICE_NAME} stopped"
++echo "docker compose/docker-compose and systemctl are not available" >&2
++exit 1
+diff --git a/web/src/App.tsx b/web/src/App.tsx
+index a8e3ec0..7bdfac5 100644
+--- a/web/src/App.tsx
++++ b/web/src/App.tsx
+@@ -297,6 +297,13 @@ type PendingSend = {
+   sessionKey?: string;
+   tempKey?: string;
+ };
++type RunningSessionTurn = {
++  rootId: string;
++  sessionKey: string;
++  requestId?: string;
++  startedAt: number;
++  lastEventAt: number;
++};
+ type ViewerSelection = {
+   filePath: string;
+   text?: string;
+@@ -1016,6 +1023,7 @@ export function App({ onGoHome }: AppProps) {
+   const pendingDraftRef = useRef<PendingSend | null>(null);
+   const pendingBySessionRef = useRef<Record<string, PendingSend>>({});
+   const pendingRequestRef = useRef<Record<string, PendingSend>>({});
++  const runningTurnBySessionRef = useRef<Record<string, RunningSessionTurn>>({});
+   const cancelRequestedBySessionRef = useRef<Record<string, boolean>>({});
+   const sessionCacheRef = useRef<Record<string, Session>>({});
+   const loadedSessionRef = useRef<Record<string, boolean>>({});
+@@ -1783,14 +1791,17 @@ export function App({ onGoHome }: AppProps) {
+       const exchanges = Array.isArray((cached as any)?.exchanges)
+         ? ((cached as any).exchanges as Exchange[]) || []
+         : fallbackExchanges;
++      const hasRunningTurn = !!runningTurnBySessionRef.current[ck];
+       const pending =
+-        drawerSession?.key === key
+-          ? !!(drawerSession as any)?.pending
+-          : typeof (session as any)?.pending === "boolean"
+-            ? !!(session as any).pending
+-            : typeof (cached as any)?.pending === "boolean"
+-              ? !!(cached as any).pending
+-              : undefined;
++        hasRunningTurn
++          ? true
++          : drawerSession?.key === key
++            ? !!(drawerSession as any)?.pending
++            : typeof (session as any)?.pending === "boolean"
++              ? !!(session as any).pending
++              : typeof (cached as any)?.pending === "boolean"
++                ? !!(cached as any).pending
++                : undefined;
+       return {
+         ...(session as any),
+         ...(cached as any),
+@@ -1830,6 +1841,9 @@ export function App({ onGoHome }: AppProps) {
+         return !!fallback;
+       }
+       const cacheKey = rootSessionKey(resolvedRoot, resolvedKey);
++      if (runningTurnBySessionRef.current[cacheKey]) {
++        return true;
++      }
+       if (pendingBySessionRef.current[cacheKey]) {
+         return true;
+       }
+@@ -1882,12 +1896,52 @@ export function App({ onGoHome }: AppProps) {
+       }
+       return (
+         !!serverPending ||
++        !!runningTurnBySessionRef.current[rootSessionKey(resolvedRoot, resolvedKey)] ||
+         !!pendingBySessionRef.current[rootSessionKey(resolvedRoot, resolvedKey)]
+       );
+     },
+     [rootSessionKey],
+   );
+ 
++  const markSessionTurnRunning = useCallback(
++    (
++      rootID: string | null | undefined,
++      sessionKey: string | null | undefined,
++      requestId?: string,
++    ) => {
++      const resolvedRoot = String(rootID || "");
++      const resolvedKey = String(sessionKey || "");
++      if (!resolvedRoot || !resolvedKey || resolvedKey.startsWith("pending-")) {
++        return;
++      }
++      const cacheKey = rootSessionKey(resolvedRoot, resolvedKey);
++      const now = Date.now();
++      const previous = runningTurnBySessionRef.current[cacheKey];
++      runningTurnBySessionRef.current[cacheKey] = {
++        rootId: resolvedRoot,
++        sessionKey: resolvedKey,
++        requestId: requestId || previous?.requestId,
++        startedAt: previous?.startedAt || now,
++        lastEventAt: now,
++      };
++    },
++    [rootSessionKey],
++  );
++
++  const forgetSessionTurnRunning = useCallback(
++    (rootID: string | null | undefined, sessionKey: string | null | undefined) => {
++      const resolvedRoot = String(rootID || "");
++      const resolvedKey = String(sessionKey || "");
++      if (!resolvedRoot || !resolvedKey || resolvedKey.startsWith("pending-")) {
++        return;
++      }
++      delete runningTurnBySessionRef.current[
++        rootSessionKey(resolvedRoot, resolvedKey)
++      ];
++    },
++    [rootSessionKey],
++  );
++
+   const clearLocalPendingForSession = useCallback(
+     (rootID: string | null | undefined, sessionKey: string | null | undefined) => {
+       const resolvedRoot = String(rootID || "");
+@@ -1896,6 +1950,7 @@ export function App({ onGoHome }: AppProps) {
+         return;
+       }
+       const cacheKey = rootSessionKey(resolvedRoot, resolvedKey);
++      delete runningTurnBySessionRef.current[cacheKey];
+       delete pendingBySessionRef.current[cacheKey];
+       delete cancelRequestedBySessionRef.current[cacheKey];
+ 
+@@ -2498,12 +2553,24 @@ export function App({ onGoHome }: AppProps) {
+       const mergeToolCall = (existing: any, incoming: any) => {
+         const merged = { ...(existing || {}), ...incoming };
+         const incomingMeta = (incoming?.meta || {}) as Record<string, unknown>;
++        const existingContent = ((existing?.content || []) as any[]).filter(Boolean);
++        const incomingContent = ((incoming?.content || []) as any[]).filter(Boolean);
++        const isDiffLikeToolText = (text: unknown): boolean => {
++          const value = typeof text === "string" ? text.trim() : "";
++          return /^(diff --git|index |--- |\+\+\+ |@@ )/m.test(value);
++        };
++        const hasStructuredChangeContent = (items: any[]): boolean =>
++          items.some((item) =>
++            item?.type === "diff" ||
++            (typeof item?.changeKind === "string" && item.changeKind.trim() !== "") ||
++            isDiffLikeToolText(item?.text),
++          );
+         const isUserShellStream =
+           incomingMeta.source === "userShell" && incomingMeta.phase === "stream";
+         if (isUserShellStream) {
+           const mergedContent = [
+-            ...((existing?.content || []) as any[]),
+-            ...((incoming?.content || []) as any[]),
++            ...existingContent,
++            ...incomingContent,
+           ];
+           const totalText = mergedContent.map((item) => item?.text || "").join("");
+           if (totalText.length > 256 * 1024) {
+@@ -2512,6 +2579,10 @@ export function App({ onGoHome }: AppProps) {
+             merged.content = mergedContent;
+           }
+           merged.meta = { ...(existing?.meta || {}), ...incomingMeta };
++        } else if (hasStructuredChangeContent(existingContent) && !hasStructuredChangeContent(incomingContent)) {
++          merged.content = incomingContent.length > 0
++            ? [...existingContent, ...incomingContent]
++            : existingContent;
+         }
+         if (!incoming.kind && existing?.kind) merged.kind = existing.kind;
+         if (!incoming.title && existing?.title) merged.title = existing.title;
+@@ -3441,6 +3512,7 @@ export function App({ onGoHome }: AppProps) {
+         delete loadedSessionRef.current[cacheKey];
+         delete loadingSessionRef.current[cacheKey];
+         delete pendingBySessionRef.current[cacheKey];
++        delete runningTurnBySessionRef.current[cacheKey];
+         delete cancelRequestedBySessionRef.current[cacheKey];
+         staleSessionKeysRef.current.delete(cacheKey);
+         void deleteCachedSession(rootID, deletedKey);
+@@ -4057,6 +4129,7 @@ export function App({ onGoHome }: AppProps) {
+       if (sendSessionKey) {
+         pendingBySessionRef.current[rootSessionKey(activeRoot, sendSessionKey)] =
+           pendingRequestRef.current[requestId];
++        markSessionTurnRunning(activeRoot, sendSessionKey, requestId);
+         const ck = rootSessionKey(activeRoot, sendSessionKey);
+         const cached =
+           sessionCacheRef.current[ck] || ({ ...(session as any) } as Session);
+@@ -4177,6 +4250,7 @@ export function App({ onGoHome }: AppProps) {
+         delete pendingBySessionRef.current[
+           rootSessionKey(activeRoot, failedSessionKey)
+         ];
++        forgetSessionTurnRunning(activeRoot, failedSessionKey);
+         setSelectedPendingByKey(failedSessionKey, false);
+         const latest = drawerSessionByRootRef.current[activeRoot];
+         if (latest && latest.key === failedSessionKey) {
+@@ -4195,6 +4269,8 @@ export function App({ onGoHome }: AppProps) {
+       setBoundSessionForRoot,
+       setDrawerOpenForRoot,
+       setDrawerSessionForRoot,
++      markSessionTurnRunning,
++      forgetSessionTurnRunning,
+       updateSessionAgentForKey,
+     ],
+   );
+@@ -4211,6 +4287,7 @@ export function App({ onGoHome }: AppProps) {
+         return;
+       }
+       delete pendingBySessionRef.current[cacheKey];
++      delete runningTurnBySessionRef.current[cacheKey];
+       const cached = sessionCacheRef.current[cacheKey];
+       if (cached && cached.key === sessionKey) {
+         sessionCacheRef.current[cacheKey] = {
+@@ -5999,6 +6076,8 @@ export function App({ onGoHome }: AppProps) {
+       }
+       const cacheKey = rootSessionKey(resolvedRoot, resolvedKey);
+       const pending = pendingBySessionRef.current[cacheKey];
++      const hasLocalRunningTurn =
++        !!pending || !!runningTurnBySessionRef.current[cacheKey];
+       const pendingAt = pending?.timestamp ? Date.parse(pending.timestamp) : Number.NaN;
+       const pendingAge = Number.isFinite(pendingAt)
+         ? Date.now() - pendingAt
+@@ -6006,7 +6085,8 @@ export function App({ onGoHome }: AppProps) {
+       candidates.set(cacheKey, {
+         rootID: resolvedRoot,
+         sessionKey: resolvedKey,
+-        canClear: !pending || pendingAge >= PENDING_RECONCILE_MIN_AGE_MS,
++        canClear:
++          !hasLocalRunningTurn && pendingAge >= PENDING_RECONCILE_MIN_AGE_MS,
+       });
+     };
+ 
+@@ -6250,6 +6330,7 @@ export function App({ onGoHome }: AppProps) {
+     ) => {
+       const cacheKey = rootSessionKey(rootID, sessionKey);
+       const pending = pendingBySessionRef.current[cacheKey];
++      const runningTurn = runningTurnBySessionRef.current[cacheKey];
+       if (requestId && pending?.requestId && pending.requestId !== requestId) {
+         console.info("[session/stream] ignore_stale_done", {
+           rootId: rootID,
+@@ -6259,10 +6340,24 @@ export function App({ onGoHome }: AppProps) {
+         });
+         return;
+       }
++      if (
++        requestId &&
++        runningTurn?.requestId &&
++        runningTurn.requestId !== requestId
++      ) {
++        console.info("[session/stream] ignore_stale_running_done", {
++          rootId: rootID,
++          sessionKey,
++          requestId,
++          runningRequestId: runningTurn.requestId,
++        });
++        return;
++      }
+       const wasCanceled = !!cancelRequestedBySessionRef.current[cacheKey];
+       if (wasCanceled) {
+         delete cancelRequestedBySessionRef.current[cacheKey];
+       }
++      forgetSessionTurnRunning(rootID, sessionKey);
+       clearLocalPendingForSession(rootID, sessionKey);
+       const drawer = drawerSessionByRootRef.current[rootID];
+       if (drawer && drawer.key === sessionKey) {
+@@ -6384,8 +6479,11 @@ export function App({ onGoHome }: AppProps) {
+       }
+       const event = payload.event;
+       if (!event?.type) return;
++      if (event.type !== "error") {
++        markSessionTurnRunning(activeRoot, streamKey, pending?.requestId);
++      }
+       const markStreamPending = () => {
+-        if (event.type === "message_done" || event.type === "error") return;
++        if (event.type === "error") return;
+         const now = new Date().toISOString();
+         const latest = sessionCacheRef.current[ck];
+         let cacheChanged = false;
+@@ -6559,7 +6657,6 @@ export function App({ onGoHome }: AppProps) {
+             event.data?.contextWindow,
+           );
+           playCompletionSound();
+-          handleSessionStreamDone(activeRoot, streamKey);
+           break;
+         case "error": {
+           const errorRequestId =
+@@ -6816,6 +6913,11 @@ export function App({ onGoHome }: AppProps) {
+           };
+           const acceptedTargetKey = pending.sessionKey || acceptedSessionKey;
+           if (acceptedTargetKey) {
++            markSessionTurnRunning(
++              pending.rootId,
++              acceptedTargetKey,
++              pending.requestId,
++            );
+             const cacheKey = rootSessionKey(pending.rootId, acceptedTargetKey);
+             const accepted = markAccepted(sessionCacheRef.current[cacheKey]);
+             if (accepted) {
+@@ -7190,7 +7292,9 @@ export function App({ onGoHome }: AppProps) {
+     appendToolCallForSession,
+     appendTodoUpdateForSession,
+     clearLocalPendingForSession,
++    forgetSessionTurnRunning,
+     clearSessionStale,
++    markSessionTurnRunning,
+     markSessionStale,
+     resolvePendingForSession,
+     setSelectedPendingByKey,
+diff --git a/web/src/components/ActionBar.tsx b/web/src/components/ActionBar.tsx
+index 094654d..d2d45a2 100644
+--- a/web/src/components/ActionBar.tsx
++++ b/web/src/components/ActionBar.tsx
+@@ -94,10 +94,29 @@ const chatBlurPlaceholders = [
+ const MOBILE_BREAKPOINT = 768;
+ const IME_ENTER_GUARD_MS = 120;
+ const CANDIDATE_FETCH_DEBOUNCE_MS = 512;
++const PI_GPT_DEFAULT_MODE = "xhigh";
+ 
+-function getAgentDefaults(agent?: AgentStatus | null) {
++function agentSupportsMode(agent: AgentStatus | null | undefined, mode: string) {
++  return (agent?.modes ?? []).some((item) => item.id === mode);
++}
++
++function isPiGPTModel(agent: AgentStatus | null | undefined, modelID: string) {
++  if (agent?.name !== "pi") {
++    return false;
++  }
++  const selectedModel = (agent.models ?? []).find((item) => item.id === modelID);
++  return `${modelID} ${selectedModel?.name || ""}`.toLowerCase().includes("gpt");
++}
++
++function getAgentDefaults(agent?: AgentStatus | null, selectedModelID?: string) {
++  const model = selectedModelID || agent?.default_model_id || agent?.current_model_id || "";
++  const mode =
++    isPiGPTModel(agent, model) && agentSupportsMode(agent, PI_GPT_DEFAULT_MODE)
++      ? PI_GPT_DEFAULT_MODE
++      : agent?.current_mode_id || "";
+   return {
+-    model: agent?.default_model_id || agent?.current_model_id || "",
++    model,
++    mode,
+     effort: agent?.default_effort || "",
+     fastService: (agent?.default_fast_service || "") as "" | "on" | "off",
+   } as const;
+@@ -435,7 +454,7 @@ export function ActionBar({
+     const defaults = getAgentDefaults(preferred);
+     setAgent(preferred.name);
+     setModel(defaults.model);
+-    setAgentMode("");
++    setAgentMode(defaults.mode);
+     setEffort(defaults.effort);
+     setFastService(defaults.fastService);
+   }, [agent, agents, currentSession]);
+@@ -467,6 +486,7 @@ export function ActionBar({
+       return;
+     }
+     setModel(defaults.model);
++    setAgentMode(defaults.mode);
+     setEffort(defaults.effort);
+     setFastService(defaults.fastService);
+   }, [agent, agents, currentSession, model]);
+@@ -852,7 +872,7 @@ export function ActionBar({
+     const defaults = getAgentDefaults(nextAgent);
+     setAgent(nextAgent.name);
+     setModel(defaults.model);
+-    setAgentMode("");
++    setAgentMode(defaults.mode);
+     setEffort(defaults.effort);
+     setFastService(defaults.fastService);
+     syncedSessionSignatureRef.current = "";
+@@ -1163,10 +1183,10 @@ export function ActionBar({
+                   agents={agents}
+                   onAgentChange={(nextAgent, nextModel) => {
+                     const nextStatus = agents.find((item) => item.name === nextAgent);
+-                    const defaults = getAgentDefaults(nextStatus);
++                    const defaults = getAgentDefaults(nextStatus, nextModel);
+                     setAgent(nextAgent);
+-                    setModel(nextModel || defaults.model);
+-                    setAgentMode("");
++                    setModel(defaults.model);
++                    setAgentMode(defaults.mode);
+                     setEffort(defaults.effort);
+                     setFastService(defaults.fastService);
+                   }}

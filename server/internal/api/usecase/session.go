@@ -765,16 +765,25 @@ func isCanceledTurnError(err error) bool {
 		strings.Contains(value, "cancelled")
 }
 
-func isStaleAgentSessionError(err error) bool {
+func compactAgentError(err error) string {
 	if err == nil {
+		return ""
+	}
+	return strings.Join(strings.Fields(strings.ToLower(strings.TrimSpace(err.Error()))), "")
+}
+
+func isAgentAlreadyProcessingError(err error) bool {
+	return strings.Contains(compactAgentError(err), "agentisalreadyprocessing")
+}
+
+func isStaleAgentSessionError(err error) bool {
+	compact := compactAgentError(err)
+	if compact == "" {
 		return false
 	}
-	value := strings.ToLower(strings.TrimSpace(err.Error()))
-	compact := strings.ReplaceAll(value, " ", "")
 	return strings.Contains(compact, "unknownsessionid") ||
 		strings.Contains(compact, "unknownsession") ||
 		strings.Contains(compact, "sessionnotfound") ||
-		strings.Contains(compact, "agentisalreadyprocessing") ||
 		(strings.Contains(compact, "invalidparams") && strings.Contains(compact, "sessionid"))
 }
 
@@ -1354,6 +1363,7 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 	})
 	var responseText string
 	sawAssistantChunk := false
+	var recoveryText string
 	plannedAssistantSeq := len(current.Exchanges) + 2
 	auxBuffer := make([]session.ExchangeAux, 0, 8)
 	defer manager.ClearPendingExchangeAux(context.Background(), current.Key)
@@ -1438,6 +1448,23 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 					sawAssistantChunk = true
 					responseText = appendResponseChunk(responseText, lastResponseUpdateType, chunk.Content)
 					lastResponseUpdateType = string(update.Type)
+				}
+			} else if update.Type == agenttypes.EventTypeRecovery {
+				if recovery, ok := update.Data.(agenttypes.RecoveryStatus); ok {
+					recoveryText = strings.TrimSpace(recovery.Message)
+				}
+			} else if update.Type == agenttypes.EventTypeMessageDone {
+				if !sawAssistantChunk && strings.TrimSpace(responseText) == "" {
+					responseText = emptyAssistantFallbackMessage(in.Agent, lastResponseUpdateType, recoveryText)
+					sawAssistantChunk = true
+					lastResponseUpdateType = string(agenttypes.EventTypeMessageChunk)
+					if in.OnUpdate != nil {
+						in.OnUpdate(agenttypes.Event{
+							Type:      agenttypes.EventTypeMessageChunk,
+							SessionID: update.SessionID,
+							Data:      agenttypes.MessageChunk{Content: responseText},
+						})
+					}
 				}
 			} else if update.Type == agenttypes.EventTypeThoughtChunk ||
 				update.Type == agenttypes.EventTypeToolCall ||
@@ -1685,6 +1712,8 @@ func attachBackgroundSessionUpdates(ctx context.Context, in subagentSessionInput
 	auxBuffer := make([]session.ExchangeAux, 0, 8)
 	var thoughtBuffer strings.Builder
 	lastResponseUpdateType := ""
+	sawAssistantChunk := false
+	var recoveryText string
 	var doneMu sync.Mutex
 	doneSent := false
 	currentThoughtID := ""
@@ -1760,8 +1789,26 @@ func attachBackgroundSessionUpdates(ctx context.Context, in subagentSessionInput
 		}
 		if update.Type == agenttypes.EventTypeMessageChunk {
 			if chunk, ok := update.Data.(agenttypes.MessageChunk); ok {
+				sawAssistantChunk = true
 				responseText = appendResponseChunk(responseText, lastResponseUpdateType, chunk.Content)
 				lastResponseUpdateType = string(update.Type)
+			}
+		} else if update.Type == agenttypes.EventTypeRecovery {
+			if recovery, ok := update.Data.(agenttypes.RecoveryStatus); ok {
+				recoveryText = strings.TrimSpace(recovery.Message)
+			}
+		} else if update.Type == agenttypes.EventTypeMessageDone {
+			if !sawAssistantChunk && strings.TrimSpace(responseText) == "" {
+				responseText = emptyAssistantFallbackMessage(in.Agent, lastResponseUpdateType, recoveryText)
+				sawAssistantChunk = true
+				lastResponseUpdateType = string(agenttypes.EventTypeMessageChunk)
+				if in.OnUpdate != nil {
+					in.OnUpdate(child.Key, agenttypes.Event{
+						Type:      agenttypes.EventTypeMessageChunk,
+						SessionID: update.SessionID,
+						Data:      agenttypes.MessageChunk{Content: responseText},
+					})
+				}
 			}
 		} else if update.Type == agenttypes.EventTypeThoughtChunk ||
 			update.Type == agenttypes.EventTypeToolCall ||
@@ -2093,6 +2140,10 @@ func (s *Service) recoverAgentTurn(ctx context.Context, in SendRecoveryInput) (a
 			}
 			lastErr = err
 			log.Printf("[session/recovery] send.failed root=%s session=%s agent=%s attempt=%d/%d action=%s err=%v", in.RootID, in.SessionKey, in.AgentName, attempt, sessionRecoveryAttempts, recoveryAction, err)
+			if isAgentAlreadyProcessingError(err) {
+				log.Printf("[session/recovery] active_turn root=%s session=%s agent=%s attempt=%d/%d action=%s decision=stop_recovery err=%v", in.RootID, in.SessionKey, in.AgentName, attempt, sessionRecoveryAttempts, recoveryAction, err)
+				return nil, err
+			}
 			if isStaleAgentSessionError(err) {
 				pool := s.Registry.GetAgentPool()
 				if pool == nil {
@@ -2244,6 +2295,24 @@ func randomHex(bytes int) string {
 		return fmt.Sprintf("%d", time.Now().UnixNano())
 	}
 	return hex.EncodeToString(buf)
+}
+
+func emptyAssistantFallbackMessage(agentName, lastResponseUpdateType, recoveryText string) string {
+	if recoveryText = strings.TrimSpace(recoveryText); recoveryText != "" {
+		return recoveryText
+	}
+	agentName = strings.TrimSpace(agentName)
+	if agentName == "" {
+		agentName = "agent"
+	}
+	switch lastResponseUpdateType {
+	case string(agenttypes.EventTypeToolCall), string(agenttypes.EventTypeToolUpdate), string(agenttypes.EventTypeTodoUpdate):
+		return fmt.Sprintf("%s 本轮已完成工具调用，但没有返回可见文本。请重试或继续。", agentName)
+	case string(agenttypes.EventTypeThoughtChunk):
+		return fmt.Sprintf("%s 本轮只有思考内容，没有返回可见文本。请重试或继续。", agentName)
+	default:
+		return fmt.Sprintf("%s 本轮没有返回可见文本。请重试或继续。", agentName)
+	}
 }
 
 func subagentSessionName(toolCall agenttypes.ToolCall, receiverThreadID string) string {

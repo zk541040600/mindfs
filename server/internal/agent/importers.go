@@ -31,7 +31,7 @@ func NewExternalSessionImporter(def Definition) (agenttypes.ExternalSessionImpor
 		return codex.NewImporter(codex.ImporterOptions{
 			AgentName: agentName,
 		}), nil
-	case ProtocolPiRPC:
+	case ProtocolPiRPC, ProtocolPiSDK:
 		return pi.NewImporter(pi.ImporterOptions{
 			AgentName: agentName,
 		}), nil
