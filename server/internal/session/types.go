@@ -21,6 +21,7 @@ type Session struct {
 	AgentCtxSeq      map[string]int `json:"agent_ctx_seq,omitempty"`
 	Model            string         `json:"model,omitempty"`
 	Shell            string         `json:"shell,omitempty"`
+	PlanMode         bool           `json:"plan_mode,omitempty"`
 	Name             string         `json:"name"`
 	Exchanges        []Exchange     `json:"exchanges"`
 	RelatedFiles     []RelatedFile  `json:"related_files"`
@@ -42,10 +43,11 @@ type Exchange struct {
 }
 
 type ExchangeAux struct {
-	Seq      int                  `json:"seq"`
-	Line     int                  `json:"line"`
-	ToolCall *agenttypes.ToolCall `json:"toolcall,omitempty"`
-	Thought  string               `json:"thought,omitempty"`
+	Seq       int                  `json:"seq"`
+	Line      int                  `json:"line"`
+	ToolCall  *agenttypes.ToolCall `json:"toolcall,omitempty"`
+	Thought   string               `json:"thought,omitempty"`
+	ThoughtID string               `json:"thought_id,omitempty"`
 }
 
 func CompactExchangeAux(aux ExchangeAux) (ExchangeAux, bool) {
@@ -63,8 +65,9 @@ func CompactExchangeAux(aux ExchangeAux) (ExchangeAux, bool) {
 }
 
 func CompactToolCall(toolCall agenttypes.ToolCall) agenttypes.ToolCall {
+	preserveContent := PreserveToolCallContent(toolCall.Kind)
 	switch {
-	case PreserveToolCallContent(toolCall.Kind):
+	case preserveContent:
 	case PreserveCommandExecutionContent(toolCall):
 		toolCall.Content = truncateToolCallContent(toolCall.Content, maxExecToolCallContentBytes)
 	case PreserveACPToolCallContent(toolCall):
@@ -72,7 +75,29 @@ func CompactToolCall(toolCall agenttypes.ToolCall) agenttypes.ToolCall {
 	default:
 		toolCall.Content = nil
 	}
+	if !preserveContent {
+		toolCall.Meta = compactToolCallMeta(toolCall.Meta)
+	}
 	return toolCall
+}
+
+func compactToolCallMeta(meta map[string]any) map[string]any {
+	if len(meta) == 0 {
+		return meta
+	}
+	out := make(map[string]any, len(meta))
+	for key, value := range meta {
+		switch key {
+		case "output":
+			continue
+		default:
+			out[key] = value
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func PreserveToolCallContent(kind agenttypes.ToolKind) bool {

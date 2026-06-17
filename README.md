@@ -1,6 +1,6 @@
 # MindFS
 
-[English](./README.md) | [简体中文](./README.zh.md)
+[English](./README.md) | [简体中文](./README.zh.md) | [Official Site](https://relay.a9gent.com/) | [Discord](https://discord.gg/YPJMqeWSn) | [Twitter](https://x.com/yandc18) | [【wechat group】](#wechat-group)
 
 > **AI Agent Remote Access Gateway · Result Visualization**
 
@@ -23,7 +23,7 @@ Access your personal AI agents and workstation data anywhere, anytime through Mi
 
 ### Agent Sessions
 
-- **Multi-Agent support**: Claude Code · OpenAI Codex · Gemini CLI · Cursor · GitHub Copilot · Cline · Augment · Kimi · Kiro · Qwen · Qoder · OMP · Pi · Hermes · OpenCode · OpenClaw — installed agents are detected automatically.
+- **Multi-Agent support**: Claude Code · OpenAI Codex · Gemini CLI · Cursor · GitHub Copilot · Cline · Augment · Kimi · Kiro · Qwen · Qoder · OMP · Pi · Hermes · Reasonix · OpenCode · OpenClaw — installed agents are detected automatically.
 - **Pi SDK runtime**: Pi uses the SDK runtime by default for chat, tool events, slash commands, extension UI, cancellation, model selection, thinking-level controls, and safe external-session import. `pi-rpc` remains available as an explicit rollback protocol.
 - **Real-time streaming**: Token-by-token output pushed to the browser; tool calls, thought traces, permission prompts, and remaining context-window capacity are rendered live as structured, collapsible cards.
 - **Flexible switching**: Switch agents or models mid-session; all agents share the same context — no need to re-explain the background.
@@ -34,6 +34,7 @@ Access your personal AI agents and workstation data anywhere, anytime through Mi
 - **Multi-device sync**: Access the same instance from multiple devices simultaneously with live session sync.
 - **Configuration backup and switching**: Agent configurations can be backed up and switched with one click, making it easier to move between multiple accounts or API keys.
 - **Subagents**: Codex subagents are automatically discovered and displayed.
+- **Scheduled tasks**: Trigger agents to run tasks at specified times.
 
 ### File Access
 
@@ -103,6 +104,9 @@ MindFS does not include any AI model — you need at least one Agent CLI install
 | **OMP** | https://github.com/can1357/oh-my-pi (`omp acp`) |
 | **Pi** | https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent (`pi` CLI; MindFS uses the SDK runtime by default) |
 | **Hermes** | https://hermes-agent.nousresearch.com/docs/user-guide/features/acp |
+| **Reasonix** | https://github.com/esengine/DeepSeek-Reasonix |
+
+MindFS also collects commonly used agents in the local UI. Open the file-tree menu, choose **Agent Install & Update**, then use the generated install/update commands for your platform. The commands are launched in MindFS command mode so you can review and run them from the same workspace.
 
 Once an agent is installed, start MindFS and interact with it through the browser.
 
@@ -124,6 +128,26 @@ irm https://raw.githubusercontent.com/zk541040600/mindfs/main/scripts/install.ps
 ```
 
 The install script auto-detects your OS and architecture, reads the latest version from the first line of [`release-notes.md`](https://raw.githubusercontent.com/zk541040600/mindfs/main/release-notes.md), then downloads the matching binary from [GitHub Releases](https://github.com/zk541040600/mindfs/releases). `release-notes.md` keeps release history with the newest entry at the top; `make release TAG=v1.2.3` commits and pushes it when changed, then uses only the top entry as the GitHub release notes.
+
+### Uninstall
+
+The uninstall command removes the installed binary, bundled web assets, bundled default `agents.json`, and the PATH entry added by the installer. User config and project `.mindfs/` data are kept by default.
+
+**macOS / Linux**
+```bash
+installer="${TMPDIR:-/tmp}/mindfs-install.sh"
+curl -fsSL https://raw.githubusercontent.com/a9gent/mindfs/main/scripts/install.sh -o "$installer"
+bash "$installer" --uninstall
+```
+
+**Windows (PowerShell)**
+```powershell
+$Installer = Join-Path $env:TEMP "mindfs-install.ps1"
+Invoke-WebRequest -Uri "https://raw.githubusercontent.com/a9gent/mindfs/main/scripts/install.ps1" -OutFile $Installer
+& $Installer -Uninstall
+```
+
+To also remove user-level MindFS config and logs, add `--purge` on macOS/Linux or `-Purge` on Windows. Project `.mindfs/` directories are never removed automatically.
 
 **Build from source** (requires Go 1.22+, Node.js 20+)
 ```bash
@@ -167,6 +191,33 @@ MindFS automatically detects the availability of installed agents. This usually 
 2. Log in to [a9gent.com](https://a9gent.com) and confirm the binding.
 3. Open your node — it is now accessible from any device.
 
+
+### Custom ACP Agents
+
+MindFS can load an extra `agents.json` for agent CLIs that speak the ACP protocol. This is useful when you are testing a new agent or want to keep project-specific agent definitions outside the bundled defaults.
+
+```json
+{
+  "agents": [
+    {
+      "name": "my-agent",
+      "brief": "Short description shown in the install/update list.",
+      "command": "my-agent",
+      "protocol": "acp",
+      "args": ["--acp"]
+    }
+  ]
+}
+```
+
+Start MindFS with the extra config:
+
+```bash
+mindfs -agent-config /path/to/agents.json
+```
+
+The extra file can add new agents or override a bundled definition with the same `name`.
+
 ### CLI Reference
 
 ```bash
@@ -186,9 +237,12 @@ mindfs -addr :9000 /path/to/project
 mindfs -foreground /path/to/project
 mindfs -status
 mindfs -version
+mindfs -update
+mindfs -uninstall
 mindfs -stop
 mindfs -restart
 mindfs -remove /path/to/project
+mindfs -agent-config /path/to/agents.json
 ```
 
 #### Flags
@@ -199,9 +253,13 @@ mindfs -remove /path/to/project
 | `-foreground` | `false` | Run the server in the foreground instead of starting a background service. |
 | `-status` | `false` | Show background service status, PID, URL, and log file path. |
 | `-version` | `false` | Show the current MindFS version. |
+| `-update` | `false` | Check for and install the latest MindFS release. Restart MindFS manually after updating. |
+| `-uninstall` | `false` | Print the uninstall command for the current platform. |
 | `-stop` | `false` | Stop the background service for the selected address. |
 | `-restart` | `false` | Stop the background service if present, then start it again. |
 | `-remove` | `false` | Remove `root` from the managed directory list. If the server is running, it is removed through the local API; otherwise it is removed from the local registry. |
+| `-config string` | empty | Read startup options from a JSON file. See [`config.json`](./config.json) for a template. Explicit command-line flags override file values. |
+| `-agent-config string` | empty | Load one extra `agents.json` file. |
 | `-no-relayer` | `false` | Disable relay integration. Local and private-network access still work. |
 | `-e2ee` | `false` | Enable end-to-end encryption for sensitive data. The pairing code can also be used as an authentication mechanism: unpaired frontends cannot access node content. LAN access requires `-tls` to work correctly. On first enablement, the CLI prints the pairing secret. |
 | `-tls` | `false` | Enable HTTPS. If `-cert` and `-key` are not provided, MindFS generates and reuses a local self-signed certificate. |
@@ -214,6 +272,11 @@ mindfs -remove /path/to/project
 
 Pull requests are welcome. For larger changes, please open an issue first to discuss the approach.
 
+## wechat-group
+
+<p align="center">
+  <img src="docs/images/mindfs-wechat-group.webp" alt="MindFS 微信群" width="360" />
+</p>
 
 ---
 

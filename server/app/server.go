@@ -2,8 +2,12 @@ package app
 
 import (
 	"context"
+	"fmt"
+	"io"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,22 +20,25 @@ import (
 	"mindfs/server/internal/githubimport"
 	"mindfs/server/internal/preferences"
 	"mindfs/server/internal/relay"
+	"mindfs/server/internal/scheduled"
 	"mindfs/server/internal/tlsutil"
 	"mindfs/server/internal/update"
 )
 
 const staticDirEnvKey = "MINDFS_STATIC_DIR"
 const externalProjectDiscoveryInterval = time.Minute
+const hostedAgentsRefreshInterval = 10 * time.Minute
 
 type StartOptions struct {
-	NoRelayer    bool
-	RelayBaseURL string
-	Version      string
-	Args         []string
-	E2EEConfig   E2EEConfig
-	UseTLS       bool
-	CertFile     string
-	KeyFile      string
+	NoRelayer       bool
+	RelayBaseURL    string
+	Version         string
+	Args            []string
+	AgentConfigPath string
+	E2EEConfig      E2EEConfig
+	UseTLS          bool
+	CertFile        string
+	KeyFile         string
 }
 
 type E2EEConfig struct {
@@ -72,7 +79,7 @@ func Start(ctx context.Context, addr string, opts StartOptions) error {
 	autoAddExternalProjectRoots(registry)
 	startExternalProjectDiscoveryLoop(ctx, registry)
 
-	agentConfig, err := agent.LoadConfig("")
+	agentConfig, err := agent.LoadConfigWithExtra(opts.AgentConfigPath)
 	if err != nil {
 		return err
 	}
@@ -83,6 +90,7 @@ func Start(ctx context.Context, addr string, opts StartOptions) error {
 	agentPool := agent.NewPool(agentConfig)
 	agentProber := agent.NewProber(&agentConfig, agentPool, 5*time.Minute)
 	agentProber.Start(ctx)
+	startHostedAgentConfigLoop(ctx, relayBaseURL, agentConfig, agentPool, agentProber)
 	prefs, err := preferences.NewStore()
 	if err != nil {
 		log.Printf("[preferences] init.error err=%v", err)
@@ -103,6 +111,8 @@ func Start(ctx context.Context, addr string, opts StartOptions) error {
 			PairingSecret: opts.E2EEConfig.PairingSecret,
 		}),
 	}
+	services.Scheduled = scheduled.NewService(services, services)
+	services.Scheduled.Start(ctx)
 	githubImportSvc, err := githubimport.NewService(services)
 	if err != nil {
 		return err
@@ -111,6 +121,7 @@ func Start(ctx context.Context, addr string, opts StartOptions) error {
 	httpHandler := &api.HTTPHandler{
 		AppContext: services,
 		StaticDir:  resolveStaticDir(),
+		Version:    opts.Version,
 	}
 	wsHandler := &api.WSHandler{AppContext: services}
 
@@ -125,6 +136,16 @@ func Start(ctx context.Context, addr string, opts StartOptions) error {
 		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	defer listener.Close()
+	localCLIToken, err := EnsureLocalCLIToken(addr)
+	if err != nil {
+		return err
+	}
+	httpHandler.LocalCLIToken = localCLIToken
 
 	relayMgr, err := relay.NewManager(addr, opts.NoRelayer, relayBaseURL, opts.UseTLS)
 	if err != nil {
@@ -149,9 +170,84 @@ func Start(ctx context.Context, addr string, opts StartOptions) error {
 	}
 
 	if opts.UseTLS {
-		return server.ListenAndServeTLS(opts.CertFile, opts.KeyFile)
+		return server.ServeTLS(listener, opts.CertFile, opts.KeyFile)
 	}
-	return server.ListenAndServe()
+	return server.Serve(listener)
+}
+
+func startHostedAgentConfigLoop(ctx context.Context, relayBaseURL string, localConfig agent.Config, pool *agent.Pool, prober *agent.Prober) {
+	endpoint, err := hostedAgentsURL(relayBaseURL)
+	if err != nil {
+		log.Printf("[agents/hosted] disabled invalid_relay_base_url=%q err=%v", relayBaseURL, err)
+		return
+	}
+	go func() {
+		refresh := func() {
+			merged, err := fetchHostedAgentConfig(ctx, endpoint, localConfig)
+			if err != nil {
+				log.Printf("[agents/hosted] refresh.error url=%s err=%v", endpoint, err)
+				return
+			}
+			effective := pool.UpdateConfig(merged)
+			prober.UpdateConfig(ctx, &effective)
+			log.Printf("[agents/hosted] refresh.ok url=%s agents=%d", endpoint, len(effective.Agents))
+		}
+		refresh()
+		ticker := time.NewTicker(hostedAgentsRefreshInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				refresh()
+			}
+		}
+	}()
+}
+
+func hostedAgentsURL(relayBaseURL string) (string, error) {
+	base := strings.TrimSpace(relayBaseURL)
+	if base == "" {
+		return "", fmt.Errorf("relay base url required")
+	}
+	u, err := url.Parse(base)
+	if err != nil {
+		return "", err
+	}
+	if u.Scheme == "" || u.Host == "" {
+		return "", fmt.Errorf("relay base url must be absolute")
+	}
+	u.Path = strings.TrimRight(u.Path, "/") + "/api/agents"
+	u.RawQuery = ""
+	u.Fragment = ""
+	return u.String(), nil
+}
+
+func fetchHostedAgentConfig(ctx context.Context, endpoint string, localConfig agent.Config) (agent.Config, error) {
+	reqCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return agent.Config{}, err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return agent.Config{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return agent.Config{}, fmt.Errorf("unexpected status %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	if err != nil {
+		return agent.Config{}, err
+	}
+	hosted, err := agent.DecodeConfig(body)
+	if err != nil {
+		return agent.Config{}, err
+	}
+	return agent.MergeHostedConfig(hosted, localConfig), nil
 }
 
 func autoAddExternalProjectRoots(registry *fs.Registry) {
@@ -175,6 +271,9 @@ func autoAddExternalProjectRoots(registry *fs.Registry) {
 			continue
 		}
 		if hasMindFSMetadataDir(projectPath) {
+			continue
+		}
+		if agent.IsTemporaryWorkDir(projectPath) {
 			continue
 		}
 		if _, err := registry.Upsert(projectPath); err != nil {

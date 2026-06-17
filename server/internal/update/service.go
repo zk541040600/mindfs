@@ -5,6 +5,11 @@ import (
 	"archive/zip"
 	"compress/gzip"
 	"context"
+	"crypto/ed25519"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -22,7 +27,10 @@ import (
 const (
 	defaultCheckInterval = time.Hour
 	releaseNotesPath     = "release-notes.md"
+	relayDownloadBase    = "https://relay.a9gent.com/mindfs-downloads"
 )
+
+var releaseManifestPublicKey string
 
 type Status struct {
 	CurrentVersion      string    `json:"current_version"`
@@ -63,6 +71,29 @@ type latestRelease struct {
 type releaseAsset struct {
 	Name               string `json:"name"`
 	BrowserDownloadURL string `json:"browser_download_url"`
+}
+
+type releaseManifest struct {
+	Version   string             `json:"version"`
+	Repo      string             `json:"repo,omitempty"`
+	Artifacts []manifestArtifact `json:"artifacts"`
+}
+
+type signedReleaseManifest struct {
+	Payload   string `json:"payload"`
+	Signature string `json:"signature"`
+}
+
+type manifestArtifact struct {
+	Name   string `json:"name"`
+	SHA256 string `json:"sha256"`
+	Size   int64  `json:"size,omitempty"`
+}
+
+type installLayout struct {
+	Mode   string
+	Prefix string
+	ExeDir string
 }
 
 func NewService(repo, currentVersion, executable string, args []string, interval time.Duration) *Service {
@@ -213,22 +244,98 @@ func (s *Service) TriggerUpdate(ctx context.Context) error {
 	return nil
 }
 
-func (s *Service) runUpdate(ctx context.Context, version string) {
+func (s *Service) InstallLatest(ctx context.Context) (Status, error) {
+	if s == nil {
+		return Status{}, errors.New("update service not configured")
+	}
 	release, err := s.fetchLatestRelease(ctx)
 	if err != nil {
+		s.updateStatus(func(st *Status) {
+			st.LastCheckedAt = time.Now().UTC()
+			st.Status = "failed"
+			st.Message = err.Error()
+		})
+		return s.GetStatus(), err
+	}
+	latest := normalizeVersion(release.TagName)
+	current := normalizeVersion(s.current)
+	hasUpdate := isNewerVersion(latest, current)
+	s.updateStatus(func(st *Status) {
+		st.CurrentVersion = s.current
+		st.LatestVersion = latest
+		st.ReleaseName = strings.TrimSpace(release.Name)
+		st.ReleaseBody = strings.TrimSpace(release.Body)
+		st.ReleaseURL = strings.TrimSpace(release.HTMLURL)
+		st.PublishedAt = release.PublishedAt
+		st.LastCheckedAt = time.Now().UTC()
+		st.HasUpdate = hasUpdate
+		st.AutoUpdateSupported = s.canAutoUpdate()
+		if !st.AutoUpdateSupported {
+			st.Status = "idle"
+			st.Message = s.unsupportedMessage()
+			return
+		}
+		st.Message = ""
+		if hasUpdate {
+			st.Status = "available"
+			return
+		}
+		st.Status = "idle"
+	})
+
+	st := s.GetStatus()
+	if !st.AutoUpdateSupported {
+		return st, errors.New(firstNonEmpty(st.Message, "auto update is not supported in this install mode"))
+	}
+	if !st.HasUpdate || strings.TrimSpace(st.LatestVersion) == "" {
+		return st, nil
+	}
+	if st.Status == "downloading" || st.Status == "installing" || st.Status == "restarting" {
+		return st, errors.New("update already in progress")
+	}
+
+	s.updateStatus(func(st *Status) {
+		st.Status = "downloading"
+		st.Message = "Downloading update..."
+	})
+	if err := s.installUpdate(ctx, st.LatestVersion, false); err != nil {
 		s.fail(err)
-		return
+		return s.GetStatus(), err
+	}
+	s.updateStatus(func(st *Status) {
+		st.Status = "installed"
+		st.Message = "Update installed. Restart MindFS to use the new version."
+	})
+	return s.GetStatus(), nil
+}
+
+func (s *Service) runUpdate(ctx context.Context, version string) {
+	if err := s.installUpdate(ctx, version, true); err != nil {
+		s.fail(err)
+	}
+}
+
+func (s *Service) installUpdate(ctx context.Context, version string, restart bool) error {
+	release, err := s.fetchLatestRelease(ctx)
+	if err != nil {
+		return err
 	}
 	asset, err := s.pickAsset(release, version)
 	if err != nil {
-		s.fail(err)
-		return
+		return err
+	}
+	manifest, err := s.fetchAndVerifyManifest(ctx, version)
+	if err != nil {
+		return err
+	}
+	artifact, err := manifest.findArtifact(asset.Name)
+	if err != nil {
+		return err
 	}
 
 	tmpDir, err := os.MkdirTemp("", "mindfs-update-*")
 	if err != nil {
-		s.fail(err)
-		return
+		return err
 	}
 	cleanupTmpDir := true
 	defer func() {
@@ -238,9 +345,11 @@ func (s *Service) runUpdate(ctx context.Context, version string) {
 	}()
 
 	archivePath := filepath.Join(tmpDir, asset.Name)
-	if err := s.downloadFile(ctx, asset.BrowserDownloadURL, archivePath); err != nil {
-		s.fail(err)
-		return
+	if err := s.downloadReleaseAsset(ctx, asset, archivePath); err != nil {
+		return err
+	}
+	if err := verifyFileSHA256(archivePath, artifact.SHA256, artifact.Size); err != nil {
+		return err
 	}
 
 	s.updateStatus(func(st *Status) {
@@ -250,33 +359,31 @@ func (s *Service) runUpdate(ctx context.Context, version string) {
 
 	extractDir := filepath.Join(tmpDir, "extract")
 	if err := os.MkdirAll(extractDir, 0o755); err != nil {
-		s.fail(err)
-		return
+		return err
 	}
 	if err := extractArchive(archivePath, extractDir); err != nil {
-		s.fail(err)
-		return
+		return err
 	}
 	pkgDir, err := findPackageDir(extractDir)
 	if err != nil {
-		s.fail(err)
-		return
+		return err
 	}
-	if runtime.GOOS == "windows" {
+	if restart && runtime.GOOS == "windows" {
 		s.updateStatus(func(st *Status) {
 			st.Status = "restarting"
 			st.Message = "Restarting service..."
 		})
 		if err := s.restartInstalledBinary(pkgDir); err != nil {
-			s.fail(err)
-			return
+			return err
 		}
 		cleanupTmpDir = false
-		return
+		return nil
 	}
 	if err := s.installPackage(pkgDir); err != nil {
-		s.fail(err)
-		return
+		return err
+	}
+	if !restart {
+		return nil
 	}
 
 	s.updateStatus(func(st *Status) {
@@ -284,9 +391,9 @@ func (s *Service) runUpdate(ctx context.Context, version string) {
 		st.Message = "Restarting service..."
 	})
 	if err := s.restartInstalledBinary(""); err != nil {
-		s.fail(err)
-		return
+		return err
 	}
+	return nil
 }
 
 func (s *Service) fail(err error) {
@@ -395,6 +502,120 @@ func (s *Service) releaseAssetForVersion(version string) releaseAsset {
 	}
 }
 
+func (s *Service) fetchAndVerifyManifest(ctx context.Context, version string) (releaseManifest, error) {
+	publicKey, err := updatePublicKey()
+	if err != nil {
+		return releaseManifest{}, err
+	}
+	version = normalizeTag(version)
+	base := fmt.Sprintf("https://github.com/%s/releases/download/%s/mindfs_%s_manifest.json", s.repo, version, version)
+	body, err := s.fetchURL(ctx, base, 4<<20)
+	if err != nil {
+		return releaseManifest{}, err
+	}
+	var envelope signedReleaseManifest
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return releaseManifest{}, fmt.Errorf("release manifest envelope invalid: %w", err)
+	}
+	if strings.TrimSpace(envelope.Payload) == "" || strings.TrimSpace(envelope.Signature) == "" {
+		return releaseManifest{}, errors.New("release manifest envelope missing payload or signature")
+	}
+	payload, err := decodeBase64String(envelope.Payload)
+	if err != nil {
+		return releaseManifest{}, fmt.Errorf("release manifest payload invalid: %w", err)
+	}
+	signature, err := decodeBase64String(envelope.Signature)
+	if err != nil {
+		return releaseManifest{}, fmt.Errorf("release manifest signature invalid: %w", err)
+	}
+	if !ed25519.Verify(publicKey, payload, signature) {
+		return releaseManifest{}, errors.New("release manifest signature verification failed")
+	}
+	var manifest releaseManifest
+	if err := json.Unmarshal(payload, &manifest); err != nil {
+		return releaseManifest{}, fmt.Errorf("release manifest invalid: %w", err)
+	}
+	if normalizeTag(manifest.Version) != version {
+		return releaseManifest{}, fmt.Errorf("release manifest version mismatch: got %q want %q", manifest.Version, version)
+	}
+	return manifest, nil
+}
+
+func updatePublicKey() (ed25519.PublicKey, error) {
+	encoded := strings.TrimSpace(releaseManifestPublicKey)
+	if encoded == "" {
+		return nil, errors.New("auto update requires a configured release manifest public key")
+	}
+	raw, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		raw, err = base64.RawStdEncoding.DecodeString(encoded)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("release manifest public key invalid: %w", err)
+	}
+	if len(raw) != ed25519.PublicKeySize {
+		return nil, fmt.Errorf("release manifest public key invalid length: got %d want %d", len(raw), ed25519.PublicKeySize)
+	}
+	return ed25519.PublicKey(raw), nil
+}
+
+func (m releaseManifest) findArtifact(name string) (manifestArtifact, error) {
+	for _, artifact := range m.Artifacts {
+		if strings.TrimSpace(artifact.Name) == name {
+			if _, err := parseSHA256Hex(artifact.SHA256); err != nil {
+				return manifestArtifact{}, fmt.Errorf("release manifest artifact %s invalid sha256: %w", name, err)
+			}
+			return artifact, nil
+		}
+	}
+	return manifestArtifact{}, fmt.Errorf("release manifest missing artifact: %s", name)
+}
+
+func verifyFileSHA256(path, wantHex string, wantSize int64) error {
+	want, err := parseSHA256Hex(wantHex)
+	if err != nil {
+		return err
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	hash := sha256.New()
+	size, err := io.Copy(hash, file)
+	if err != nil {
+		return err
+	}
+	if wantSize > 0 && size != wantSize {
+		return fmt.Errorf("downloaded artifact size mismatch: got %d want %d", size, wantSize)
+	}
+	if got := hash.Sum(nil); !bytesEqual(got, want) {
+		return errors.New("downloaded artifact sha256 verification failed")
+	}
+	return nil
+}
+
+func parseSHA256Hex(value string) ([]byte, error) {
+	value = strings.TrimSpace(value)
+	if len(value) != sha256.Size*2 {
+		return nil, fmt.Errorf("got %d hex chars want %d", len(value), sha256.Size*2)
+	}
+	out, err := hex.DecodeString(value)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func decodeBase64String(value string) ([]byte, error) {
+	encoded := strings.TrimSpace(value)
+	out, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		out, err = base64.RawStdEncoding.DecodeString(encoded)
+	}
+	return out, err
+}
+
 func (s *Service) downloadFile(ctx context.Context, url, dst string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -418,8 +639,65 @@ func (s *Service) downloadFile(ctx context.Context, url, dst string) error {
 	return err
 }
 
+func (s *Service) downloadReleaseAsset(ctx context.Context, asset releaseAsset, dst string) error {
+	primaryURL := strings.TrimSpace(asset.BrowserDownloadURL)
+	if primaryURL == "" {
+		return errors.New("release asset download URL unavailable")
+	}
+	if err := s.downloadFile(ctx, primaryURL, dst); err == nil {
+		return nil
+	} else {
+		fallbackURL := relayAssetURL(asset.Name)
+		if fallbackURL == "" || fallbackURL == primaryURL {
+			return err
+		}
+		log.Printf("[update] download.github_failed asset=%s err=%v fallback=%s", strings.TrimSpace(asset.Name), err, fallbackURL)
+		_ = os.Remove(dst)
+		if fallbackErr := s.downloadFile(ctx, fallbackURL, dst); fallbackErr != nil {
+			return fmt.Errorf("download failed from GitHub (%v) and relay fallback (%v)", err, fallbackErr)
+		}
+		return nil
+	}
+}
+
+func relayAssetURL(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" || strings.ContainsAny(name, `/\`) {
+		return ""
+	}
+	return strings.TrimRight(relayDownloadBase, "/") + "/" + name
+}
+
+func (s *Service) fetchURL(ctx context.Context, url string, limit int64) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "mindfs-updater")
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("download failed: %s", resp.Status)
+	}
+	reader := io.Reader(resp.Body)
+	if limit > 0 {
+		reader = io.LimitReader(resp.Body, limit+1)
+	}
+	body, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, err
+	}
+	if limit > 0 && int64(len(body)) > limit {
+		return nil, fmt.Errorf("download exceeds size limit: %d bytes", limit)
+	}
+	return body, nil
+}
+
 func (s *Service) installPackage(pkgDir string) error {
-	prefix, err := s.installPrefix()
+	layout, err := s.installLayout()
 	if err != nil {
 		return err
 	}
@@ -431,10 +709,7 @@ func (s *Service) installPackage(pkgDir string) error {
 	if _, err := os.Stat(srcBin); err != nil {
 		return fmt.Errorf("updated binary missing: %w", err)
 	}
-	if runtime.GOOS == "windows" {
-		return nil
-	}
-	dstBin := filepath.Join(prefix, "bin", binName)
+	dstBin, dstAgents, dstWeb := layout.destinationPaths(binName)
 	if err := os.MkdirAll(filepath.Dir(dstBin), 0o755); err != nil {
 		return err
 	}
@@ -443,7 +718,6 @@ func (s *Service) installPackage(pkgDir string) error {
 	}
 	srcWeb := filepath.Join(pkgDir, "web")
 	if info, err := os.Stat(srcWeb); err == nil && info.IsDir() {
-		dstWeb := filepath.Join(prefix, "share", "mindfs", "web")
 		if err := os.RemoveAll(dstWeb); err != nil {
 			return err
 		}
@@ -453,7 +727,6 @@ func (s *Service) installPackage(pkgDir string) error {
 	}
 	srcAgents := filepath.Join(pkgDir, "agents.json")
 	if info, err := os.Stat(srcAgents); err == nil && !info.IsDir() {
-		dstAgents := filepath.Join(prefix, "share", "mindfs", "agents.json")
 		if err := os.MkdirAll(filepath.Dir(dstAgents), 0o755); err != nil {
 			return err
 		}
@@ -479,12 +752,17 @@ func (s *Service) restartInstalledBinary(pkgDir string) error {
 	if strings.TrimSpace(exe) == "" {
 		return errors.New("current executable path unavailable")
 	}
-	prefix, err := s.installPrefix()
+	layout, err := s.installLayout()
 	if err != nil {
 		return err
 	}
+	binName := "mindfs"
+	if runtime.GOOS == "windows" {
+		binName = "mindfs.exe"
+	}
+	dstBin, dstAgents, dstWeb := layout.destinationPaths(binName)
 	log.Printf("[update] restart.begin exe=%s args=%q", exe, s.args)
-	if err := startReplacementProcess(os.Getpid(), exe, s.args, os.Stdout, os.Stderr, pkgDir, prefix); err != nil {
+	if err := startReplacementProcess(os.Getpid(), exe, s.args, os.Stdout, os.Stderr, pkgDir, dstBin, dstAgents, dstWeb); err != nil {
 		return err
 	}
 	go func() {
@@ -498,32 +776,60 @@ func (s *Service) canAutoUpdate() bool {
 	if strings.TrimSpace(s.executable) == "" {
 		return false
 	}
+	if _, err := updatePublicKey(); err != nil {
+		return false
+	}
 	base := strings.ToLower(filepath.Base(s.executable))
 	if base != "mindfs" && base != "mindfs.exe" {
 		return false
 	}
-	_, err := s.installPrefix()
+	_, err := s.installLayout()
 	return err == nil
 }
 
 func (s *Service) unsupportedMessage() string {
+	if _, err := updatePublicKey(); err != nil {
+		return "Auto update is unavailable because the release verification public key is not configured."
+	}
 	base := strings.ToLower(filepath.Base(s.executable))
 	if base != "mindfs" && base != "mindfs.exe" {
-		return "Auto update is only available for installed mindfs release binaries."
+		return "Auto update is only available for mindfs release binaries."
 	}
 	return "Auto update is unavailable for the current install path."
 }
 
-func (s *Service) installPrefix() (string, error) {
+func (s *Service) installLayout() (installLayout, error) {
 	exe := strings.TrimSpace(s.executable)
 	if exe == "" {
-		return "", errors.New("executable path required")
+		return installLayout{}, errors.New("executable path required")
 	}
-	binDir := filepath.Dir(exe)
-	if strings.ToLower(filepath.Base(binDir)) != "bin" {
-		return "", errors.New("unsupported executable layout")
+	base := strings.ToLower(filepath.Base(exe))
+	if base != "mindfs" && base != "mindfs.exe" {
+		return installLayout{}, errors.New("unsupported executable name")
 	}
-	return filepath.Dir(binDir), nil
+	exeDir := filepath.Dir(exe)
+	if strings.ToLower(filepath.Base(exeDir)) == "bin" {
+		return installLayout{
+			Mode:   "installed",
+			Prefix: filepath.Dir(exeDir),
+			ExeDir: exeDir,
+		}, nil
+	}
+	return installLayout{
+		Mode:   "portable",
+		ExeDir: exeDir,
+	}, nil
+}
+
+func (l installLayout) destinationPaths(binName string) (string, string, string) {
+	if l.Mode == "installed" {
+		return filepath.Join(l.Prefix, "bin", binName),
+			filepath.Join(l.Prefix, "share", "mindfs", "agents.json"),
+			filepath.Join(l.Prefix, "share", "mindfs", "web")
+	}
+	return filepath.Join(l.ExeDir, binName),
+		filepath.Join(l.ExeDir, "agents.json"),
+		filepath.Join(l.ExeDir, "web")
 }
 
 func normalizeVersion(v string) string {
@@ -645,6 +951,17 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
+func bytesEqual(left, right []byte) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	var diff byte
+	for i := range left {
+		diff |= left[i] ^ right[i]
+	}
+	return diff == 0
+}
+
 func extractArchive(archivePath, dst string) error {
 	switch {
 	case strings.HasSuffix(archivePath, ".tar.gz"):
@@ -676,13 +993,16 @@ func extractTarGz(path, dst string) error {
 		if err != nil {
 			return err
 		}
-		target := filepath.Join(dst, header.Name)
+		target, err := safeArchiveTarget(dst, header.Name)
+		if err != nil {
+			return err
+		}
 		switch header.Typeflag {
 		case tar.TypeDir:
 			if err := os.MkdirAll(target, 0o755); err != nil {
 				return err
 			}
-		case tar.TypeReg:
+		case tar.TypeReg, tar.TypeRegA:
 			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 				return err
 			}
@@ -697,6 +1017,8 @@ func extractTarGz(path, dst string) error {
 			if err := file.Close(); err != nil {
 				return err
 			}
+		default:
+			return fmt.Errorf("unsupported tar entry type for %s", header.Name)
 		}
 	}
 }
@@ -708,7 +1030,13 @@ func extractZip(path, dst string) error {
 	}
 	defer reader.Close()
 	for _, file := range reader.File {
-		target := filepath.Join(dst, file.Name)
+		if file.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("unsupported zip symlink entry: %s", file.Name)
+		}
+		target, err := safeArchiveTarget(dst, file.Name)
+		if err != nil {
+			return err
+		}
 		if file.FileInfo().IsDir() {
 			if err := os.MkdirAll(target, 0o755); err != nil {
 				return err
@@ -743,6 +1071,33 @@ func extractZip(path, dst string) error {
 	return nil
 }
 
+func safeArchiveTarget(root, name string) (string, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "", errors.New("empty archive entry name")
+	}
+	if filepath.IsAbs(name) {
+		return "", fmt.Errorf("unsafe absolute archive entry: %s", name)
+	}
+	clean := filepath.Clean(name)
+	if clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("unsafe archive entry path: %s", name)
+	}
+	rootAbs, err := filepath.Abs(root)
+	if err != nil {
+		return "", err
+	}
+	target := filepath.Join(rootAbs, clean)
+	rel, err := filepath.Rel(rootAbs, target)
+	if err != nil {
+		return "", err
+	}
+	if rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return "", fmt.Errorf("archive entry escapes destination: %s", name)
+	}
+	return target, nil
+}
+
 func findPackageDir(root string) (string, error) {
 	entries, err := os.ReadDir(root)
 	if err != nil {
@@ -775,6 +1130,9 @@ func replaceFile(src, dst string, mode os.FileMode) error {
 		return err
 	}
 	if err := out.Close(); err != nil {
+		return err
+	}
+	if err := os.Remove(dst); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	return os.Rename(tmp, dst)

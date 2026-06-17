@@ -63,8 +63,12 @@ func TestCredentialsStoreSaveLoad(t *testing.T) {
 		t.Fatalf("Load() = %+v, want %+v", got.Relay, input.Relay)
 	}
 
-	if _, err := os.Stat(store.filePath); err != nil {
+	info, err := os.Stat(store.filePath)
+	if err != nil {
 		t.Fatalf("credentials file missing: %v", err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("credentials file mode = %o, want 0600", info.Mode().Perm())
 	}
 }
 
@@ -105,6 +109,56 @@ func TestBuildBindPollURL(t *testing.T) {
 	}
 	if got != "https://relay.example.com/api/bind/poll?code=pc_123" {
 		t.Fatalf("buildBindPollURL() = %q", got)
+	}
+}
+
+func TestPrepareLocalProxyHeadersRemovesRelayInternalHeaders(t *testing.T) {
+	original, err := http.NewRequest(http.MethodGet, "https://test-node-relay.a9gent.com/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original.Host = "test-node-relay.a9gent.com"
+	original.Header.Set("X-MindFS-Relayed", "1")
+	original.Header.Set("X-MindFS-Relay-Service-Slug", "test")
+	targetURL, err := url.Parse("http://127.0.0.1:5173/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	outbound := original.Clone(original.Context())
+
+	prepareLocalProxyHeaders(outbound, original, targetURL, true)
+
+	if got := outbound.Header.Get("X-MindFS-Relayed"); got != "" {
+		t.Fatalf("X-MindFS-Relayed = %q, want empty", got)
+	}
+	if got := outbound.Header.Get("X-MindFS-Relay-Service-Slug"); got != "" {
+		t.Fatalf("X-MindFS-Relay-Service-Slug = %q, want empty", got)
+	}
+	if got := outbound.Header.Get("X-Forwarded-Host"); got != "test-node-relay.a9gent.com" {
+		t.Fatalf("X-Forwarded-Host = %q", got)
+	}
+}
+
+func TestPrepareLocalProxyHeadersKeepsRelayedHeaderForNodeProxy(t *testing.T) {
+	original, err := http.NewRequest(http.MethodGet, "https://relay.a9gent.com/n/node/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original.Host = "relay.a9gent.com"
+	original.Header.Set("X-MindFS-Relayed", "1")
+	targetURL, err := url.Parse("http://127.0.0.1:7331/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	outbound := original.Clone(original.Context())
+
+	prepareLocalProxyHeaders(outbound, original, targetURL, false)
+
+	if got := outbound.Header.Get("X-MindFS-Relayed"); got != "1" {
+		t.Fatalf("X-MindFS-Relayed = %q, want 1", got)
+	}
+	if got := outbound.Header.Get("X-Forwarded-Host"); got != "relay.a9gent.com" {
+		t.Fatalf("X-Forwarded-Host = %q", got)
 	}
 }
 

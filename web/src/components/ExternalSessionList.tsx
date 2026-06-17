@@ -29,10 +29,12 @@ type ExternalSessionListProps = {
   onBack?: () => void;
   onSelect?: (session: SessionItem) => void;
   onToggleImport?: (session: SessionItem) => void;
+  onToggleSelectAllImport?: (checked: boolean) => void;
   onConfirmImport?: () => void;
   onLoadOlder?: () => void;
   onRefresh?: () => void;
   loading?: boolean;
+  error?: string;
   loadingOlder?: boolean;
   sdkRefreshing?: boolean;
   confirmingImport?: boolean;
@@ -53,10 +55,12 @@ export function ExternalSessionList({
   onBack,
   onSelect,
   onToggleImport,
+  onToggleSelectAllImport,
   onConfirmImport,
   onLoadOlder,
   onRefresh,
   loading = false,
+  error = "",
   loadingOlder = false,
   sdkRefreshing = false,
   confirmingImport = false,
@@ -64,6 +68,22 @@ export function ExternalSessionList({
 }: ExternalSessionListProps) {
   const selectedCount = selectedImportKeys?.size || 0;
   const busy = confirmingImport || Boolean(importingKey) || Boolean(importingKeys?.size);
+  const importableKeys = sessions.map(externalSessionKey).filter(Boolean);
+  const selectedVisibleCount = importableKeys.filter((key) =>
+    selectedImportKeys?.has(key),
+  ).length;
+  const allVisibleSelected =
+    importableKeys.length > 0 && selectedVisibleCount === importableKeys.length;
+  const partiallySelected =
+    selectedVisibleCount > 0 && selectedVisibleCount < importableKeys.length;
+  const selectAllRef = React.useRef<HTMLInputElement | null>(null);
+
+  React.useEffect(() => {
+    if (selectAllRef.current) {
+      selectAllRef.current.indeterminate = partiallySelected;
+    }
+  }, [partiallySelected]);
+
   return (
     <div
       style={{
@@ -117,6 +137,8 @@ export function ExternalSessionList({
           <div style={emptyStyle}>正在加载可导入会话...</div>
         ) : !selectedAgent ? (
           <div style={emptyStyle}>选择一个 Agent 查看可导入会话</div>
+        ) : error && !sessions.length ? (
+          <div style={errorStyle}>{error}</div>
         ) : !sessions.length ? (
           <div style={emptyStyle}>
             {filterBound
@@ -125,6 +147,7 @@ export function ExternalSessionList({
           </div>
         ) : (
           <div style={{ display: "flex", flexDirection: "column", gap: "2px" }}>
+            {error ? <div style={errorStyle}>{error}</div> : null}
             {sessions.map((session) => (
               <ExternalSessionCard
                 key={session.key}
@@ -169,14 +192,52 @@ export function ExternalSessionList({
             borderTop: "1px solid var(--border-color)",
             padding: "8px 10px",
             background: "var(--mindfs-topbar-bg, transparent)",
+            display: "flex",
+            alignItems: "center",
+            gap: "8px",
           }}
         >
+          <label
+            style={{
+              height: "36px",
+              display: "inline-flex",
+              alignItems: "center",
+              gap: "6px",
+              flexShrink: 0,
+              color: "var(--text-secondary)",
+              fontSize: "12px",
+              fontWeight: 500,
+              cursor: busy ? "not-allowed" : "pointer",
+              opacity: busy ? 0.64 : 1,
+              userSelect: "none",
+              whiteSpace: "nowrap",
+            }}
+          >
+            <input
+              ref={selectAllRef}
+              type="checkbox"
+              checked={allVisibleSelected}
+              disabled={busy || !importableKeys.length}
+              onChange={(event) =>
+                onToggleSelectAllImport?.(event.currentTarget.checked)
+              }
+              style={{
+                width: "14px",
+                height: "14px",
+                margin: 0,
+                accentColor: "var(--accent-color)",
+                cursor: busy ? "not-allowed" : "pointer",
+              }}
+            />
+            全选
+          </label>
           <button
             type="button"
             disabled={!selectedCount || busy}
             onClick={onConfirmImport}
             style={{
-              width: "100%",
+              flex: 1,
+              minWidth: 0,
               border: "1px solid var(--border-color)",
               borderRadius: "10px",
               background: "var(--accent-color)",
@@ -454,6 +515,12 @@ const emptyStyle: React.CSSProperties = {
   fontSize: "12px",
   color: "var(--text-secondary)",
   padding: "12px 8px",
+};
+
+const errorStyle: React.CSSProperties = {
+  ...emptyStyle,
+  color: "var(--danger-color, #b42318)",
+  whiteSpace: "pre-wrap",
 };
 
 function iconButtonStyle(withGap: boolean): React.CSSProperties {

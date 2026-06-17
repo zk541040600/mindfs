@@ -31,6 +31,47 @@
 - Pi import UI 展示 SDK 状态与刷新按钮。
 - 保持 `agents.json` 中 Pi 为 `protocol: "pi-rpc"`，普通聊天、slash、tool、extension UI 不切到 SDK。
 
+# MindFS v0.3.5
+
+## 新功能
+- 通过前端安装和更新agent
+- cli通过-agent-config 可自定义agent/shell
+- cli增加-config 配置文件选项
+
+## 优化和修复
+- 取消回复时冻结队列，不在自动发送
+- 优化更新包下载
+- cli 增加 -update 更新选项
+- markdown 渲染数学公式
+- 文件权限错误返回到前端
+- 修复移动端长时间切后台后一直正在回复的问题
+- codex skill 扫描目录增加.agent/skills
+
+
+# MindFS v0.3.4
+
+## 新功能
+- 当前链接状态圆点提示
+- 错误信息框中可以刷新重启后台agent
+- 普通 toolcall 结果从后台获取
+- 回复中可以发送新消息、发送后排队、可打断发送
+- 定时任务
+- agent 增加 reasonix
+
+## 优化和修复
+- 修复 relay 下的 ws 链接错误
+- 修复 切换 project 后的 ws 状态错误
+- ask user中增加自定义回答
+- 侧边栏可折叠收回
+- 会话导入增加全选
+- 修复 cc 导入会话项目匹配问题
+- 修复项目发现时加入临时目录问题
+- 修复有的 ui 组件颜色模式不一致问题
+- 修复 cc 默认模型无法设置思考等级问题
+- 修复导入阶段卡主问题
+- e2ee 安全加固
+- 自升级安装包签名验证
+
 
 # MindFS v0.3.1
 

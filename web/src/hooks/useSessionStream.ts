@@ -14,6 +14,7 @@ type ExchangeLike = {
   effort?: string;
   fast_service?: string;
   content?: string;
+  thought_id?: string;
   context_window?: {
     totalTokens: number;
     modelContextWindow: number;
@@ -200,13 +201,15 @@ function buildAssistantTimeline(
     }
     if (aux.thought) {
       out.push({
-        id: stableTimelineID(
-          "thought",
-          index * 1000 + segmentIndex,
-          aux.thought,
-          ex.timestamp,
-          ex.agent,
-        ),
+        id:
+          aux.thought_id ||
+          stableTimelineID(
+            "thought",
+            index * 1000 + segmentIndex,
+            aux.thought,
+            ex.timestamp,
+            ex.agent,
+          ),
         type: "thought",
         content: aux.thought,
       });
@@ -288,7 +291,9 @@ function buildBaseTimeline(
     if (role === "thought") {
       if (!content) continue;
       out.push({
-        id: stableTimelineID("thought", index, content, ex.timestamp, ex.agent),
+        id:
+          ex.thought_id ||
+          stableTimelineID("thought", index, content, ex.timestamp, ex.agent),
         type: "thought",
         content,
       });

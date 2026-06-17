@@ -18,6 +18,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	agenttypes "mindfs/server/internal/agent/types"
 	"mindfs/server/internal/fs"
 
 	_ "modernc.org/sqlite"
@@ -28,8 +29,8 @@ const (
 	exchangeFileTpl  = "sessions/%s.jsonl"
 	auxFileTpl       = "sessions/%s.aux.jsonl"
 	selectSessionSQL = `
-SELECT key, type, parent_session_key, parent_tool_call_id, model, shell, name, related_files_json, created_at, updated_at, closed_at
-FROM sessions`
+	SELECT key, type, parent_session_key, parent_tool_call_id, model, shell, plan_mode, name, related_files_json, created_at, updated_at, closed_at
+	FROM sessions`
 	deleteSessionSQL = `
 DELETE FROM sessions
 WHERE key = ?`
@@ -38,15 +39,16 @@ DELETE FROM session_agent_bindings
 WHERE session_key = ?`
 	upsertSessionMetaSQL = `
 INSERT INTO sessions (
-	key, type, parent_session_key, parent_tool_call_id, model, shell, name, related_files_json, created_at, updated_at, closed_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		key, type, parent_session_key, parent_tool_call_id, model, shell, plan_mode, name, related_files_json, created_at, updated_at, closed_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(key) DO UPDATE SET
 	type = excluded.type,
 	parent_session_key = excluded.parent_session_key,
-	parent_tool_call_id = excluded.parent_tool_call_id,
-	model = excluded.model,
-	shell = excluded.shell,
-	name = excluded.name,
+		parent_tool_call_id = excluded.parent_tool_call_id,
+		model = excluded.model,
+		shell = excluded.shell,
+		plan_mode = excluded.plan_mode,
+		name = excluded.name,
 	related_files_json = excluded.related_files_json,
 	created_at = excluded.created_at,
 	updated_at = excluded.updated_at,
@@ -57,9 +59,10 @@ CREATE TABLE IF NOT EXISTS sessions (
 	type TEXT NOT NULL,
 	parent_session_key TEXT NOT NULL DEFAULT '',
 	parent_tool_call_id TEXT NOT NULL DEFAULT '',
-	model TEXT NOT NULL DEFAULT '',
-	shell TEXT NOT NULL DEFAULT '',
-	name TEXT NOT NULL,
+		model TEXT NOT NULL DEFAULT '',
+		shell TEXT NOT NULL DEFAULT '',
+		plan_mode INTEGER NOT NULL DEFAULT 0,
+		name TEXT NOT NULL,
 	related_files_json TEXT NOT NULL,
 	created_at TEXT NOT NULL,
 	updated_at TEXT NOT NULL,
@@ -96,16 +99,17 @@ LIMIT 1`
 )
 
 type Manager struct {
-	root            fs.RootInfo
-	mu              sync.Mutex
-	loopOnce        sync.Once
-	db              *sql.DB
-	sessions        map[string]*Session
-	now             func() time.Time
-	idleInterval    time.Duration
-	idleFor         time.Duration
-	closeFor        time.Duration
-	maxIdleSessions int
+	root             fs.RootInfo
+	mu               sync.Mutex
+	loopOnce         sync.Once
+	db               *sql.DB
+	sessions         map[string]*Session
+	pendingToolCalls map[string]map[string]agenttypes.ToolCall
+	now              func() time.Time
+	idleInterval     time.Duration
+	idleFor          time.Duration
+	closeFor         time.Duration
+	maxIdleSessions  int
 }
 
 type CreateInput struct {
@@ -116,6 +120,7 @@ type CreateInput struct {
 	Agent            string
 	Model            string
 	Shell            string
+	PlanMode         bool
 	Name             string
 }
 
@@ -134,13 +139,14 @@ type ListOptions struct {
 
 func NewManager(root fs.RootInfo, opts ...Option) *Manager {
 	m := &Manager{
-		root:            root,
-		sessions:        make(map[string]*Session),
-		now:             time.Now,
-		idleInterval:    1 * time.Minute,
-		idleFor:         10 * time.Minute,
-		closeFor:        7 * 24 * time.Hour,
-		maxIdleSessions: 3,
+		root:             root,
+		sessions:         make(map[string]*Session),
+		pendingToolCalls: make(map[string]map[string]agenttypes.ToolCall),
+		now:              time.Now,
+		idleInterval:     1 * time.Minute,
+		idleFor:          10 * time.Minute,
+		closeFor:         7 * 24 * time.Hour,
+		maxIdleSessions:  3,
 	}
 	for _, opt := range opts {
 		opt(m)
@@ -199,6 +205,7 @@ func (m *Manager) Create(_ context.Context, input CreateInput) (*Session, error)
 		AgentCtxSeq:      agentCtxSeq,
 		Model:            strings.TrimSpace(input.Model),
 		Shell:            strings.TrimSpace(input.Shell),
+		PlanMode:         input.PlanMode,
 		Name:             name,
 		Exchanges:        []Exchange{},
 		RelatedFiles:     []RelatedFile{},
@@ -225,6 +232,79 @@ func (m *Manager) GetExchangeAux(_ context.Context, key string, afterSeq int) (m
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.loadExchangeAux(key, afterSeq)
+}
+
+func (m *Manager) GetFullToolCall(_ context.Context, key, callID string) (*agenttypes.ToolCall, error) {
+	if strings.TrimSpace(key) == "" {
+		return nil, errors.New("session key required")
+	}
+	callID = strings.TrimSpace(callID)
+	if callID == "" {
+		return nil, errors.New("tool call id required")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if found, ok := m.pendingFullToolCallUnsafe(key, callID); ok {
+		return found, nil
+	}
+	aux, err := m.loadExchangeAuxEntries(key, 0)
+	if err != nil {
+		return nil, err
+	}
+	var found *agenttypes.ToolCall
+	for _, item := range aux {
+		if item.ToolCall == nil || strings.TrimSpace(item.ToolCall.CallID) != callID {
+			continue
+		}
+		next := *item.ToolCall
+		if found == nil {
+			found = &next
+			continue
+		}
+		merged := mergeToolCall(*found, next)
+		found = &merged
+	}
+	if found == nil {
+		return nil, os.ErrNotExist
+	}
+	return found, nil
+}
+
+func (m *Manager) UpsertPendingExchangeAux(_ context.Context, sessionKey string, aux ExchangeAux) error {
+	sessionKey = strings.TrimSpace(sessionKey)
+	if sessionKey == "" {
+		return errors.New("session key required")
+	}
+	if aux.ToolCall == nil || strings.TrimSpace(aux.ToolCall.CallID) == "" {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.pendingToolCalls == nil {
+		m.pendingToolCalls = make(map[string]map[string]agenttypes.ToolCall)
+	}
+	callID := strings.TrimSpace(aux.ToolCall.CallID)
+	next := cloneToolCall(*aux.ToolCall)
+	byCallID := m.pendingToolCalls[sessionKey]
+	if byCallID == nil {
+		byCallID = make(map[string]agenttypes.ToolCall)
+		m.pendingToolCalls[sessionKey] = byCallID
+	}
+	if existing, ok := byCallID[callID]; ok {
+		next = mergeToolCall(existing, next)
+	}
+	byCallID[callID] = next
+	return nil
+}
+
+func (m *Manager) ClearPendingExchangeAux(_ context.Context, sessionKey string) {
+	sessionKey = strings.TrimSpace(sessionKey)
+	if sessionKey == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.pendingToolCalls, sessionKey)
 }
 
 func (m *Manager) List(_ context.Context, opts ListOptions) ([]*Session, error) {
@@ -371,13 +451,9 @@ func (m *Manager) AddExchangeAux(_ context.Context, sessionKey string, aux Excha
 	if aux.ToolCall == nil && strings.TrimSpace(aux.Thought) == "" {
 		return errors.New("aux content required")
 	}
-	compacted, ok := CompactExchangeAux(aux)
-	if !ok {
-		return nil
-	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.appendExchangeAux(sessionKey, compacted)
+	return m.appendExchangeAux(sessionKey, aux)
 }
 
 func (m *Manager) AddRelatedFile(_ context.Context, key string, file RelatedFile) error {
@@ -672,6 +748,27 @@ func (m *Manager) UpdateShell(_ context.Context, session *Session, shell string)
 	return m.upsertSessionMetaUnsafe(current)
 }
 
+func (m *Manager) UpdatePlanMode(_ context.Context, session *Session, enabled bool) error {
+	if session == nil || strings.TrimSpace(session.Key) == "" {
+		return errors.New("session required")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	current, err := m.getSessionUnsafe(session.Key, 0)
+	if err != nil {
+		return err
+	}
+	if current.PlanMode == enabled {
+		session.PlanMode = enabled
+		return nil
+	}
+	current.PlanMode = enabled
+	current.UpdatedAt = m.now().UTC()
+	session.PlanMode = enabled
+	session.UpdatedAt = current.UpdatedAt
+	return m.upsertSessionMetaUnsafe(current)
+}
+
 func (m *Manager) closeSessionUnsafe(key string) (*Session, error) {
 	session, err := m.getSessionUnsafe(key, 0)
 	if err != nil {
@@ -828,7 +925,7 @@ func (m *Manager) createSessionUnsafe(session *Session) error {
 	if statErr == nil {
 		return nil
 	}
-	if !os.IsNotExist(statErr) {
+	if !errors.Is(statErr, os.ErrNotExist) {
 		return statErr
 	}
 	return m.root.WriteMetaFile(path, []byte{})
@@ -1014,7 +1111,7 @@ func (m *Manager) loadExchanges(key string, afterSeq int) ([]Exchange, int, erro
 	}
 	payload, err := m.root.ReadMetaFile(path)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, os.ErrNotExist) {
 			return []Exchange{}, 0, nil
 		}
 		return nil, 0, err
@@ -1069,18 +1166,34 @@ func (m *Manager) appendExchange(key string, exchange Exchange) error {
 }
 
 func (m *Manager) loadExchangeAux(key string, afterSeq int) (map[int][]ExchangeAux, error) {
+	entries, err := m.loadExchangeAuxEntries(key, afterSeq)
+	if err != nil {
+		return nil, err
+	}
+	items := make(map[int][]ExchangeAux)
+	for _, entry := range entries {
+		compacted, ok := CompactExchangeAux(entry)
+		if !ok {
+			continue
+		}
+		items[compacted.Seq] = append(items[compacted.Seq], compacted)
+	}
+	return items, nil
+}
+
+func (m *Manager) loadExchangeAuxEntries(key string, afterSeq int) ([]ExchangeAux, error) {
 	path, err := m.auxPath(key)
 	if err != nil {
 		return nil, err
 	}
 	payload, err := m.root.ReadMetaFile(path)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return map[int][]ExchangeAux{}, nil
+		if errors.Is(err, os.ErrNotExist) {
+			return []ExchangeAux{}, nil
 		}
 		return nil, err
 	}
-	items := make(map[int][]ExchangeAux)
+	items := make([]ExchangeAux, 0)
 	scanner := jsonlScanner(payload)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -1097,16 +1210,72 @@ func (m *Manager) loadExchangeAux(key string, afterSeq int) (map[int][]ExchangeA
 		if afterSeq > 0 && entry.Seq <= afterSeq {
 			continue
 		}
-		compacted, ok := CompactExchangeAux(entry)
-		if !ok {
-			continue
-		}
-		items[compacted.Seq] = append(items[compacted.Seq], compacted)
+		items = append(items, entry)
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, err
 	}
 	return items, nil
+}
+
+func mergeToolCall(base, next agenttypes.ToolCall) agenttypes.ToolCall {
+	merged := base
+	if strings.TrimSpace(next.CallID) != "" {
+		merged.CallID = next.CallID
+	}
+	if strings.TrimSpace(next.Title) != "" {
+		merged.Title = next.Title
+	}
+	if strings.TrimSpace(next.Status) != "" {
+		merged.Status = next.Status
+	}
+	if next.Kind != "" {
+		merged.Kind = next.Kind
+	}
+	if len(next.Content) > 0 {
+		merged.Content = append([]agenttypes.ToolCallContentItem(nil), next.Content...)
+	}
+	if len(next.Locations) > 0 {
+		merged.Locations = append([]agenttypes.ToolCallLocation(nil), next.Locations...)
+	}
+	if strings.TrimSpace(next.RawType) != "" {
+		merged.RawType = next.RawType
+	}
+	if len(base.Meta) > 0 || len(next.Meta) > 0 {
+		merged.Meta = make(map[string]any, len(base.Meta)+len(next.Meta))
+		for key, value := range base.Meta {
+			merged.Meta[key] = value
+		}
+		for key, value := range next.Meta {
+			merged.Meta[key] = value
+		}
+	}
+	return merged
+}
+
+func (m *Manager) pendingFullToolCallUnsafe(sessionKey, callID string) (*agenttypes.ToolCall, bool) {
+	if m.pendingToolCalls == nil {
+		return nil, false
+	}
+	toolCall, ok := m.pendingToolCalls[sessionKey][callID]
+	if !ok {
+		return nil, false
+	}
+	out := cloneToolCall(toolCall)
+	return &out, true
+}
+
+func cloneToolCall(toolCall agenttypes.ToolCall) agenttypes.ToolCall {
+	out := toolCall
+	out.Content = append([]agenttypes.ToolCallContentItem(nil), toolCall.Content...)
+	out.Locations = append([]agenttypes.ToolCallLocation(nil), toolCall.Locations...)
+	if len(toolCall.Meta) > 0 {
+		out.Meta = make(map[string]any, len(toolCall.Meta))
+		for key, value := range toolCall.Meta {
+			out.Meta[key] = value
+		}
+	}
+	return out
 }
 
 func jsonlScanner(payload []byte) *bufio.Scanner {
@@ -1198,6 +1367,10 @@ func (m *Manager) ensureSessionMetaDBUnsafe() (*sql.DB, error) {
 		db.Close()
 		return nil, err
 	}
+	if _, err := db.Exec(`ALTER TABLE sessions ADD COLUMN plan_mode INTEGER NOT NULL DEFAULT 0`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
+		db.Close()
+		return nil, err
+	}
 	for _, stmt := range []string{
 		`ALTER TABLE sessions ADD COLUMN parent_session_key TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE sessions ADD COLUMN parent_tool_call_id TEXT NOT NULL DEFAULT ''`,
@@ -1230,12 +1403,20 @@ func sessionMetaUpsertArgs(session *Session) ([]any, error) {
 		session.ParentToolCallID,
 		session.Model,
 		session.Shell,
+		boolToSQLiteInt(session.PlanMode),
 		session.Name,
 		string(relatedFilesJSON),
 		session.CreatedAt.UTC().Format(time.RFC3339Nano),
 		session.UpdatedAt.UTC().Format(time.RFC3339Nano),
 		closedAt,
 	}, nil
+}
+
+func boolToSQLiteInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
 }
 
 type rowScanner interface {
@@ -1250,6 +1431,7 @@ func scanSessionMetaRow(scanner rowScanner) (*Session, error) {
 		parentToolCallID string
 		model            string
 		shell            string
+		planMode         int
 		name             string
 		relatedFilesJSON string
 		createdAtRaw     string
@@ -1263,6 +1445,7 @@ func scanSessionMetaRow(scanner rowScanner) (*Session, error) {
 		&parentToolCallID,
 		&model,
 		&shell,
+		&planMode,
 		&name,
 		&relatedFilesJSON,
 		&createdAtRaw,
@@ -1278,6 +1461,7 @@ func scanSessionMetaRow(scanner rowScanner) (*Session, error) {
 		ParentToolCallID: parentToolCallID,
 		Model:            model,
 		Shell:            shell,
+		PlanMode:         planMode != 0,
 		Name:             name,
 		Exchanges:        []Exchange{},
 		RelatedFiles:     []RelatedFile{},
@@ -1409,7 +1593,7 @@ func (m *Manager) searchSessionContent(s *Session, qLower string) (SearchHit, bo
 	}
 	file, err := m.root.OpenMetaFile(path)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, os.ErrNotExist) {
 			return SearchHit{}, false, nil
 		}
 		return SearchHit{}, false, err

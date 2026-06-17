@@ -30,6 +30,9 @@ type Session interface {
 	// SetMode updates the mode used by the current session.
 	SetMode(ctx context.Context, mode string) error
 
+	// SetPlanMode updates the plan mode used by the current session.
+	SetPlanMode(ctx context.Context, enabled bool) error
+
 	// ListModes returns the modes visible to the current session/runtime.
 	ListModes(ctx context.Context) (ModeList, error)
 
@@ -64,6 +67,7 @@ type OpenSessionInput struct {
 	Mode           string
 	Effort         string
 	FastService    string
+	PlanMode       bool
 	Probe          bool
 	RootPath       string
 	AgentSessionID string
@@ -203,6 +207,7 @@ type MessageChunk struct {
 }
 
 type ThoughtChunk struct {
+	ID      string `json:"id,omitempty"`
 	Content string `json:"content"`
 }
 

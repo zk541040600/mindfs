@@ -6,6 +6,17 @@ import { e2eeService } from "./e2ee";
 
 export type SessionType = "chat" | "plugin" | "command";
 
+export type QueuedUserMessage = {
+  id: string;
+  agent?: string;
+  model?: string;
+  mode?: string;
+  effort?: string;
+  fast_service?: string;
+  content: string;
+  timestamp: string;
+};
+
 const commandTerminalFontSize = 12;
 const commandTerminalFontFamily =
   '"Cascadia Mono", "Cascadia Code", Consolas, "Microsoft YaHei Mono", "Microsoft YaHei", "Noto Sans Mono CJK SC", monospace';
@@ -59,6 +70,7 @@ export type ExchangeAux = {
   line: number;
   toolcall?: ToolCall | null;
   thought?: string | null;
+  thought_id?: string;
 };
 
 export type Session = {
@@ -72,6 +84,7 @@ export type Session = {
   mode?: string;
   effort?: string;
   fast_service?: string;
+  plan_mode?: boolean;
   name: string;
   created_at: string;
   updated_at: string;
@@ -184,7 +197,7 @@ export type ExtensionUIResponse = {
 
 export type StreamEvent =
   | { type: "message_chunk"; data: { content: string } }
-  | { type: "thought_chunk"; data: { content: string } }
+  | { type: "thought_chunk"; data: { id?: string; content: string } }
   | { type: "tool_call"; data: ToolCall }
   | { type: "tool_call_update"; data: ToolCall }
   | { type: "todo_update"; data: TodoUpdate }
@@ -265,8 +278,11 @@ class SessionService {
   private pendingMessages = new Map<string, PendingMessage>();
   private listeners = new Set<(event: SessionServiceEvent) => void>();
   private reconnectTimer: number | null = null;
+  private connectTimeoutTimer: number | null = null;
   private probeTimeoutTimer: number | null = null;
   private activeProbeId: string | null = null;
+  private connectingStartedAt = 0;
+  private openingSocket = false;
   private reconnectDelayMs = 1000;
   private fastReconnectUntil = 0;
   private rootId: string | null = null;
@@ -275,7 +291,9 @@ class SessionService {
   private readonly maxReconnectDelayMs = 30000;
   private readonly fastReconnectDelayMs = 1000;
   private readonly fastReconnectWindowMs = 10000;
+  private readonly connectTimeoutMs = 5000;
   private readonly probeTimeoutMs = 2000;
+  private readonly reconnectWatchdogMs = 3000;
   private contextCache = new Map<string, { selectionKey: string }>();
 
   constructor() {
@@ -284,6 +302,7 @@ class SessionService {
       window.addEventListener("online", () => this.ensureConnection());
       window.addEventListener("pageshow", () => this.ensureConnection());
       window.addEventListener("focus", () => this.ensureConnection());
+      window.setInterval(() => this.ensureReconnectLoop(), this.reconnectWatchdogMs);
     }
     if (typeof document !== "undefined") {
       document.addEventListener("visibilitychange", () => {
@@ -305,27 +324,76 @@ class SessionService {
     return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
   }
 
-  private buildWSUrl(): string {
-    return wsURL("/ws", new URLSearchParams({ client_id: this.clientId }));
+  private async buildWSUrl(): Promise<string> {
+    const params = new URLSearchParams({ client_id: this.clientId });
+    const proofTarget = wsURL("/ws", params);
+    if (e2eeService.isRequired()) {
+      const proofParams = await e2eeService.wsProofParams("GET", proofTarget);
+      for (const [key, value] of proofParams) {
+        params.set(key, value);
+      }
+    }
+    return wsURL("/ws", params);
   }
 
   connect(rootId: string) {
     this.rootId = rootId;
-    if (
-      this.ws?.readyState === WebSocket.OPEN ||
-      this.ws?.readyState === WebSocket.CONNECTING
-    ) {
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.emit({ type: this.hasConnected ? "ws.reconnected" : "ws.connected" });
+      this.hasConnected = true;
+      return;
+    }
+    if (this.openingSocket || this.ws?.readyState === WebSocket.CONNECTING) {
+      if (
+        this.connectingStartedAt > 0 &&
+        Date.now() - this.connectingStartedAt > this.connectTimeoutMs
+      ) {
+        this.reconnectNow();
+        return;
+      }
+      this.emit({ type: this.hasConnected ? "ws.reconnecting" : "ws.connecting" });
       return;
     }
 
     this.clearReconnectTimer();
     this.closeSocket();
+    this.emit({ type: this.hasConnected ? "ws.reconnecting" : "ws.connecting" });
 
-    const ws = new WebSocket(this.buildWSUrl());
+    void this.openSocket();
+  }
+
+  private async openSocket() {
+    if (this.openingSocket) {
+      return;
+    }
+    this.openingSocket = true;
+    let target = "";
+    try {
+      target = await this.buildWSUrl();
+    } catch (err) {
+      this.openingSocket = false;
+      console.error("[Session] Failed to prepare WebSocket proof:", err);
+      this.emit({ type: "ws.closed", payload: { code: 0, reason: "e2ee_proof_failed", was_clean: false } });
+      this.scheduleReconnect();
+      return;
+    }
+    if (!this.rootId || this.ws) {
+      this.openingSocket = false;
+      return;
+    }
+    const ws = new WebSocket(target);
+    this.openingSocket = false;
     this.ws = ws;
+    this.connectingStartedAt = Date.now();
+    this.connectTimeoutTimer = window.setTimeout(() => {
+      if (this.ws !== ws || ws.readyState !== WebSocket.CONNECTING) return;
+      console.warn("[Session] WebSocket connect timed out, reconnecting");
+      this.reconnectNow();
+    }, this.connectTimeoutMs);
 
     ws.onopen = () => {
       if (this.ws !== ws) return;
+      this.clearConnectTimeout();
       this.clearProbe();
       this.reconnectDelayMs = 1000;
       if (this.hasConnected) {
@@ -360,6 +428,7 @@ class SessionService {
 
     ws.onclose = (event) => {
       if (this.ws !== ws) return;
+      this.clearConnectTimeout();
       this.ws = null;
       this.emit({
         type: "ws.closed",
@@ -381,6 +450,7 @@ class SessionService {
 
   disconnect() {
     this.clearReconnectTimer();
+    this.clearConnectTimeout();
     this.clearProbe();
     this.closeSocket();
     this.contextCache.clear();
@@ -393,6 +463,14 @@ class SessionService {
     }
   }
 
+  private clearConnectTimeout() {
+    if (this.connectTimeoutTimer) {
+      clearTimeout(this.connectTimeoutTimer);
+      this.connectTimeoutTimer = null;
+    }
+    this.connectingStartedAt = 0;
+  }
+
   private clearProbe() {
     if (this.probeTimeoutTimer) {
       clearTimeout(this.probeTimeoutTimer);
@@ -402,7 +480,9 @@ class SessionService {
   }
 
   private closeSocket() {
+    this.clearConnectTimeout();
     this.clearProbe();
+    this.openingSocket = false;
     if (this.ws) {
       const ws = this.ws;
       this.ws = null;
@@ -420,17 +500,42 @@ class SessionService {
       this.reconnectNow();
       return;
     }
-    if (this.ws.readyState === WebSocket.CONNECTING) return;
+    if (this.ws.readyState === WebSocket.CONNECTING) {
+      if (
+        this.connectingStartedAt > 0 &&
+        Date.now() - this.connectingStartedAt > this.connectTimeoutMs
+      ) {
+        this.reconnectNow();
+      }
+      return;
+    }
     this.probeConnection();
+  }
+
+  private ensureReconnectLoop() {
+    if (!this.rootId) return;
+    if (!this.ws || this.ws.readyState >= WebSocket.CLOSING) {
+      this.reconnectNow();
+      return;
+    }
+    if (
+      this.ws.readyState === WebSocket.CONNECTING &&
+      this.connectingStartedAt > 0 &&
+      Date.now() - this.connectingStartedAt > this.connectTimeoutMs
+    ) {
+      this.reconnectNow();
+    }
   }
 
   private reconnectNow() {
     if (!this.rootId) return;
+    const rootId = this.rootId;
     this.clearReconnectTimer();
     this.clearProbe();
+    this.closeSocket();
     this.reconnectDelayMs = 1000;
     this.fastReconnectUntil = Date.now() + this.fastReconnectWindowMs;
-    this.connect(this.rootId);
+    this.connect(rootId);
   }
 
   private probeConnection() {
@@ -717,6 +822,29 @@ class SessionService {
     return this.sendWSMessage(msg);
   }
 
+  async setPlanMode(
+    rootId: string,
+    sessionKey: string,
+    enabled: boolean,
+    requestId = this.createRequestId("plan"),
+  ): Promise<boolean> {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      return false;
+    }
+    if (!rootId || !sessionKey) {
+      return false;
+    }
+    return this.sendWSMessage({
+      id: requestId,
+      type: "session.plan_mode.set",
+      payload: {
+        root_id: rootId,
+        session_key: sessionKey,
+        enabled,
+      },
+    });
+  }
+
   private resendPendingMessages() {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       return;
@@ -747,6 +875,52 @@ class SessionService {
     };
 
     return this.sendWSMessage(msg);
+  }
+
+  async removeQueuedMessage(rootId: string, sessionKey: string, queueId: string): Promise<boolean> {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !rootId || !sessionKey || !queueId) {
+      return false;
+    }
+    return this.sendWSMessage({
+      id: `queue-remove-${Date.now()}`,
+      type: "session.queue.remove",
+      payload: {
+        root_id: rootId,
+        session_key: sessionKey,
+        queue_id: queueId,
+      },
+    });
+  }
+
+  async updateQueuedMessage(rootId: string, sessionKey: string, queueId: string, content: string): Promise<boolean> {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !rootId || !sessionKey || !queueId || !content.trim()) {
+      return false;
+    }
+    return this.sendWSMessage({
+      id: `queue-update-${Date.now()}`,
+      type: "session.queue.update",
+      payload: {
+        root_id: rootId,
+        session_key: sessionKey,
+        queue_id: queueId,
+        content,
+      },
+    });
+  }
+
+  async sendQueuedMessageNow(rootId: string, sessionKey: string, queueId: string): Promise<boolean> {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !rootId || !sessionKey || !queueId) {
+      return false;
+    }
+    return this.sendWSMessage({
+      id: `queue-send-now-${Date.now()}`,
+      type: "session.queue.send_now",
+      payload: {
+        root_id: rootId,
+        session_key: sessionKey,
+        queue_id: queueId,
+      },
+    });
   }
 
   async answerQuestion(
@@ -820,11 +994,12 @@ class SessionService {
     if (!rootId || !sessionKey) {
       return false;
     }
+    const now = Date.now();
     if (e2eeService.isRequired()) {
       await e2eeService.ensureSession();
     }
     return this.sendWSMessage({
-      id: `ready-${Date.now()}`,
+      id: `ready-${now}`,
       type: "session.ready",
       payload: {
         root_id: rootId,
@@ -905,6 +1080,31 @@ class SessionService {
       return Array.isArray(data?.sessions) ? data.sessions : [];
     } catch (err) {
       console.error("[Session] Failed to get replying sessions:", err);
+      return null;
+    }
+  }
+
+  async getToolCall(
+    rootId: string,
+    sessionKey: string,
+    callId: string,
+  ): Promise<ToolCall | null> {
+    try {
+      if (!rootId || !sessionKey || !callId) return null;
+      const params = new URLSearchParams({ root: rootId });
+      const data = await protectedJSON<{ toolcall?: ToolCall; toolCall?: ToolCall } | ToolCall>(
+        appURL(
+          `/api/sessions/${encodeURIComponent(sessionKey)}/toolcalls/${encodeURIComponent(callId)}`,
+          params,
+        ),
+      );
+      const wrapped = data as { toolcall?: ToolCall; toolCall?: ToolCall };
+      if (wrapped?.toolcall) return wrapped.toolcall;
+      if (wrapped?.toolCall) return wrapped.toolCall;
+      const direct = data as ToolCall;
+      return direct?.callId ? direct : null;
+    } catch (err) {
+      console.error("[Session] Failed to get toolcall:", err);
       return null;
     }
   }
@@ -1081,6 +1281,10 @@ class SessionService {
       imported_count?: number;
       success: boolean;
       error?: string;
+      error_code?: string;
+      error_detail?: string;
+      error_path?: string;
+      error_operation?: string;
     }>;
   } | null> {
     try {
@@ -1272,6 +1476,10 @@ function withSessionMeta(
         : typeof (base as any).fast_service === "string"
           ? (base as any).fast_service
           : "",
+    plan_mode:
+      typeof (incoming as any).plan_mode === "boolean"
+        ? (incoming as any).plan_mode
+        : !!(base as any).plan_mode,
     name: preferIncomingText(incoming.name, base.name) || "",
     exchanges: Array.isArray(incoming.exchanges) ? [...incoming.exchanges] : [],
     exchange_aux: cloneExchangeAux(incoming.exchange_aux || base.exchange_aux),

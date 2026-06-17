@@ -40,6 +40,9 @@ type Status struct {
 	ModesError          string                   `json:"modes_error,omitempty"`
 	Commands            []agenttypes.CommandInfo `json:"commands,omitempty"`
 	CommandsError       string                   `json:"commands_error,omitempty"`
+	Brief               string                   `json:"brief,omitempty"`
+	InstallCommands     []string                 `json:"install_commands,omitempty"`
+	UpdateCommands      []string                 `json:"update_commands,omitempty"`
 }
 
 const (
@@ -284,6 +287,30 @@ func (p *Prober) Stop() {
 	}
 }
 
+func (p *Prober) UpdateConfig(ctx context.Context, cfg *Config) {
+	if p == nil || cfg == nil {
+		return
+	}
+	now := time.Now().UTC()
+	var installed []Definition
+	p.mu.Lock()
+	p.cfg = cfg
+	for _, def := range cfg.Agents {
+		if _, ok := p.statuses[def.Name]; ok {
+			continue
+		}
+		status := normalizeStatus(probeInstallStatus(def.Name, def, now))
+		p.statuses[def.Name] = status
+		if status.Installed {
+			installed = append(installed, def)
+		}
+	}
+	p.mu.Unlock()
+	if len(installed) > 0 {
+		go p.probeInstalledAgents(ctx, installed)
+	}
+}
+
 // ProbeAll 探测所有配置的 Agent
 func (p *Prober) ProbeAll(ctx context.Context) {
 	defs := p.configuredDefinitions()
@@ -449,6 +476,26 @@ func (p *Prober) GetAllStatuses() []Status {
 	return statuses
 }
 
+// GetConfiguredStatuses returns statuses for agents declared in agents.json.
+func (p *Prober) GetConfiguredStatuses() []Status {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	if p.cfg == nil {
+		return nil
+	}
+	statuses := make([]Status, 0, len(p.cfg.Agents))
+	now := time.Now().UTC()
+	for _, def := range p.cfg.Agents {
+		if st, ok := p.statuses[def.Name]; ok {
+			statuses = append(statuses, st)
+			continue
+		}
+		statuses = append(statuses, normalizeStatus(probeInstallStatus(def.Name, def, now)))
+	}
+	return statuses
+}
+
 // GetInstalledStatuses returns configured statuses filtered to installed agents.
 func (p *Prober) GetInstalledStatuses() []Status {
 	all := p.GetAllStatuses()
@@ -479,6 +526,9 @@ func probeConfiguredAgentWithPool(ctx context.Context, name string, def Definiti
 }
 
 func probeInstalledAgentWithPool(ctx context.Context, name string, def Definition, pool *Pool, probeSessions *probeSessionStore, status Status, phase probePhase) Status {
+	if !status.Installed {
+		return status
+	}
 	status.Installed = true
 
 	tmpRoot, err := EnsureStableWorkDir("agent-probe", name)
@@ -586,17 +636,6 @@ func (p *Prober) probeMissingCommands() {
 	p.probeInstallOnly(defs)
 }
 
-func (p *Prober) probeFailedInstalledOnly(ctx context.Context) {
-	if p.cfg == nil {
-		return
-	}
-	defs := p.collectDefinitions(func(st Status, ok bool) bool {
-		return ok && st.Installed && !st.Available
-	})
-	log.Printf("[agent/probe] probe_failed_installed count=%d agents=%s", len(defs), definitionNames(defs))
-	p.probeInstalledAgents(ctx, defs)
-}
-
 // AddListener registers a callback invoked when an agent status changes.
 func (p *Prober) AddListener(listener func(Status)) {
 	if listener == nil {
@@ -664,6 +703,25 @@ func statusChanged(prev Status, next Status) bool {
 	if prev.CommandsError != next.CommandsError {
 		return true
 	}
+	if prev.Brief != next.Brief {
+		return true
+	}
+	if len(prev.InstallCommands) != len(next.InstallCommands) {
+		return true
+	}
+	for i := range prev.InstallCommands {
+		if prev.InstallCommands[i] != next.InstallCommands[i] {
+			return true
+		}
+	}
+	if len(prev.UpdateCommands) != len(next.UpdateCommands) {
+		return true
+	}
+	for i := range prev.UpdateCommands {
+		if prev.UpdateCommands[i] != next.UpdateCommands[i] {
+			return true
+		}
+	}
 	if len(prev.Models) != len(next.Models) {
 		return true
 	}
@@ -727,6 +785,9 @@ func unavailableStatus(name string, installed bool, errMsg string, ts time.Time)
 
 func probeInstallStatus(name string, def Definition, ts time.Time) Status {
 	status := unavailableStatus(name, false, "", ts)
+	status.Brief = strings.TrimSpace(def.Brief)
+	status.InstallCommands = append([]string(nil), def.InstallCommands...)
+	status.UpdateCommands = append([]string(nil), def.UpdateCommands...)
 	if def.Command == "" {
 		status.ProbeError = "command required"
 		return status
@@ -941,6 +1002,15 @@ func preserveKnownCapabilities(prev Status, next Status) Status {
 	if len(next.Commands) == 0 {
 		next.Commands = prev.Commands
 	}
+	if next.Brief == "" {
+		next.Brief = prev.Brief
+	}
+	if len(next.InstallCommands) == 0 {
+		next.InstallCommands = prev.InstallCommands
+	}
+	if len(next.UpdateCommands) == 0 {
+		next.UpdateCommands = prev.UpdateCommands
+	}
 	return next
 }
 
@@ -1030,7 +1100,8 @@ func (p *Prober) probeInstalledAgents(ctx context.Context, defs []Definition) {
 	}
 
 	p.runDefinitionsConcurrently(defs, func(_ int, def Definition) {
-		status := safeProbeInstalledAgentWithPool(ctx, def.Name, def, p.pool, p.probeSessions, probeInstallStatus(def.Name, def, time.Now().UTC()), probePhaseBackground)
+		status := unavailableStatus(def.Name, true, "probe pending", time.Now().UTC())
+		status = safeProbeInstalledAgentWithPool(ctx, def.Name, def, p.pool, p.probeSessions, status, probePhaseBackground)
 		p.setStatus(status)
 	})
 }

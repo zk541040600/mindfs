@@ -692,6 +692,7 @@ func TestSkillCandidateProviderSearch(t *testing.T) {
 	mustWriteFile(t, filepath.Join(homeDir, ".codex", "skills", "status", "SKILL.md"), "---\nname: status\ndescription: Home status skill\n---\n")
 	mustWriteFile(t, filepath.Join(homeDir, ".agents", "skills", "review", "SKILL.md"), "---\nname: review\ndescription: Shared review skill\n---\n")
 	mustWriteFile(t, filepath.Join(rootDir, ".codex", "skills", "status", "SKILL.md"), "---\nname: status\ndescription: Root status skill\n---\n")
+	mustWriteFile(t, filepath.Join(rootDir, ".agents", "skills", "trellis-start", "SKILL.md"), "---\nname: trellis-start\ndescription: Start Trellis\n---\n")
 	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
 
 	provider := NewSkillCandidateProvider()
@@ -699,10 +700,10 @@ func TestSkillCandidateProviderSearch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Search returned error: %v", err)
 	}
-	if len(items) != 2 {
-		t.Fatalf("expected 2 unique items, got %d: %#v", len(items), items)
+	if len(items) != 3 {
+		t.Fatalf("expected 3 unique items, got %d: %#v", len(items), items)
 	}
-	if items[0].Name != "review" && items[0].Name != "status" {
+	if items[0].Name != "review" && items[0].Name != "status" && items[0].Name != "trellis-start" {
 		t.Fatalf("unexpected first item: %#v", items[0])
 	}
 	descriptionByName := make(map[string]string, len(items))
@@ -714,6 +715,9 @@ func TestSkillCandidateProviderSearch(t *testing.T) {
 	}
 	if got := descriptionByName["review"]; got != "Shared review skill" {
 		t.Fatalf("unexpected review description: %q", got)
+	}
+	if got := descriptionByName["trellis-start"]; got != "Start Trellis" {
+		t.Fatalf("unexpected trellis-start description: %q", got)
 	}
 }
 
@@ -746,6 +750,66 @@ func TestSkillCandidateProviderSearchFollowsSymlinkedSkillDir(t *testing.T) {
 	}
 	if items[0].Description != "Linked skill" {
 		t.Fatalf("skill description = %q, want Linked skill", items[0].Description)
+	}
+}
+
+func TestSkillCandidateProviderSearchExpandsNamespacedSkillBundle(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	rootDir := t.TempDir()
+	ssotDir := t.TempDir()
+	targetDir := filepath.Join(ssotDir, "aegis-skills")
+	mustWriteFile(t, filepath.Join(targetDir, "brainstorming", "SKILL.md"), "---\nname: brainstorming\ndescription: Aegis brainstorm\n---\n")
+	mustWriteFile(t, filepath.Join(targetDir, "using-aegis", "SKILL.md"), "---\nname: using-aegis\ndescription: Aegis router\n---\n")
+	skillsDir := filepath.Join(homeDir, ".agents", "skills")
+	if err := os.MkdirAll(skillsDir, 0o755); err != nil {
+		t.Fatalf("mkdir skills dir: %v", err)
+	}
+	if err := os.Symlink(targetDir, filepath.Join(skillsDir, "aegis")); err != nil {
+		t.Skipf("symlink not available: %v", err)
+	}
+	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
+
+	provider := NewSkillCandidateProvider()
+	items, err := provider.Search(context.Background(), root, "codex", "aegis")
+	if err != nil {
+		t.Fatalf("Search returned error: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("expected 2 namespaced skills, got %d: %#v", len(items), items)
+	}
+	descriptionByName := make(map[string]string, len(items))
+	for _, item := range items {
+		descriptionByName[item.Name] = item.Description
+	}
+	if _, ok := descriptionByName["aegis"]; ok {
+		t.Fatalf("did not expect bare namespace item: %#v", items)
+	}
+	if got := descriptionByName["aegis:brainstorming"]; got != "Aegis brainstorm" {
+		t.Fatalf("unexpected aegis:brainstorming description: %q", got)
+	}
+	if got := descriptionByName["aegis:using-aegis"]; got != "Aegis router" {
+		t.Fatalf("unexpected aegis:using-aegis description: %q", got)
+	}
+}
+
+func TestSkillCandidateProviderSearchMatchesNamespacedChildName(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	rootDir := t.TempDir()
+	mustWriteFile(t, filepath.Join(homeDir, ".agents", "skills", "aegis", "brainstorming", "SKILL.md"), "---\nname: brainstorming\ndescription: Aegis brainstorm\n---\n")
+	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
+
+	provider := NewSkillCandidateProvider()
+	items, err := provider.Search(context.Background(), root, "codex", "brain")
+	if err != nil {
+		t.Fatalf("Search returned error: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 namespaced skill, got %d: %#v", len(items), items)
+	}
+	if items[0].Name != "aegis:brainstorming" {
+		t.Fatalf("skill name = %q, want aegis:brainstorming", items[0].Name)
 	}
 }
 
@@ -1081,6 +1145,81 @@ func TestAppendResponseChunk(t *testing.T) {
 	}
 }
 
+func TestIsNonRecoverableAgentError(t *testing.T) {
+	testCases := []struct {
+		err  error
+		want bool
+	}{
+		{nil, false},
+		{errors.New("codex turn failed: exceeded retry limit, last status: 429 Too Many Requests"), true},
+		{errors.New("remote compaction failed while compact_remote retried"), true},
+		{errors.New("usageLimitExceeded"), true},
+		{errors.New("responseTooManyFailedAttempts"), true},
+		{errors.New("temporary websocket EOF"), false},
+		{context.Canceled, false},
+	}
+
+	for _, tc := range testCases {
+		if got := isNonRecoverableAgentError(tc.err); got != tc.want {
+			t.Fatalf("isNonRecoverableAgentError(%v) = %v, want %v", tc.err, got, tc.want)
+		}
+	}
+}
+
+func TestRecoverAgentTurnStopsOnNonRecoverableError(t *testing.T) {
+	rootDir := t.TempDir()
+	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
+	manager := session.NewManager(root)
+	current, err := manager.Create(context.Background(), session.CreateInput{
+		Type:  session.TypeChat,
+		Agent: "codex",
+		Name:  "chat",
+	})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	service := Service{}
+	runtime := &fakeUsecaseAgentSession{id: "codex-thread"}
+	var sent []string
+	gotSess, err := service.recoverAgentTurn(context.Background(), SendRecoveryInput{
+		RootID:            root.ID,
+		SessionKey:        current.Key,
+		Manager:           manager,
+		Current:           current,
+		AgentName:         "codex",
+		CurrentSession:    runtime,
+		Prompt:            "original prompt",
+		SawAssistantChunk: true,
+		SendWithAttachment: func(_ agenttypes.Session, content string) error {
+			sent = append(sent, content)
+			return errors.New("codex turn failed: exceeded retry limit, last status: 429 Too Many Requests")
+		},
+	})
+	if err == nil {
+		t.Fatal("recoverAgentTurn returned nil error")
+	}
+	if gotSess != nil {
+		t.Fatalf("recoverAgentTurn returned session %#v, want nil", gotSess)
+	}
+	if len(sent) != 1 || sent[0] != "continue" {
+		t.Fatalf("sent = %#v, want one continue recovery attempt", sent)
+	}
+}
+
+func TestCancelRuntimeAfterNonRecoverableErrorClosesSession(t *testing.T) {
+	runtime := &fakeUsecaseAgentSession{id: "codex-thread"}
+
+	cancelRuntimeAfterNonRecoverableError(runtime, nil, "codex", errors.New("429 Too Many Requests"))
+
+	if runtime.cancelCalls != 1 {
+		t.Fatalf("cancel calls = %d, want 1", runtime.cancelCalls)
+	}
+	if runtime.closeCalls != 1 {
+		t.Fatalf("close calls = %d, want 1", runtime.closeCalls)
+	}
+}
+
 func assertFileContent(t *testing.T, path string, want string) {
 	t.Helper()
 	payload, err := os.ReadFile(path)
@@ -1220,8 +1359,10 @@ func (uploadTestRegistry) GetFileWatcher(string, *session.Manager) (*rootfs.Shar
 func (uploadTestRegistry) ReleaseFileWatcher(string, string) {}
 
 type fakeUsecaseAgentSession struct {
-	id       string
-	onUpdate func(agenttypes.Event)
+	id          string
+	cancelCalls int
+	closeCalls  int
+	onUpdate    func(agenttypes.Event)
 }
 
 func (s *fakeUsecaseAgentSession) SendMessage(context.Context, string) error { return nil }
@@ -1244,6 +1385,8 @@ func (s *fakeUsecaseAgentSession) ListModels(context.Context) (agenttypes.ModelL
 
 func (s *fakeUsecaseAgentSession) SetMode(context.Context, string) error { return nil }
 
+func (s *fakeUsecaseAgentSession) SetPlanMode(context.Context, bool) error { return nil }
+
 func (s *fakeUsecaseAgentSession) ListModes(context.Context) (agenttypes.ModeList, error) {
 	return agenttypes.ModeList{}, nil
 }
@@ -1252,7 +1395,10 @@ func (s *fakeUsecaseAgentSession) ListCommands(context.Context) (agenttypes.Comm
 	return agenttypes.CommandList{}, nil
 }
 
-func (s *fakeUsecaseAgentSession) CancelCurrentTurn() error { return nil }
+func (s *fakeUsecaseAgentSession) CancelCurrentTurn() error {
+	s.cancelCalls++
+	return nil
+}
 
 func (s *fakeUsecaseAgentSession) OnUpdate(onUpdate func(agenttypes.Event)) {
 	s.onUpdate = onUpdate
@@ -1264,7 +1410,10 @@ func (s *fakeUsecaseAgentSession) ContextWindow(context.Context) (agenttypes.Con
 	return agenttypes.ContextWindow{}, nil
 }
 
-func (s *fakeUsecaseAgentSession) Close() error { return nil }
+func (s *fakeUsecaseAgentSession) Close() error {
+	s.closeCalls++
+	return nil
+}
 
 func (s *fakeUsecaseAgentSession) emit(event agenttypes.Event) {
 	if s.onUpdate != nil {

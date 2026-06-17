@@ -2,6 +2,8 @@ package usecase
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
@@ -146,6 +148,23 @@ func (s *Service) GetSessionExchangeAux(ctx context.Context, in GetSessionExchan
 		return nil, err
 	}
 	return manager.GetExchangeAux(ctx, in.Key, in.Seq)
+}
+
+type GetSessionToolCallInput struct {
+	RootID string
+	Key    string
+	CallID string
+}
+
+func (s *Service) GetSessionToolCall(ctx context.Context, in GetSessionToolCallInput) (*agenttypes.ToolCall, error) {
+	if err := s.ensureRegistry(); err != nil {
+		return nil, err
+	}
+	manager, err := s.Registry.GetSessionManager(in.RootID)
+	if err != nil {
+		return nil, err
+	}
+	return manager.GetFullToolCall(ctx, in.Key, in.CallID)
 }
 
 type GetSessionContextWindowInput struct {
@@ -759,6 +778,54 @@ func isStaleAgentSessionError(err error) bool {
 		(strings.Contains(compact, "invalidparams") && strings.Contains(compact, "sessionid"))
 }
 
+func isNonRecoverableAgentError(err error) bool {
+	if err == nil {
+		return false
+	}
+	value := strings.ToLower(strings.TrimSpace(err.Error()))
+	if value == "" {
+		return false
+	}
+	needles := []string{
+		"429",
+		"too many requests",
+		"exceeded retry limit",
+		"rate limit",
+		"ratelimit",
+		"usage limit",
+		"usagelimitexceeded",
+		"remote compaction failed",
+		"compact_remote",
+		"responsetoomanyfailedattempts",
+	}
+	for _, needle := range needles {
+		if strings.Contains(value, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func cancelRuntimeAfterNonRecoverableError(sess agenttypes.Session, pool *agent.Pool, agentName string, cause error) {
+	agentName = strings.TrimSpace(agentName)
+	if sess != nil {
+		if err := sess.CancelCurrentTurn(); err != nil {
+			log.Printf("[session] turn.cancel_after_non_recoverable.error agent=%s cause=%v err=%v", agentName, cause, err)
+		}
+	}
+	if pool != nil && agentName != "" {
+		if _, ok := pool.KillAgentProcess(agentName, 0); ok {
+			log.Printf("[session] runtime.kill_after_non_recoverable.done agent=%s cause=%v", agentName, cause)
+			return
+		}
+	}
+	if sess != nil {
+		if err := sess.Close(); err != nil {
+			log.Printf("[session] runtime.close_after_non_recoverable.error agent=%s cause=%v err=%v", agentName, cause, err)
+		}
+	}
+}
+
 func contextLineCount(exchanges []session.Exchange) int {
 	return len(exchanges)
 }
@@ -972,10 +1039,12 @@ func (s *Service) ensureAgentSession(
 	nextMode := resolveRuntimeMode(current, mode)
 	nextEffort := resolveRuntimeEffort(agentName, current, effort)
 	nextFastService := resolveRuntimeFastService(agentName, current, fastService)
+	nextPlanMode := current != nil && current.PlanMode
 	currentModel := ""
 	currentMode := ""
 	currentEffort := ""
 	currentFastService := ""
+	currentPlanMode := false
 	if current != nil {
 		currentModel = resolveSessionExchangeModel(current)
 		if currentModel == "" {
@@ -984,6 +1053,7 @@ func (s *Service) ensureAgentSession(
 		currentMode = resolveSessionExchangeMode(current)
 		currentEffort = session.InferEffortFromSession(current)
 		currentFastService = inferFastServiceFromSession(current)
+		currentPlanMode = current.PlanMode
 	}
 	if existing, ok := pool.Get(poolSessionKey); ok {
 		if !shouldReopenSessionForSetting(pool, agentName, currentEffort, nextEffort) &&
@@ -1009,6 +1079,17 @@ func (s *Service) ensureAgentSession(
 					return nil, nil, err
 				}
 				log.Printf("[session/mode] switch.done session=%s agent=%s mode=%q pool_session=%s", current.Key, agentName, nextMode, poolSessionKey)
+			}
+			if current != nil && currentPlanMode != nextPlanMode {
+				log.Printf("[session/plan] switch.detected session=%s agent=%s from=%t to=%t action=set_plan_mode", current.Key, agentName, currentPlanMode, nextPlanMode)
+				if err := existing.SetPlanMode(ctx, nextPlanMode); err != nil {
+					if prober := s.Registry.GetProber(); prober != nil {
+						prober.ReportRuntimeFailure(agentName, err)
+					}
+					log.Printf("[session/plan] switch.error session=%s agent=%s plan_mode=%t pool_session=%s err=%v", current.Key, agentName, nextPlanMode, poolSessionKey, err)
+					return nil, nil, err
+				}
+				log.Printf("[session/plan] switch.done session=%s agent=%s plan_mode=%t pool_session=%s", current.Key, agentName, nextPlanMode, poolSessionKey)
 			}
 			var currentSeq *int
 			if current != nil {
@@ -1042,6 +1123,7 @@ func (s *Service) ensureAgentSession(
 		Mode:        nextMode,
 		Effort:      nextEffort,
 		FastService: nextFastService,
+		PlanMode:    nextPlanMode,
 		RootPath:    rootAbs,
 	}
 	statelessRuntimeCtx := usesStatelessRuntimeContext(pool, agentName)
@@ -1254,6 +1336,7 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 	}
 	root := manager.Root()
 	rootAbs, _ := root.RootDir()
+	planMode := current != nil && current.PlanMode
 	sess, agentCtxSeq, err := s.ensureAgentSession(turnCtx, agentPool, manager, current, in.Agent, in.Model, in.Mode, in.Effort, in.FastService, rootAbs)
 	if err != nil {
 		return err
@@ -1273,33 +1356,44 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 	sawAssistantChunk := false
 	plannedAssistantSeq := len(current.Exchanges) + 2
 	auxBuffer := make([]session.ExchangeAux, 0, 8)
+	defer manager.ClearPendingExchangeAux(context.Background(), current.Key)
 	var thoughtBuffer strings.Builder
+	currentThoughtID := ""
 	flushThought := func() {
 		thought := thoughtBuffer.String()
 		if strings.TrimSpace(thought) == "" {
 			thoughtBuffer.Reset()
+			currentThoughtID = ""
 			return
 		}
+		thoughtID := currentThoughtID
 		thoughtBuffer.Reset()
+		currentThoughtID = ""
 		auxBuffer = append(auxBuffer, session.ExchangeAux{
-			Seq:     plannedAssistantSeq,
-			Line:    currentAssistantLine(responseText),
-			Thought: thought,
+			Seq:       plannedAssistantSeq,
+			Line:      currentAssistantLine(responseText),
+			Thought:   thought,
+			ThoughtID: thoughtID,
 		})
 	}
 	lastResponseUpdateType := ""
 	attachSessionUpdates := func(runtime agenttypes.Session) {
 		runtime.OnUpdate(func(update agenttypes.Event) {
 			update = normalizeAgentUpdatePaths(root, update)
-			update = compactAgentUpdate(update)
 			switch update.Type {
 			case agenttypes.EventTypeThoughtChunk:
 				if chunk, ok := update.Data.(agenttypes.ThoughtChunk); ok && chunk.Content != "" {
+					if currentThoughtID == "" {
+						currentThoughtID = "thought-" + randomHex(8)
+					}
+					chunk.ID = currentThoughtID
+					update.Data = chunk
 					thoughtBuffer.WriteString(chunk.Content)
 				}
 			case agenttypes.EventTypeToolCall, agenttypes.EventTypeToolUpdate, agenttypes.EventTypeTodoUpdate, agenttypes.EventTypeMessageChunk, agenttypes.EventTypeMessageDone:
 				flushThought()
 			}
+			clientUpdate := compactAgentUpdate(update)
 			if update.Type == agenttypes.EventTypeToolCall || update.Type == agenttypes.EventTypeToolUpdate {
 				if toolCall, ok := update.Data.(agenttypes.ToolCall); ok && toolCall.IsWriteOperation() {
 					for _, path := range toolCall.GetAffectedPaths() {
@@ -1336,6 +1430,7 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 						Line:     currentAssistantLine(responseText),
 						ToolCall: &toolCallCopy,
 					})
+					_ = manager.UpsertPendingExchangeAux(context.Background(), current.Key, session.ExchangeAux{ToolCall: &toolCallCopy})
 				}
 			}
 			if update.Type == agenttypes.EventTypeMessageChunk {
@@ -1354,7 +1449,7 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 				watcher.MarkSessionActive(current.Key)
 			}
 			if in.OnUpdate != nil {
-				in.OnUpdate(update)
+				in.OnUpdate(clientUpdate)
 			}
 		})
 	}
@@ -1386,7 +1481,10 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 		}
 	}
 	if sendErr != nil && !isCanceledTurnError(sendErr) {
-		if !sawAssistantChunk {
+		if isNonRecoverableAgentError(sendErr) {
+			log.Printf("[session] turn.send.non_recoverable root=%s session=%s agent=%s action=fail_without_recovery err=%v", in.RootID, current.Key, in.Agent, sendErr)
+			cancelRuntimeAfterNonRecoverableError(sess, agentPool, in.Agent, sendErr)
+		} else if !sawAssistantChunk {
 			log.Printf("[session] turn.send.no_response root=%s session=%s agent=%s action=fail_without_recovery", in.RootID, current.Key, in.Agent)
 		} else {
 			if in.OnUpdate != nil {
@@ -1405,6 +1503,7 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 				Mode:               in.Mode,
 				Effort:             in.Effort,
 				FastService:        in.FastService,
+				PlanMode:           planMode,
 				RootAbs:            rootAbs,
 				CurrentSession:     sess,
 				Prompt:             prompt,
@@ -1420,7 +1519,7 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 		}
 	}
 	flushThought()
-	if sendErr != nil {
+	if sendErr != nil && !isCanceledTurnError(sendErr) {
 		log.Printf("[session] turn.send.error root=%s session=%s agent=%s err=%v", in.RootID, current.Key, in.Agent, sendErr)
 	}
 	resolvedModel := resolveRuntimeModel(current, sess, in.Model)
@@ -1514,6 +1613,7 @@ func (s *Service) ensureSubagentSession(ctx context.Context, in subagentSessionI
 		ParentToolCallID: in.ToolCall.CallID,
 		Agent:            in.Agent,
 		Model:            firstNonEmptyString(stringMeta(in.ToolCall.Meta, "model"), in.Model),
+		PlanMode:         false,
 		Name:             subagentSessionName(in.ToolCall, receiverThreadID),
 	})
 	if err != nil {
@@ -1549,6 +1649,7 @@ func (s *Service) startSubagentSubscription(in subagentSessionInput, child *sess
 			Mode:           in.Mode,
 			Effort:         firstNonEmptyString(stringMeta(in.ToolCall.Meta, "reasoningEffort"), in.Effort),
 			FastService:    in.FastService,
+			PlanMode:       false,
 			RootPath:       in.RootAbs,
 			AgentSessionID: receiverThreadID,
 			AgentCtxSeq:    child.AgentCtxSeq[in.Agent],
@@ -1586,17 +1687,22 @@ func attachBackgroundSessionUpdates(ctx context.Context, in subagentSessionInput
 	lastResponseUpdateType := ""
 	var doneMu sync.Mutex
 	doneSent := false
+	currentThoughtID := ""
 	flushThought := func() {
 		thought := thoughtBuffer.String()
 		if strings.TrimSpace(thought) == "" {
 			thoughtBuffer.Reset()
+			currentThoughtID = ""
 			return
 		}
+		thoughtID := currentThoughtID
 		thoughtBuffer.Reset()
+		currentThoughtID = ""
 		auxBuffer = append(auxBuffer, session.ExchangeAux{
-			Seq:     plannedAssistantSeq,
-			Line:    currentAssistantLine(responseText),
-			Thought: thought,
+			Seq:       plannedAssistantSeq,
+			Line:      currentAssistantLine(responseText),
+			Thought:   thought,
+			ThoughtID: thoughtID,
 		})
 	}
 	finish := func(emit bool) {
@@ -1607,6 +1713,7 @@ func attachBackgroundSessionUpdates(ctx context.Context, in subagentSessionInput
 		}
 		doneSent = true
 		doneMu.Unlock()
+		defer in.Manager.ClearPendingExchangeAux(context.Background(), child.Key)
 		flushThought()
 		if err := in.Manager.AddExchangeForAgent(ctx, child, "agent", responseText, in.Agent, in.Mode, in.Effort, in.FastService); err != nil {
 			log.Printf("[subagent] persist.agent.error root=%s session=%s err=%v", in.RootID, child.Key, err)
@@ -1626,15 +1733,20 @@ func attachBackgroundSessionUpdates(ctx context.Context, in subagentSessionInput
 		}
 	}
 	runtime.OnUpdate(func(update agenttypes.Event) {
-		update = compactAgentUpdate(update)
 		switch update.Type {
 		case agenttypes.EventTypeThoughtChunk:
 			if chunk, ok := update.Data.(agenttypes.ThoughtChunk); ok && chunk.Content != "" {
+				if currentThoughtID == "" {
+					currentThoughtID = "thought-" + randomHex(8)
+				}
+				chunk.ID = currentThoughtID
+				update.Data = chunk
 				thoughtBuffer.WriteString(chunk.Content)
 			}
 		case agenttypes.EventTypeToolCall, agenttypes.EventTypeToolUpdate, agenttypes.EventTypeTodoUpdate, agenttypes.EventTypeMessageChunk, agenttypes.EventTypeMessageDone:
 			flushThought()
 		}
+		clientUpdate := compactAgentUpdate(update)
 		if update.Type == agenttypes.EventTypeToolCall || update.Type == agenttypes.EventTypeToolUpdate {
 			if toolCall, ok := update.Data.(agenttypes.ToolCall); ok {
 				toolCallCopy := toolCall
@@ -1643,6 +1755,7 @@ func attachBackgroundSessionUpdates(ctx context.Context, in subagentSessionInput
 					Line:     currentAssistantLine(responseText),
 					ToolCall: &toolCallCopy,
 				})
+				_ = in.Manager.UpsertPendingExchangeAux(context.Background(), child.Key, session.ExchangeAux{ToolCall: &toolCallCopy})
 			}
 		}
 		if update.Type == agenttypes.EventTypeMessageChunk {
@@ -1658,13 +1771,13 @@ func attachBackgroundSessionUpdates(ctx context.Context, in subagentSessionInput
 		}
 		if update.Type != agenttypes.EventTypeMessageDone {
 			if in.OnUpdate != nil {
-				in.OnUpdate(child.Key, update)
+				in.OnUpdate(child.Key, clientUpdate)
 			}
 			return
 		}
 		finish(false)
 		if in.OnUpdate != nil {
-			in.OnUpdate(child.Key, update)
+			in.OnUpdate(child.Key, clientUpdate)
 		}
 	})
 	return func() { finish(true) }
@@ -1928,6 +2041,7 @@ type SendRecoveryInput struct {
 	Mode               string
 	Effort             string
 	FastService        string
+	PlanMode           bool
 	RootAbs            string
 	CurrentSession     agenttypes.Session
 	Prompt             string
@@ -1971,6 +2085,10 @@ func (s *Service) recoverAgentTurn(ctx context.Context, in SendRecoveryInput) (a
 		log.Printf("[session/recovery] send.start root=%s session=%s agent=%s attempt=%d/%d action=%s", in.RootID, in.SessionKey, in.AgentName, attempt, sessionRecoveryAttempts, recoveryAction)
 		if err := in.SendWithAttachment(sess, recoveryMessage); err != nil {
 			if isCanceledTurnError(err) || ctx.Err() != nil {
+				return nil, err
+			}
+			if isNonRecoverableAgentError(err) {
+				log.Printf("[session/recovery] send.non_recoverable root=%s session=%s agent=%s attempt=%d/%d action=%s err=%v", in.RootID, in.SessionKey, in.AgentName, attempt, sessionRecoveryAttempts, recoveryAction, err)
 				return nil, err
 			}
 			lastErr = err
@@ -2117,6 +2235,17 @@ func appendResponseChunk(responseText, lastResponseUpdateType, chunk string) str
 	return responseText + chunk
 }
 
+func randomHex(bytes int) string {
+	if bytes <= 0 {
+		return ""
+	}
+	buf := make([]byte, bytes)
+	if _, err := rand.Read(buf); err != nil {
+		return fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(buf)
+}
+
 func subagentSessionName(toolCall agenttypes.ToolCall, receiverThreadID string) string {
 	if prompt := stringMeta(toolCall.Meta, "prompt"); prompt != "" {
 		return truncateRunes(prompt, 48)
@@ -2192,10 +2321,6 @@ func normalizeAgentUpdatePaths(root pathNormalizer, update agenttypes.Event) age
 				toolCall.Content[i].Text = normalizeDiffTextPaths(root, toolCall.Content[i].Text)
 			}
 		}
-	} else if session.PreserveCommandExecutionContent(toolCall) {
-		toolCall = session.CompactToolCall(toolCall)
-	} else {
-		toolCall.Content = nil
 	}
 	if toolCall.Meta != nil {
 		if filePath, ok := toolCall.Meta["filePath"].(string); ok {
@@ -2341,12 +2466,17 @@ func (s *Service) CancelSessionTurn(ctx context.Context, in CancelSessionTurnInp
 	if active == nil {
 		return nil
 	}
-	active.cancel()
 	if active.session != nil {
+		// Let the runtime emit its own turn boundary after interrupt. Canceling
+		// turnCtx first can dequeue the current waiter, so a late ResultMessage
+		// may be delivered to the next queued turn.
 		if err := active.session.CancelCurrentTurn(); err != nil {
 			log.Printf("[session] turn.cancel.error root=%s session=%s err=%v", in.RootID, current.Key, err)
+			active.cancel()
 			return err
 		}
+		return nil
 	}
+	active.cancel()
 	return nil
 }

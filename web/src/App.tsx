@@ -19,6 +19,7 @@ import {
   type ExtensionUIRequest,
   type ExtensionUIResponse,
   type AgentSDKStatus,
+  type QueuedUserMessage,
 } from "./services/session";
 import { buildClientContext } from "./services/context";
 import { e2eeService, type E2EEState } from "./services/e2ee";
@@ -97,6 +98,7 @@ import { AgentMenuList } from "./components/AgentMenuList";
 import { ActionBar } from "./components/ActionBar";
 import { ToastContainer } from "./components/Toast";
 import { BottomSheet } from "./components/BottomSheet";
+import { ScheduledAgentTaskDialog } from "./components/ScheduledAgentTaskDialog";
 import {
   ExtensionUIDialog,
   extensionUIPayloadLines,
@@ -114,6 +116,7 @@ import { fetchAgents, type AgentStatus } from "./services/agents";
 
 // 类型定义
 type SessionMode = "chat" | "plugin" | "command";
+type WSStatus = "connecting" | "connected" | "reconnecting" | "disconnected";
 
 function normalizeFastService(
   value: unknown,
@@ -135,6 +138,7 @@ export type SessionItem = {
   mode?: string;
   effort?: string;
   fast_service?: "" | "on" | "off";
+  plan_mode?: boolean;
   scope?: string;
   purpose?: string;
   created_at?: string;
@@ -156,12 +160,13 @@ export type SessionItem = {
     role?: string;
     agent?: string;
     content?: string;
+    thought_id?: string;
     timestamp?: string;
     model?: string;
-    mode?: string;
-    effort?: string;
-    fast_service?: "" | "on" | "off";
-    context_window?: {
+	    mode?: string;
+	    effort?: string;
+	    fast_service?: "" | "on" | "off";
+	    context_window?: {
       totalTokens: number;
       modelContextWindow: number;
     };
@@ -229,6 +234,10 @@ function toSessionItem(
     fast_service:
       normalizeFastService(session?.fast_service) ||
       normalizeFastService(latestExchangeText(session?.exchanges, "fast_service")),
+    plan_mode:
+      typeof session?.plan_mode === "boolean"
+        ? session.plan_mode
+        : false,
     scope: typeof session?.scope === "string" ? session.scope : "",
     purpose: typeof session?.purpose === "string" ? session.purpose : "",
     created_at:
@@ -273,6 +282,7 @@ type Exchange = {
   effort?: string;
   fast_service?: "" | "on" | "off";
   content?: string;
+  thought_id?: string;
   context_window?: {
     totalTokens: number;
     modelContextWindow: number;
@@ -297,6 +307,7 @@ type PendingSend = {
   sessionKey?: string;
   tempKey?: string;
 };
+type SessionQueueItem = QueuedUserMessage;
 type ViewerSelection = {
   filePath: string;
   text?: string;
@@ -1016,6 +1027,9 @@ export function App({ onGoHome }: AppProps) {
   const pendingDraftRef = useRef<PendingSend | null>(null);
   const pendingBySessionRef = useRef<Record<string, PendingSend>>({});
   const pendingRequestRef = useRef<Record<string, PendingSend>>({});
+  const queuedMessagesBySessionRef = useRef<Record<string, SessionQueueItem[]>>({});
+  const queueFrozenBySessionRef = useRef<Record<string, boolean>>({});
+  const optimisticDequeuedIdsRef = useRef<Record<string, Set<string>>>({});
   const cancelRequestedBySessionRef = useRef<Record<string, boolean>>({});
   const sessionCacheRef = useRef<Record<string, Session>>({});
   const loadedSessionRef = useRef<Record<string, boolean>>({});
@@ -1065,14 +1079,17 @@ export function App({ onGoHome }: AppProps) {
   const [sessionListMode, setSessionListMode] = useState<"local" | "import">(
     "local",
   );
+  const sessionListModeRef = useRef<"local" | "import">("local");
   const [externalSessions, setExternalSessions] = useState<SessionItem[]>([]);
   const externalSessionsRef = useRef<SessionItem[]>([]);
   const [hasMoreExternalSessions, setHasMoreExternalSessions] = useState(false);
   const [loadingOlderExternalSessions, setLoadingOlderExternalSessions] =
     useState(false);
   const [loadingExternalSessions, setLoadingExternalSessions] = useState(false);
+  const [externalSessionsError, setExternalSessionsError] = useState("");
   const [externalSelectedKey, setExternalSelectedKey] = useState("");
   const [externalImportAgent, setExternalImportAgent] = useState("");
+  const externalImportAgentRef = useRef("");
   const [externalFilterBound, setExternalFilterBound] = useState(true);
   const [externalSDKStatus, setExternalSDKStatus] =
     useState<AgentSDKStatus | null>(null);
@@ -1091,6 +1108,7 @@ export function App({ onGoHome }: AppProps) {
   const worktreeCreatePopoverRef = useRef<HTMLDivElement | null>(null);
   const worktreeSwitchPopoverRef = useRef<HTMLDivElement | null>(null);
   const [availableAgents, setAvailableAgents] = useState<AgentStatus[]>([]);
+  const [scheduledAgentDialogOpen, setScheduledAgentDialogOpen] = useState(false);
   const [selectedSession, setSelectedSession] = useState<SessionItem | null>(
     null,
   );
@@ -1098,8 +1116,10 @@ export function App({ onGoHome }: AppProps) {
   const [activeBoundSessionKey, setActiveBoundSessionKey] = useState<
     string | null
   >(null);
+  const [pendingPlanMode, setPendingPlanMode] = useState(false);
   const [currentSession, setCurrentSession] = useState<SessionItem | null>(null);
   const [cacheVersion, setCacheVersion] = useState(0);
+  const [queueVersion, setQueueVersion] = useState(0);
   const [interactionMode, setInteractionMode] = useState<"main" | "drawer">(
     "main",
   );
@@ -1256,7 +1276,7 @@ export function App({ onGoHome }: AppProps) {
       return {};
     }
   });
-  const [status, setStatus] = useState("Disconnected");
+  const [status, setStatus] = useState<WSStatus>("disconnected");
   const [file, setFile] = useState<FilePayload | null>(null);
   const [viewerSelection, setViewerSelection] =
     useState<ViewerSelection | null>(null);
@@ -1482,9 +1502,15 @@ export function App({ onGoHome }: AppProps) {
     selectedSessionRef.current = selectedSession;
   }, [selectedSession]);
   useEffect(() => {
+    if (selectedSession || activeBoundSessionKey || interactionMode !== "main") {
+      setPendingPlanMode(false);
+    }
+  }, [selectedSession, activeBoundSessionKey, interactionMode]);
+  useEffect(() => {
     sessionsRef.current = sessions;
   }, [sessions]);
   useEffect(() => {
+    sessionListModeRef.current = sessionListMode;
     if (sessionListMode !== "local") {
       setSessionSearchOpen(false);
       setSessionSearchResultsMode(false);
@@ -1502,8 +1528,14 @@ export function App({ onGoHome }: AppProps) {
     setSessionSearchLoading(false);
   }, [currentRootId]);
   useEffect(() => {
+    setPendingPlanMode(false);
+  }, [currentRootId]);
+  useEffect(() => {
     externalSessionsRef.current = externalSessions;
   }, [externalSessions]);
+  useEffect(() => {
+    externalImportAgentRef.current = externalImportAgent;
+  }, [externalImportAgent]);
   useEffect(() => {
     currentSessionRef.current = currentSession;
   }, [currentSession]);
@@ -1880,6 +1912,9 @@ export function App({ onGoHome }: AppProps) {
       if (!resolvedRoot || !resolvedKey) {
         return !!serverPending;
       }
+      if (serverPending === false) {
+        return false;
+      }
       return (
         !!serverPending ||
         !!pendingBySessionRef.current[rootSessionKey(resolvedRoot, resolvedKey)]
@@ -1895,26 +1930,39 @@ export function App({ onGoHome }: AppProps) {
       if (!resolvedRoot || !resolvedKey || resolvedKey.startsWith("pending-")) {
         return;
       }
+      const clearPendingAck = <T,>(session: T): T => {
+        const exchanges = (session as any)?.exchanges;
+        if (!Array.isArray(exchanges)) {
+          return session;
+        }
+        return {
+          ...(session as any),
+          exchanges: exchanges.map((exchange: any) =>
+            exchange?.pending_ack === true
+              ? { ...exchange, pending_ack: false }
+              : exchange,
+          ),
+        } as T;
+      };
       const cacheKey = rootSessionKey(resolvedRoot, resolvedKey);
       delete pendingBySessionRef.current[cacheKey];
-      delete cancelRequestedBySessionRef.current[cacheKey];
 
       const cached = sessionCacheRef.current[cacheKey];
-      if (cached && cached.key === resolvedKey && (cached as any).pending) {
-        sessionCacheRef.current[cacheKey] = {
+      if (cached && (cached.key || (cached as any).session_key) === resolvedKey) {
+        sessionCacheRef.current[cacheKey] = clearPendingAck({
           ...(cached as any),
           pending: false,
-        } as Session;
+        } as Session);
       }
 
       setSessions((prev) =>
         prev.map((item) => {
           const itemKey = item.key || item.session_key;
           const itemRoot = item.root_id || resolvedRoot;
-          if (itemKey !== resolvedKey || itemRoot !== resolvedRoot || !item.pending) {
+          if (itemKey !== resolvedKey || itemRoot !== resolvedRoot) {
             return item;
           }
-          return { ...item, pending: false };
+          return clearPendingAck({ ...(item as any), pending: false } as SessionItem);
         }),
       );
 
@@ -1922,40 +1970,35 @@ export function App({ onGoHome }: AppProps) {
         const prevKey = prev?.key || prev?.session_key;
         const prevRoot =
           (prev?.root_id as string | undefined) || currentRootIdRef.current;
-        if (
-          !prev ||
-          prevKey !== resolvedKey ||
-          prevRoot !== resolvedRoot ||
-          !(prev as any).pending
-        ) {
+        if (!prev || prevKey !== resolvedKey || prevRoot !== resolvedRoot) {
           return prev;
         }
-        return { ...(prev as any), pending: false } as SessionItem;
+        return clearPendingAck({
+          ...(prev as any),
+          pending: false,
+        } as SessionItem);
       });
 
       setCurrentSession((prev) => {
         const prevKey = prev?.key || prev?.session_key;
         const prevRoot =
           (prev?.root_id as string | undefined) || currentRootIdRef.current;
-        if (
-          !prev ||
-          prevKey !== resolvedKey ||
-          prevRoot !== resolvedRoot ||
-          !(prev as any).pending
-        ) {
+        if (!prev || prevKey !== resolvedKey || prevRoot !== resolvedRoot) {
           return prev;
         }
-        return { ...(prev as any), pending: false } as SessionItem;
+        return clearPendingAck({
+          ...(prev as any),
+          pending: false,
+        } as SessionItem);
       });
 
       const drawer = drawerSessionByRootRef.current[resolvedRoot];
-      if (drawer && (drawer.key || drawer.session_key) === resolvedKey && drawer.pending) {
-        setDrawerSessionForRoot(resolvedRoot, {
+      if (drawer && (drawer.key || (drawer as any).session_key) === resolvedKey) {
+        setDrawerSessionForRoot(resolvedRoot, clearPendingAck({
           ...(drawer as any),
           pending: false,
-        } as SessionItem);
+        } as Session));
       }
-
       bumpCacheVersion();
     },
     [bumpCacheVersion, rootSessionKey, setDrawerSessionForRoot],
@@ -2022,11 +2065,17 @@ export function App({ onGoHome }: AppProps) {
       if (!fullSession) {
         return null;
       }
-      const pending = resolveFreshSessionPending(
-        resolvedRoot,
-        resolvedKey,
-        !!(fullSession as any)?.pending,
-      );
+      const serverPending =
+        typeof (fullSession as any)?.pending === "boolean"
+          ? !!(fullSession as any).pending
+          : undefined;
+      if (serverPending === false) {
+        clearLocalPendingForSession(resolvedRoot, resolvedKey);
+      }
+      const pending =
+        serverPending === undefined
+          ? resolvePendingForSession(resolvedRoot, resolvedKey, false)
+          : resolveFreshSessionPending(resolvedRoot, resolvedKey, serverPending);
       sessionCacheRef.current[cacheKey] = {
         ...(fullSession as any),
         key: resolvedKey,
@@ -2040,7 +2089,7 @@ export function App({ onGoHome }: AppProps) {
         pending,
       } as Session;
     },
-    [bumpCacheVersion, resolveFreshSessionPending, rootSessionKey],
+    [bumpCacheVersion, clearLocalPendingForSession, resolveFreshSessionPending, resolvePendingForSession, rootSessionKey],
   );
 
   const updateSessionRelatedFilesForKey = useCallback(
@@ -2197,6 +2246,52 @@ export function App({ onGoHome }: AppProps) {
     }
   }, [sessions, syncSessionHeaderFromListItem]);
 
+  const handleSetPlanMode = useCallback(
+    async (enabled: boolean, targetSessionKey?: string, targetRootId?: string) => {
+      const activeRoot = targetRootId || currentRootIdRef.current;
+      const session = currentSessionRef.current || drawerSessionByRootRef.current[activeRoot || ""];
+      const sessionKey = targetSessionKey || session?.key || (session as any)?.session_key;
+      if (!activeRoot) {
+        reportError("session.sync_failed", "请先选择一个会话再切换 Plan 模式");
+        return;
+      }
+      if (!sessionKey || String(sessionKey).startsWith("pending-")) {
+        setPendingPlanMode(enabled);
+        return;
+      }
+      const now = new Date().toISOString();
+      const cacheKey = rootSessionKey(activeRoot, sessionKey);
+      const cached = sessionCacheRef.current[cacheKey];
+      if (cached) {
+        sessionCacheRef.current[cacheKey] = {
+          ...(cached as any),
+          plan_mode: enabled,
+          updated_at: now,
+        } as Session;
+      }
+      setSelectedSession((prev) => {
+        const prevKey = prev?.key || prev?.session_key;
+        const prevRoot = (prev?.root_id as string | undefined) || activeRoot;
+        if (!prev || prevKey !== sessionKey || prevRoot !== activeRoot) return prev;
+        return { ...(prev as any), plan_mode: enabled, updated_at: now } as SessionItem;
+      });
+      const drawer = drawerSessionByRootRef.current[activeRoot];
+      if (drawer?.key === sessionKey) {
+        setDrawerSessionForRoot(activeRoot, {
+          ...(drawer as any),
+          plan_mode: enabled,
+          updated_at: now,
+        } as Session);
+      }
+      bumpCacheVersion();
+      const sent = await sessionService.setPlanMode(activeRoot, sessionKey, enabled);
+      if (!sent) {
+        reportError("network.disconnected", "Plan 模式切换失败：连接未就绪，请稍后重试");
+      }
+    },
+    [rootSessionKey, setDrawerSessionForRoot, bumpCacheVersion],
+  );
+
   const promotePendingSessionForRoot = useCallback(
     (
       rootID: string,
@@ -2305,10 +2400,10 @@ export function App({ onGoHome }: AppProps) {
       fallback?: {
         agent?: string;
         model?: string;
-        mode?: string;
-        effort?: string;
-        fast_service?: "" | "on" | "off";
-      },
+	        mode?: string;
+	        effort?: string;
+	        fast_service?: "" | "on" | "off";
+	      },
     ) => {
       const cacheKey = rootSessionKey(rootID, sessionKey);
       const candidates = [
@@ -2331,10 +2426,10 @@ export function App({ onGoHome }: AppProps) {
         .find(
           (item) =>
             item?.agent ||
-            item?.model ||
-            item?.mode ||
-            item?.effort ||
-            item?.fast_service,
+	            item?.model ||
+	            item?.mode ||
+	            item?.effort ||
+	            item?.fast_service,
         );
       candidates.push(latestMatchingExchange as any);
 
@@ -2352,13 +2447,13 @@ export function App({ onGoHome }: AppProps) {
         }
         return "";
       };
-      return {
-        agent: pickText("agent"),
-        model: pickText("model"),
-        mode: pickText("mode"),
-        effort: pickText("effort"),
-        fast_service: pickFastService(),
-      };
+	      return {
+	        agent: pickText("agent"),
+	        model: pickText("model"),
+	        mode: pickText("mode"),
+	        effort: pickText("effort"),
+	        fast_service: pickFastService(),
+	      };
     },
     [rootSessionKey],
   );
@@ -2371,10 +2466,10 @@ export function App({ onGoHome }: AppProps) {
       runtimeHint?: {
         agent?: string;
         model?: string;
-        mode?: string;
-        effort?: string;
-        fast_service?: "" | "on" | "off";
-      },
+	        mode?: string;
+	        effort?: string;
+	        fast_service?: "" | "on" | "off";
+	      },
     ) => {
       if (!content) return;
       const now = new Date().toISOString();
@@ -2392,10 +2487,10 @@ export function App({ onGoHome }: AppProps) {
             ...last,
             agent: last.agent || runtimeMeta.agent,
             model: last.model || runtimeMeta.model,
-            mode: last.mode || runtimeMeta.mode,
-            effort: last.effort || runtimeMeta.effort,
-            fast_service: last.fast_service || runtimeMeta.fast_service,
-            content: `${last.content || ""}${content}`,
+	            mode: last.mode || runtimeMeta.mode,
+	            effort: last.effort || runtimeMeta.effort,
+	            fast_service: last.fast_service || runtimeMeta.fast_service,
+	            content: `${last.content || ""}${content}`,
             timestamp: now,
           };
           return list;
@@ -2404,10 +2499,10 @@ export function App({ onGoHome }: AppProps) {
           role: "agent",
           agent: runtimeMeta.agent,
           model: runtimeMeta.model,
-          mode: runtimeMeta.mode,
-          effort: runtimeMeta.effort,
-          fast_service: runtimeMeta.fast_service,
-          content,
+	          mode: runtimeMeta.mode,
+	          effort: runtimeMeta.effort,
+	          fast_service: runtimeMeta.fast_service,
+	          content,
           timestamp: now,
         });
         return list;
@@ -2420,10 +2515,10 @@ export function App({ onGoHome }: AppProps) {
           type: "chat",
           agent: runtimeMeta.agent,
           model: runtimeMeta.model,
-          mode: runtimeMeta.mode,
-          effort: runtimeMeta.effort,
-          fast_service: runtimeMeta.fast_service,
-          name: "",
+	          mode: runtimeMeta.mode,
+	          effort: runtimeMeta.effort,
+	          fast_service: runtimeMeta.fast_service,
+	          name: "",
           created_at: new Date().toISOString(),
           updated_at: new Date().toISOString(),
           exchanges: [],
@@ -2435,10 +2530,10 @@ export function App({ onGoHome }: AppProps) {
         ...(base as any),
         agent: (base as any).agent || runtimeMeta.agent,
         model: (base as any).model || runtimeMeta.model,
-        mode: (base as any).mode || runtimeMeta.mode,
-        effort: (base as any).effort || runtimeMeta.effort,
-        fast_service: (base as any).fast_service || runtimeMeta.fast_service,
-        exchanges: nextList,
+	        mode: (base as any).mode || runtimeMeta.mode,
+	        effort: (base as any).effort || runtimeMeta.effort,
+	        fast_service: (base as any).fast_service || runtimeMeta.fast_service,
+	        exchanges: nextList,
         updated_at: new Date().toISOString(),
       } as Session;
       bumpCacheVersion();
@@ -2447,22 +2542,44 @@ export function App({ onGoHome }: AppProps) {
   );
 
   const appendThoughtChunkForSession = useCallback(
-    (rootID: string, sessionKey: string, content: string) => {
+    (rootID: string, sessionKey: string, content: string, thoughtID?: string) => {
       if (!content) return;
       const now = new Date().toISOString();
       const cacheKey = rootSessionKey(rootID, sessionKey);
       const updateList = (prevList: Exchange[]) => {
         const list = [...(prevList || [])];
+        if (thoughtID) {
+          const existingIndex = list.findIndex(
+            (item) => item.role === "thought" && item.thought_id === thoughtID,
+          );
+          if (existingIndex >= 0) {
+            const existing = list[existingIndex];
+            const existingContent = existing.content || "";
+            let nextContent = existingContent;
+            if (content.includes(existingContent)) {
+              nextContent = content;
+            } else if (!existingContent.includes(content)) {
+              nextContent = `${existingContent}${content}`;
+            }
+            list[existingIndex] = {
+              ...existing,
+              content: nextContent,
+              timestamp: now,
+            };
+            return list;
+          }
+        }
         const last = list.length > 0 ? list[list.length - 1] : null;
-        if (last && last.role === "thought") {
+        if (last && last.role === "thought" && (!thoughtID || !last.thought_id)) {
           list[list.length - 1] = {
             ...last,
             content: `${last.content || ""}${content}`,
+            thought_id: thoughtID || last.thought_id,
             timestamp: now,
           };
           return list;
         }
-        list.push({ role: "thought", content, timestamp: now });
+        list.push({ role: "thought", content, thought_id: thoughtID, timestamp: now });
         return list;
       };
       const cached = sessionCacheRef.current[cacheKey];
@@ -3244,11 +3361,17 @@ export function App({ onGoHome }: AppProps) {
         options?: { writeCache?: boolean },
       ) => {
         const shouldWriteCache = options?.writeCache !== false;
-        const pending = resolveFreshSessionPending(
-          targetRoot,
-          key,
-          !!(fullSession as any)?.pending,
-        );
+        const serverPending =
+          typeof (fullSession as any)?.pending === "boolean"
+            ? !!(fullSession as any).pending
+            : undefined;
+        if (serverPending === false) {
+          clearLocalPendingForSession(targetRoot, key);
+        }
+        const pending =
+          serverPending !== undefined
+            ? resolveFreshSessionPending(targetRoot, key, serverPending)
+            : resolvePendingForSession(targetRoot, key, preservePending);
         const normalized = {
           ...(fullSession as any),
           key,
@@ -3655,6 +3778,7 @@ export function App({ onGoHome }: AppProps) {
       if (!rootID || !agent) {
         setExternalSessions([]);
         setHasMoreExternalSessions(false);
+        setExternalSessionsError("");
         return;
       }
       try {
@@ -3672,12 +3796,22 @@ export function App({ onGoHome }: AppProps) {
             refresh: options?.refresh,
           },
         )) as SessionItem[];
+        setExternalSessionsError("");
         setHasMoreExternalSessions(next.length >= 50);
         if (options?.replace || (!options?.beforeTime && !options?.afterTime)) {
           setExternalSessions(next);
           return;
         }
         setExternalSessions((prev) => mergeSessionItems(prev, next));
+      } catch (err) {
+        const message =
+          err instanceof Error ? err.message : String(err || "加载可导入会话失败");
+        setExternalSessionsError(message || "加载可导入会话失败");
+        if (options?.replace || (!options?.beforeTime && !options?.afterTime)) {
+          setExternalSessions([]);
+          setHasMoreExternalSessions(false);
+        }
+        console.error("[Session] Failed to fetch external sessions:", err);
       } finally {
         setLoadingExternalSessions(false);
       }
@@ -3688,6 +3822,7 @@ export function App({ onGoHome }: AppProps) {
   const exitImportMode = useCallback(() => {
     setSessionListMode("local");
     setExternalSelectedKey("");
+    setExternalSessionsError("");
     setSelectedExternalImportKeys(new Set());
     setImportingExternalSessionKeys(new Set());
     setExternalSDKStatus(null);
@@ -3704,6 +3839,7 @@ export function App({ onGoHome }: AppProps) {
       }
       setExternalImportAgent(trimmedAgent);
       setExternalSelectedKey("");
+      setExternalSessionsError("");
       setSelectedExternalImportKeys(new Set());
       setImportingExternalSessionKeys(new Set());
       setSessionListMode("import");
@@ -3771,6 +3907,25 @@ export function App({ onGoHome }: AppProps) {
     });
   }, []);
 
+  const toggleAllExternalImportSelection = useCallback((checked: boolean) => {
+    const visibleKeys = externalSessionsRef.current
+      .map((session) =>
+        String(session.agent_session_id || session.key || "").trim(),
+      )
+      .filter(Boolean);
+    setSelectedExternalImportKeys((current) => {
+      const next = new Set(current);
+      visibleKeys.forEach((key) => {
+        if (checked) {
+          next.add(key);
+        } else {
+          next.delete(key);
+        }
+      });
+      return next;
+    });
+  }, []);
+
   const handleConfirmExternalImport = useCallback(async () => {
     const rootID = currentRootIdRef.current || "";
     const sessionKeys = [...selectedExternalImportKeys].filter(Boolean);
@@ -3833,9 +3988,15 @@ export function App({ onGoHome }: AppProps) {
       const results = imported?.items || [];
       const successItems = results.filter((item) => item.success && item.session_key);
       if (!imported || !successItems.length) {
-        reportError("session.import_failed", "导入会话失败");
+        const firstError = results.find((item) => !item.success)?.error;
+        reportError(
+          "session.import_failed",
+          firstError ? `导入会话失败：${firstError}` : "导入会话失败",
+        );
         return;
       }
+      setConfirmingExternalImport(false);
+      setImportingExternalSessionKeys(new Set());
       const failedKeys = new Set(
         results
           .filter((item) => !item.success)
@@ -3843,9 +4004,13 @@ export function App({ onGoHome }: AppProps) {
           .filter(Boolean),
       );
       if (failedKeys.size > 0) {
+        const firstError = results.find((item) => !item.success)?.error;
+        const message = firstError
+          ? `部分会话导入失败：${failedKeys.size} 项。${firstError}`
+          : `部分会话导入失败：${failedKeys.size} 项`;
         reportError(
           "session.import_failed",
-          `部分会话导入失败：${failedKeys.size} 项`,
+          message,
         );
       }
       setSelectedExternalImportKeys(failedKeys);
@@ -3898,13 +4063,6 @@ export function App({ onGoHome }: AppProps) {
     ) => {
       const activeRoot = currentRootIdRef.current;
       if (!activeRoot) return;
-      if (
-        Object.values(pendingRequestRef.current).some(
-          (pending) => pending.rootId === activeRoot,
-        )
-      ) {
-        return;
-      }
       const selected = selectedSessionRef.current;
       const selectedKey = selected?.key || selected?.session_key;
       const selectedRoot =
@@ -3952,6 +4110,15 @@ export function App({ onGoHome }: AppProps) {
         effectiveEffort = effort || "",
         effectiveFastService = (fastService || "") as "" | "on" | "off",
         effectiveShell = shell || "";
+      const messageRequestsPlanMode =
+        message.trim().toLowerCase() === "/plan" ||
+        message.trim().toLowerCase().startsWith("/plan ");
+      const isQueueSend =
+        !!sendSessionKey &&
+        !!session &&
+        (((session as any).pending === true) ||
+          (currentSessionRef.current?.key === sendSessionKey &&
+            currentSessionRef.current?.pending === true));
       if (sendSessionKey && session) {
         const targetSessionKey = sendSessionKey;
         const previousAgent = session.agent || "";
@@ -4003,11 +4170,13 @@ export function App({ onGoHome }: AppProps) {
           shell: effectiveShell,
         } as Session;
         setBoundSessionForRoot(activeRoot, targetSessionKey);
-        setSelectedPendingByKey(targetSessionKey, true);
-        setDrawerSessionForRoot(activeRoot, {
-          ...(session as any),
-          pending: true,
-        } as Session);
+        if (!isQueueSend) {
+          setSelectedPendingByKey(targetSessionKey, true);
+          setDrawerSessionForRoot(activeRoot, {
+            ...(session as any),
+            pending: true,
+          } as Session);
+        }
       } else {
         sendSessionKey = undefined;
         const tempKey = `pending-${Date.now()}`;
@@ -4020,6 +4189,7 @@ export function App({ onGoHome }: AppProps) {
           effort: effectiveEffort,
           fast_service: effectiveFastService,
           shell: effectiveShell,
+          plan_mode: pendingPlanMode || messageRequestsPlanMode,
           name: "新会话",
           pending: true,
         } as any;
@@ -4054,7 +4224,7 @@ export function App({ onGoHome }: AppProps) {
         sessionKey: sendSessionKey || undefined,
         tempKey,
       };
-      if (sendSessionKey) {
+      if (sendSessionKey && !isQueueSend) {
         pendingBySessionRef.current[rootSessionKey(activeRoot, sendSessionKey)] =
           pendingRequestRef.current[requestId];
         const ck = rootSessionKey(activeRoot, sendSessionKey);
@@ -4074,7 +4244,7 @@ export function App({ onGoHome }: AppProps) {
         } as Session;
         session = sessionCacheRef.current[ck];
         bumpCacheVersion();
-      } else {
+      } else if (!sendSessionKey) {
         const tempSessionKey = session?.key || "";
         pendingDraftRef.current = {
           rootId: activeRoot,
@@ -4110,10 +4280,12 @@ export function App({ onGoHome }: AppProps) {
         setInteractionMode("drawer");
         setDrawerOpenForRoot(activeRoot, true);
       }
-      setDrawerSessionForRoot(activeRoot, {
-        ...(session as any),
-        pending: true,
-      } as Session);
+      if (!isQueueSend) {
+        setDrawerSessionForRoot(activeRoot, {
+          ...(session as any),
+          pending: true,
+        } as Session);
+      }
       const explicitFileContext = hasExplicitFileContext(message);
       const selection =
         explicitFileContext || !attachedFileContext?.filePath
@@ -4131,6 +4303,7 @@ export function App({ onGoHome }: AppProps) {
           effectiveMode === "plugin" ? getViewModeSystemPrompt() : undefined,
       });
       let outgoingMessage = message;
+      const applyPendingPlanPrefix = pendingPlanMode && !sendSessionKey;
       const currentFile = fileRef.current;
       if (currentFile && !pluginBypassRef.current) {
         try {
@@ -4146,6 +4319,9 @@ export function App({ onGoHome }: AppProps) {
           console.warn("[plugin/view-context] failed", err);
         }
       }
+      if (applyPendingPlanPrefix) {
+        outgoingMessage = `/plan ${outgoingMessage}`;
+      }
       const sent = await sessionService.sendMessage(
         activeRoot,
         sendSessionKey || undefined,
@@ -4160,6 +4336,9 @@ export function App({ onGoHome }: AppProps) {
         effectiveShell || undefined,
         requestId,
       );
+      if (sent && applyPendingPlanPrefix) {
+        setPendingPlanMode(false);
+      }
       console.info("[session/send] dispatched", { requestId, rootId: activeRoot, sessionKey: sendSessionKey || null, tempKey: tempKey || null, sent });
       if (!sent) {
         console.warn("[session/send] dispatch_failed", { requestId, rootId: activeRoot, sessionKey: sendSessionKey || null });
@@ -4196,6 +4375,44 @@ export function App({ onGoHome }: AppProps) {
       setDrawerOpenForRoot,
       setDrawerSessionForRoot,
       updateSessionAgentForKey,
+      pendingPlanMode,
+    ],
+  );
+
+  const handleRunAgentLifecycleCommand = useCallback(
+    async (agentName: string, action: "install" | "update", commands: string[]) => {
+      const activeRoot = currentRootIdRef.current;
+      if (!activeRoot) {
+        throw new Error("当前未选择项目，无法执行命令");
+      }
+      const script = commands.map((command) => command.trim()).filter(Boolean).join("\n");
+      if (!script) {
+        throw new Error("agents.json 未配置命令");
+      }
+      const previousBoundKey = boundSessionByRootRef.current[activeRoot];
+      if (previousBoundKey && !previousBoundKey.startsWith("pending-")) {
+        suppressedAutoBindSessionByRootRef.current[activeRoot] = previousBoundKey;
+      }
+      selectedSessionRef.current = null;
+      currentSessionRef.current = null;
+      setSelectedSession(null);
+      selectedSessionByRootRef.current[activeRoot] = null;
+      setBoundSessionForRoot(activeRoot, null);
+      setDrawerSessionForRoot(activeRoot, null);
+      setInteractionMode("drawer");
+      setDrawerOpenForRoot(activeRoot, true);
+      await handleSendMessage(script, "command", "");
+      console.info("[agent/lifecycle] command dispatched", {
+        agent: agentName,
+        action,
+        commandCount: commands.length,
+      });
+    },
+    [
+      handleSendMessage,
+      setBoundSessionForRoot,
+      setDrawerOpenForRoot,
+      setDrawerSessionForRoot,
     ],
   );
 
@@ -4210,28 +4427,114 @@ export function App({ onGoHome }: AppProps) {
         delete cancelRequestedBySessionRef.current[cacheKey];
         return;
       }
-      delete pendingBySessionRef.current[cacheKey];
-      const cached = sessionCacheRef.current[cacheKey];
-      if (cached && cached.key === sessionKey) {
-        sessionCacheRef.current[cacheKey] = {
-          ...(cached as any),
-          pending: false,
-        } as Session;
-      }
-      setSelectedPendingByKey(sessionKey, false);
-      const drawer = drawerSessionByRootRef.current[activeRoot];
-      if (drawer && drawer.key === sessionKey) {
-        setDrawerSessionForRoot(activeRoot, {
-          ...(drawer as any),
-          pending: false,
-        } as Session);
-      }
-      bumpCacheVersion();
+      clearLocalPendingForSession(activeRoot, sessionKey);
       window.setTimeout(() => {
         delete cancelRequestedBySessionRef.current[cacheKey];
       }, 30000);
     },
+    [clearLocalPendingForSession, rootSessionKey],
+  );
+
+  const markSessionPending = useCallback(
+    (rootID: string, sessionKey: string) => {
+      if (!rootID || !sessionKey) return;
+      const now = new Date().toISOString();
+      const cacheKey = rootSessionKey(rootID, sessionKey);
+      const cached = sessionCacheRef.current[cacheKey];
+      if (cached) {
+        sessionCacheRef.current[cacheKey] = {
+          ...(cached as any),
+          pending: true,
+          updated_at: now,
+        } as Session;
+        bumpCacheVersion();
+      }
+      setSelectedPendingByKey(sessionKey, true);
+      const drawer = drawerSessionByRootRef.current[rootID];
+      if (drawer && (drawer.key || (drawer as any).session_key) === sessionKey) {
+        setDrawerSessionForRoot(rootID, {
+          ...(drawer as any),
+          pending: true,
+          updated_at: now,
+        } as Session);
+      }
+    },
     [bumpCacheVersion, rootSessionKey, setDrawerSessionForRoot, setSelectedPendingByKey],
+  );
+
+  const handleRemoveQueuedMessage = useCallback(
+    async (queueId: string) => {
+      const activeRoot = currentRootIdRef.current;
+      const selected = selectedSessionRef.current;
+      const selectedRoot =
+        (selected?.root_id as string | undefined) || activeRoot || "";
+      const selectedKey = selected?.key || selected?.session_key || "";
+      const sessionKey =
+        interactionModeRef.current !== "drawer" &&
+        selectedRoot === activeRoot &&
+        selectedKey &&
+        !selectedKey.startsWith("pending-")
+          ? selectedKey
+          : boundSessionByRootRef.current[activeRoot || ""] || "";
+      if (!activeRoot || !sessionKey || !queueId) return;
+      await sessionService.removeQueuedMessage(activeRoot, sessionKey, queueId);
+    },
+    [],
+  );
+
+  const handleUpdateQueuedMessage = useCallback(
+    async (queueId: string, content: string) => {
+      const activeRoot = currentRootIdRef.current;
+      const selected = selectedSessionRef.current;
+      const selectedRoot =
+        (selected?.root_id as string | undefined) || activeRoot || "";
+      const selectedKey = selected?.key || selected?.session_key || "";
+      const sessionKey =
+        interactionModeRef.current !== "drawer" &&
+        selectedRoot === activeRoot &&
+        selectedKey &&
+        !selectedKey.startsWith("pending-")
+          ? selectedKey
+          : boundSessionByRootRef.current[activeRoot || ""] || "";
+      if (!activeRoot || !sessionKey || !queueId || !content.trim()) return;
+      await sessionService.updateQueuedMessage(activeRoot, sessionKey, queueId, content);
+    },
+    [],
+  );
+
+  const handleSendQueuedMessageNow = useCallback(
+    async (queueId: string) => {
+      const activeRoot = currentRootIdRef.current;
+      const selected = selectedSessionRef.current;
+      const selectedRoot =
+        (selected?.root_id as string | undefined) || activeRoot || "";
+      const selectedKey = selected?.key || selected?.session_key || "";
+      const sessionKey =
+        interactionModeRef.current !== "drawer" &&
+        selectedRoot === activeRoot &&
+        selectedKey &&
+        !selectedKey.startsWith("pending-")
+          ? selectedKey
+          : boundSessionByRootRef.current[activeRoot || ""] || "";
+      if (!activeRoot || !sessionKey || !queueId) return;
+      const cacheKey = rootSessionKey(activeRoot, sessionKey);
+      const previousQueue = queuedMessagesBySessionRef.current[cacheKey] || [];
+      const nextQueue = previousQueue.filter((item) => item.id !== queueId);
+      queuedMessagesBySessionRef.current[cacheKey] = nextQueue;
+      if (!optimisticDequeuedIdsRef.current[cacheKey]) {
+        optimisticDequeuedIdsRef.current[cacheKey] = new Set();
+      }
+      optimisticDequeuedIdsRef.current[cacheKey].add(queueId);
+      setQueueVersion((v) => v + 1);
+      markSessionPending(activeRoot, sessionKey);
+      const sent = await sessionService.sendQueuedMessageNow(activeRoot, sessionKey, queueId);
+      if (!sent) {
+        optimisticDequeuedIdsRef.current[cacheKey]?.delete(queueId);
+        queuedMessagesBySessionRef.current[cacheKey] = previousQueue;
+        setQueueVersion((v) => v + 1);
+      }
+    },
+    [markSessionPending, rootSessionKey],
   );
 
   const submitExtensionUIResponse = useCallback(
@@ -5970,7 +6273,6 @@ export function App({ onGoHome }: AppProps) {
   useEffect(() => {
     if (!currentRootId) return;
     sessionService.connect(currentRootId);
-    setStatus("Connected");
   }, [currentRootId]);
 
   useEffect(() => {
@@ -6121,7 +6423,7 @@ export function App({ onGoHome }: AppProps) {
   useEffect(
     () => () => {
       sessionService.disconnect();
-      setStatus("Disconnected");
+      setStatus("disconnected");
     },
     [],
   );
@@ -6263,18 +6565,17 @@ export function App({ onGoHome }: AppProps) {
       if (wasCanceled) {
         delete cancelRequestedBySessionRef.current[cacheKey];
       }
-      clearLocalPendingForSession(rootID, sessionKey);
-      const drawer = drawerSessionByRootRef.current[rootID];
-      if (drawer && drawer.key === sessionKey) {
-        const latest = wasCanceled
-          ? sessionCacheRef.current[cacheKey] || drawer
-          : drawer;
-        setDrawerSessionForRoot(rootID, {
-          ...(latest as any),
-          pending: false,
-        } as Session);
+      const queued = queuedMessagesBySessionRef.current[cacheKey] || [];
+      const queueFrozen = !!queueFrozenBySessionRef.current[cacheKey];
+      const hiddenQueued = optimisticDequeuedIdsRef.current[cacheKey];
+      const hasQueuedContinuation =
+        (queued.length > 0 && !queueFrozen) ||
+        !!(hiddenQueued && hiddenQueued.size > 0);
+      if (hasQueuedContinuation && !wasCanceled) {
+        markSessionPending(rootID, sessionKey);
+        return;
       }
-      bumpCacheVersion();
+      clearLocalPendingForSession(rootID, sessionKey);
     };
 
     const handleSessionStream = (payload: any) => {
@@ -6334,10 +6635,10 @@ export function App({ onGoHome }: AppProps) {
             content: pending.message,
             timestamp: pending.timestamp,
             model: pending.model,
-            mode: pending.agentMode,
-            effort: pending.effort,
-            fast_service: pending.fastService || "",
-            shell: pending.shell || "",
+	            mode: pending.agentMode,
+	            effort: pending.effort,
+	            fast_service: pending.fastService || "",
+	            shell: pending.shell || "",
           };
           const cached =
             sessionCacheRef.current[ck] ||
@@ -6346,10 +6647,10 @@ export function App({ onGoHome }: AppProps) {
               type: pending.mode,
               agent: pending.agent,
               model: pending.model,
-              mode: pending.agentMode,
-              effort: pending.effort,
-              fast_service: pending.fastService || "",
-              shell: pending.shell || "",
+	              mode: pending.agentMode,
+	              effort: pending.effort,
+	              fast_service: pending.fastService || "",
+	              shell: pending.shell || "",
               name: pendingName,
               created_at: pending.timestamp,
               updated_at: pending.timestamp,
@@ -6386,29 +6687,7 @@ export function App({ onGoHome }: AppProps) {
       if (!event?.type) return;
       const markStreamPending = () => {
         if (event.type === "message_done" || event.type === "error") return;
-        const now = new Date().toISOString();
-        const latest = sessionCacheRef.current[ck];
-        let cacheChanged = false;
-        if (latest && !(latest as any).pending) {
-          sessionCacheRef.current[ck] = {
-            ...(latest as any),
-            pending: true,
-            updated_at: now,
-          } as Session;
-          cacheChanged = true;
-        }
-        setSelectedPendingByKey(streamKey, true);
-        const drawer = drawerSessionByRootRef.current[activeRoot];
-        if (drawer && (drawer.key || (drawer as any).session_key) === streamKey) {
-          setDrawerSessionForRoot(activeRoot, {
-            ...(drawer as any),
-            pending: true,
-            updated_at: now,
-          } as Session);
-        }
-        if (cacheChanged) {
-          bumpCacheVersion();
-        }
+        markSessionPending(activeRoot, streamKey);
       };
       const updateDrawerIfShowingStream = () => {
         const drawerKey = drawerSessionByRootRef.current[activeRoot]?.key || "";
@@ -6450,6 +6729,7 @@ export function App({ onGoHome }: AppProps) {
             activeRoot,
             streamKey,
             event.data?.content || "",
+            event.data?.id || "",
           );
           updateDrawerIfShowingStream();
           break;
@@ -6705,7 +6985,11 @@ export function App({ onGoHome }: AppProps) {
     const unsubscribeEvents = sessionService.subscribeEvents((event) => {
       const payload = (event.payload || {}) as any;
       switch (event.type) {
+        case "ws.connecting":
+          setStatus("connecting");
+          break;
         case "ws.connected":
+          setStatus("connected");
           void refreshManagedRoots();
           if (currentRootIdRef.current) {
             const newest = sessionsRef.current[0]?.updated_at || "";
@@ -6716,7 +7000,11 @@ export function App({ onGoHome }: AppProps) {
           }
           replayTargetsForAllRoots();
           break;
+        case "ws.reconnecting":
+          setStatus("reconnecting");
+          break;
         case "ws.reconnected":
+          setStatus("connected");
           void refreshManagedRoots();
           if (currentRootIdRef.current) {
             const newest = sessionsRef.current[0]?.updated_at || "";
@@ -6728,6 +7016,7 @@ export function App({ onGoHome }: AppProps) {
           replayTargetsForAllRoots();
           break;
         case "ws.closed":
+          setStatus(currentRootIdRef.current ? "reconnecting" : "disconnected");
           void handleRelayWebSocketClosed();
           break;
         case "root.changed":
@@ -6760,17 +7049,87 @@ export function App({ onGoHome }: AppProps) {
         case "session.imported": {
           const rootID =
             typeof payload?.root_id === "string" ? payload.root_id : "";
+          const agentName =
+            typeof payload?.agent === "string" ? payload.agent : "";
+          const agentSessionID =
+            typeof payload?.agent_session_id === "string"
+              ? payload.agent_session_id.trim()
+              : "";
           if (!rootID) {
             break;
           }
           if (rootID === currentRootIdRef.current) {
             void loadSessionsForRoot(rootID, { replace: true });
+            if (
+              sessionListModeRef.current === "import" &&
+              agentSessionID &&
+              (!agentName || agentName === externalImportAgentRef.current)
+            ) {
+              setImportingExternalSessionKeys((current) => {
+                if (!current.has(agentSessionID)) {
+                  return current;
+                }
+                const next = new Set(current);
+                next.delete(agentSessionID);
+                return next;
+              });
+              setSelectedExternalImportKeys((current) => {
+                if (!current.has(agentSessionID)) {
+                  return current;
+                }
+                const next = new Set(current);
+                next.delete(agentSessionID);
+                return next;
+              });
+              setConfirmingExternalImport(false);
+              if (externalImportAgentRef.current) {
+                void loadExternalSessions(rootID, externalImportAgentRef.current, {
+                  replace: true,
+                });
+              }
+            }
           }
           break;
         }
         case "session.stream":
           handleSessionStream(payload);
           break;
+        case "session.queue.updated": {
+          const rootID =
+            typeof payload?.root_id === "string" ? payload.root_id : "";
+          const sessionKey =
+            typeof payload?.session_key === "string" ? payload.session_key : "";
+          if (!rootID || !sessionKey) {
+            break;
+          }
+          const incomingQueue = Array.isArray(payload?.queue)
+            ? (payload.queue.filter(
+                (item: any) =>
+                  item &&
+                  typeof item.id === "string" &&
+                  typeof item.content === "string",
+              ) as SessionQueueItem[])
+            : [];
+          const cacheKey = rootSessionKey(rootID, sessionKey);
+          const hidden = optimisticDequeuedIdsRef.current[cacheKey];
+          const queue = hidden && hidden.size > 0
+            ? incomingQueue.filter((item) => !hidden.has(item.id))
+            : incomingQueue;
+          queueFrozenBySessionRef.current[cacheKey] = payload?.queue_frozen === true;
+          if (hidden) {
+            for (const queueId of Array.from(hidden)) {
+              if (!incomingQueue.some((item) => item.id === queueId)) {
+                hidden.delete(queueId);
+              }
+            }
+            if (hidden.size === 0) {
+              delete optimisticDequeuedIdsRef.current[cacheKey];
+            }
+          }
+          queuedMessagesBySessionRef.current[cacheKey] = queue;
+          setQueueVersion((v) => v + 1);
+          break;
+        }
         case "session.accepted": {
           const requestId =
             typeof payload?.request_id === "string" ? payload.request_id : "";
@@ -6938,6 +7297,10 @@ export function App({ onGoHome }: AppProps) {
                 fast_service:
                   normalizeFastService(sessionMeta?.fast_service) ||
                   normalizeFastService(exchange?.fast_service),
+	                plan_mode:
+	                  typeof sessionMeta?.plan_mode === "boolean"
+	                    ? sessionMeta.plan_mode
+	                    : false,
                 name: sessionMeta?.name || "新会话",
                 created_at:
                   sessionMeta?.created_at ||
@@ -6986,6 +7349,10 @@ export function App({ onGoHome }: AppProps) {
                 normalizeFastService(sessionMeta?.fast_service) ||
                 normalizeFastService(exchange?.fast_service) ||
                 normalizeFastService((cached as any).fast_service),
+	              plan_mode:
+	                typeof sessionMeta?.plan_mode === "boolean"
+	                  ? sessionMeta.plan_mode
+	                  : !!(cached as any).plan_mode,
               exchanges: duplicate
                 ? prevExchanges
                 : [
@@ -6994,10 +7361,10 @@ export function App({ onGoHome }: AppProps) {
                       role: "user",
                       agent: exchange?.agent || "",
                       model: exchange?.model || "",
-                      mode: exchange?.mode || "",
-                      effort: exchange?.effort || "",
-                      fast_service: exchange?.fast_service || "",
-                      content: exchange?.content || "",
+	                      mode: exchange?.mode || "",
+	                      effort: exchange?.effort || "",
+	                      fast_service: exchange?.fast_service || "",
+	                      content: exchange?.content || "",
                       timestamp:
                         exchange?.timestamp || new Date().toISOString(),
                       pending_ack: false,
@@ -7047,6 +7414,10 @@ export function App({ onGoHome }: AppProps) {
                 fast_service:
                   normalizeFastService(payload.session.fast_service) ||
                   normalizeFastService((cached as any).fast_service),
+                plan_mode:
+                  typeof payload.session.plan_mode === "boolean"
+                    ? payload.session.plan_mode
+                    : !!(cached as any).plan_mode,
                 parent_session_key:
                   typeof payload.session.parent_session_key === "string"
                     ? payload.session.parent_session_key
@@ -7086,6 +7457,10 @@ export function App({ onGoHome }: AppProps) {
                       fast_service:
                         normalizeFastService(payload.session.fast_service) ||
                         normalizeFastService((prev as any).fast_service),
+                      plan_mode:
+                        typeof payload.session.plan_mode === "boolean"
+                          ? payload.session.plan_mode
+                          : !!(prev as any).plan_mode,
                       parent_session_key:
                         typeof payload.session.parent_session_key === "string"
                           ? payload.session.parent_session_key
@@ -7181,6 +7556,7 @@ export function App({ onGoHome }: AppProps) {
     };
   }, [
     currentRootId,
+    loadExternalSessions,
     loadSessionsForRoot,
     rootSessionKey,
     resolveRootForSessionKey,
@@ -7191,6 +7567,7 @@ export function App({ onGoHome }: AppProps) {
     appendTodoUpdateForSession,
     clearLocalPendingForSession,
     clearSessionStale,
+    markSessionPending,
     markSessionStale,
     resolvePendingForSession,
     setSelectedPendingByKey,
@@ -7527,6 +7904,10 @@ export function App({ onGoHome }: AppProps) {
     : selectedInCurrentRoot
       ? (selectedSession as any)
       : null;
+  const actionBarSessionKey =
+    (actionBarSession as any)?.key ||
+    (actionBarSession as any)?.session_key ||
+    "";
   const isBoundSessionInMain =
     !!activeBoundSessionKey &&
     selectedKey === activeBoundSessionKey &&
@@ -7534,6 +7915,15 @@ export function App({ onGoHome }: AppProps) {
   const canOpenSessionDrawer = !!activeBoundSessionKey && !isBoundSessionInMain;
   const detachedBoundSession =
     isDetachedMainSessionTarget && !isDrawerOpen;
+  const actionBarQueuedMessages = useMemo(() => {
+    void queueVersion;
+    if (!currentRootId || !actionBarSessionKey) return [];
+    return (
+      queuedMessagesBySessionRef.current[
+        rootSessionKey(currentRootId, actionBarSessionKey)
+      ] || []
+    );
+  }, [actionBarSessionKey, currentRootId, queueVersion, rootSessionKey]);
 
   const matchedPlugin = useMemo(() => {
     if (!currentRootId || !file) return null;
@@ -8404,6 +8794,7 @@ export function App({ onGoHome }: AppProps) {
         onCreateWorktree={handleOpenWorktreeLocation}
         onSwitchWorktree={handleSwitchWorktreeStart}
         onRemoveWorktree={handleRemoveCurrentWorktree}
+        onOpenScheduledAgentTasks={() => setScheduledAgentDialogOpen(true)}
         menuOverlay={
           projectAddMode === "worktree_location"
             ? projectAddOverlay
@@ -8658,6 +9049,7 @@ export function App({ onGoHome }: AppProps) {
         sdkStatus={externalSDKStatus}
         sdkStatusLoading={externalSDKStatusLoading}
         loading={loadingExternalSessions}
+        error={externalSessionsError}
         loadingOlder={loadingOlderExternalSessions}
         sdkRefreshing={loadingExternalSessions}
         confirmingImport={confirmingExternalImport}
@@ -8669,6 +9061,7 @@ export function App({ onGoHome }: AppProps) {
           )
         }
         onToggleImport={toggleExternalImportSelection}
+        onToggleSelectAllImport={toggleAllExternalImportSelection}
         onConfirmImport={() => {
           void handleConfirmExternalImport();
         }}
@@ -8885,6 +9278,8 @@ export function App({ onGoHome }: AppProps) {
         rightOpen={isRightOpen}
         onCloseLeft={() => setIsLeftOpen(false)}
         onCloseRight={() => setIsRightOpen(false)}
+        onOpenLeft={() => setIsLeftOpen(true)}
+        onOpenRight={() => setIsRightOpen(true)}
         sidebar={
           <FileTree
             entries={rootEntries}
@@ -8936,6 +9331,9 @@ export function App({ onGoHome }: AppProps) {
             relayActionDisabled={relayActionDisabled}
             relayActionHelp={null}
             onRelayAction={handleRelayAction}
+            relayNodeId={relayStatus?.node_id || ""}
+            relayBaseURL={relayStatus?.relay_base_url || ""}
+            relayNoRelayer={relayStatus?.no_relayer === true}
             updateActionLabel={showUpdateButton ? updateLabel : null}
             updateActionDisabled={updateBusy}
             updateActionHelp={showUpdateButton ? updateHelp : ""}
@@ -8947,6 +9345,7 @@ export function App({ onGoHome }: AppProps) {
             showEnterKeySendOption={isMobile}
             enterKeySends={mobileEnterKeySends}
             onEnterKeySendsChange={setMobileEnterKeySends}
+            onRunAgentLifecycleCommand={handleRunAgentLifecycleCommand}
             onGoHome={onGoHome}
           />
         }
@@ -8963,57 +9362,6 @@ export function App({ onGoHome }: AppProps) {
               position: "relative",
             }}
           >
-            {!isMobile && (
-              <div
-                style={{
-                  position: "absolute",
-                  top: "10px",
-                  left: isMobile ? "10px" : isLeftOpen ? "-40px" : "10px",
-                  right: isMobile ? "10px" : isRightOpen ? "-40px" : "10px",
-                  display: "flex",
-                  justifyContent: "space-between",
-                  pointerEvents: "none",
-                  zIndex: 100,
-                }}
-              >
-                <button
-                  onClick={() => setIsLeftOpen(!isLeftOpen)}
-                  style={{
-                    pointerEvents: "auto",
-                    background: "var(--content-bg)",
-                    border: "1px solid var(--border-color)",
-                    borderRadius: "8px",
-                    width: "32px",
-                    height: "32px",
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                    cursor: "pointer",
-                    opacity: isLeftOpen && !isMobile ? 0 : 1,
-                  }}
-                >
-                  📁
-                </button>
-                <button
-                  onClick={() => setIsRightOpen(!isRightOpen)}
-                  style={{
-                    pointerEvents: "auto",
-                    background: "var(--content-bg)",
-                    border: "1px solid var(--border-color)",
-                    borderRadius: "8px",
-                    width: "32px",
-                    height: "32px",
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                    cursor: "pointer",
-                    opacity: isRightOpen && !isMobile ? 0 : 1,
-                  }}
-                >
-                  🕒
-                </button>
-              </div>
-            )}
             <div
               style={{
                 flex: 1,
@@ -9067,13 +9415,19 @@ export function App({ onGoHome }: AppProps) {
               agentsVersion={agentsVersion}
               currentRootId={currentRootId}
               currentSession={actionBarSession}
+              pendingPlanMode={pendingPlanMode}
               attachedFileContext={attachedFileContext}
               canOpenSessionDrawer={canOpenSessionDrawer}
               sessionDrawerOpen={isDrawerOpen}
               detachedBoundSession={detachedBoundSession}
               editDraftRequest={editDraftRequest}
+              queuedMessages={actionBarQueuedMessages}
               onSendMessage={handleSendMessage}
+              onSetPlanMode={handleSetPlanMode}
               onCancelCurrentTurn={handleCancelCurrentTurn}
+              onRemoveQueuedMessage={handleRemoveQueuedMessage}
+              onUpdateQueuedMessage={handleUpdateQueuedMessage}
+              onSendQueuedMessageNow={handleSendQueuedMessageNow}
               mobileEnterKeySends={mobileEnterKeySends}
               onNewSession={handleNewSession}
               onRequestFileContext={handleRequestFileContext}
@@ -9266,6 +9620,12 @@ export function App({ onGoHome }: AppProps) {
           onCancel={cancelExtensionUI}
         />
       ) : null}
+      <ScheduledAgentTaskDialog
+        open={scheduledAgentDialogOpen}
+        rootId={currentRootId}
+        agents={availableAgents}
+        onClose={() => setScheduledAgentDialogOpen(false)}
+      />
       <ToastContainer />
     </>
   );
