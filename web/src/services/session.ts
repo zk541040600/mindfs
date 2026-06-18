@@ -248,6 +248,7 @@ class SessionService {
   private ws: WebSocket | null = null;
   private handlers = new Map<string, Set<SessionEventHandler>>();
   private pendingStreams = new Map<string, StreamEvent[]>();
+  private activeStreams = new Set<string>();
   private pendingMessages = new Map<string, PendingMessage>();
   private listeners = new Set<(event: SessionServiceEvent) => void>();
   private reconnectTimer: number | null = null;
@@ -627,6 +628,7 @@ class SessionService {
     this.emit({ type, sessionKey, payload: nextPayload });
 
     if (!sessionKey) return;
+    this.updateActiveStreamState(type, sessionKey, nextPayload);
 
     const handlers = this.handlers.get(sessionKey);
     if ((!handlers || handlers.size === 0) && type === "session.stream") {
@@ -696,6 +698,31 @@ class SessionService {
     for (const listener of this.listeners) {
       listener(event);
     }
+  }
+
+  private updateActiveStreamState(
+    type: string,
+    sessionKey: string,
+    payload: Record<string, unknown>,
+  ) {
+    if (type === "session.done" || type === "session.error") {
+      this.activeStreams.delete(sessionKey);
+      return;
+    }
+    if (type !== "session.stream") return;
+    const event = payload.event as StreamEvent | undefined;
+    if (!event) return;
+    if (event.type === "error") {
+      this.activeStreams.delete(sessionKey);
+      return;
+    }
+    if (event.type !== "message_done") {
+      this.activeStreams.add(sessionKey);
+    }
+  }
+
+  isSessionStreaming(sessionKey: string) {
+    return this.activeStreams.has(sessionKey);
   }
 
   subscribe(sessionKey: string, handler: SessionEventHandler) {

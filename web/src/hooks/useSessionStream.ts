@@ -435,6 +435,7 @@ export function useSessionStream(
   exchanges: ExchangeLike[] = [],
   exchangeAux: ExchangeAuxMapLike = {},
   sessionContextWindow?: ContextWindowLike,
+  sessionPending = false,
 ): UseSessionStreamResult {
   const [isStreaming, setIsStreaming] = useState(false);
   const [streamVersion, setStreamVersion] = useState(0);
@@ -450,10 +451,15 @@ export function useSessionStream(
   );
 
   useEffect(() => {
-    setIsStreaming(false);
     setStreamVersion(0);
     setStreamStatusText("");
-    if (!sessionKey) return;
+    if (!sessionKey) {
+      setIsStreaming(false);
+      return;
+    }
+    setIsStreaming(
+      sessionPending && sessionService.isSessionStreaming(sessionKey),
+    );
 
     const unsubscribe = sessionService.subscribe(sessionKey, {
       onStream: (event) => {
@@ -466,7 +472,10 @@ export function useSessionStream(
         if (event.type === "message_chunk") {
           setStreamStatusText("");
         }
-        if (event.type === "message_done" || event.type === "error") {
+        if (event.type === "message_done") {
+          return;
+        }
+        if (event.type === "error") {
           setStreamStatusText("");
           setIsStreaming(false);
         } else {
@@ -486,7 +495,7 @@ export function useSessionStream(
     return () => {
       unsubscribe();
     };
-  }, [sessionKey]);
+  }, [sessionKey, sessionPending]);
 
   return {
     timeline: settleRunningTools(baseTimeline),

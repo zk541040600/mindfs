@@ -910,13 +910,14 @@ function SessionViewerInner({
   const relatedFilesDefaultStateRef = useRef<string>("");
   const sessionKey = session?.key || session?.session_key || null;
   const exchanges = Array.isArray(session?.exchanges) ? session.exchanges : [];
+  const isAwaiting = !!(session as any)?.pending;
   const { timeline, isStreaming, streamVersion, streamStatusText } = useSessionStream(
     sessionKey,
     exchanges,
     session?.exchange_aux || {},
     session?.context_window,
+    isAwaiting,
   );
-  const isAwaiting = !!(session as any)?.pending;
   const shouldStickToBottomRef = useRef(true);
   const lastSessionKeyRef = useRef<string | null>(null);
   const targetSeqScrollKeyRef = useRef("");

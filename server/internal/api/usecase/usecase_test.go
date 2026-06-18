@@ -280,6 +280,216 @@ func TestSubSessionSyntheticDonePersistsPartialResponse(t *testing.T) {
 	}
 }
 
+func TestClaudeSubagentRouterCreatesChildSessionAndRoutesChunks(t *testing.T) {
+	ctx := context.Background()
+	rootDir := t.TempDir()
+	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
+	manager := session.NewManager(root)
+	parent, err := manager.Create(ctx, session.CreateInput{Type: session.TypeChat, Agent: "claude", Name: "parent"})
+	if err != nil {
+		t.Fatalf("create parent: %v", err)
+	}
+
+	var created *session.Session
+	var sawDone bool
+	router := newClaudeSubagentRouter(subagentSessionInput{
+		RootID:  root.ID,
+		Parent:  parent,
+		Agent:   "claude",
+		Model:   "sonnet",
+		Mode:    "default",
+		Effort:  "medium",
+		Manager: manager,
+		OnCreated: func(child *session.Session) {
+			created = child
+		},
+		OnUpdate: func(sessionKey string, update agenttypes.Event) {
+			if created != nil && sessionKey == created.Key && update.Type == agenttypes.EventTypeMessageDone {
+				sawDone = true
+			}
+		},
+	})
+
+	parentTask := agenttypes.ToolCall{
+		CallID:  "tool-1",
+		Title:   "Review changes",
+		Status:  "running",
+		Kind:    agenttypes.ToolKindTask,
+		RawType: "claude_task",
+		Meta: map[string]any{
+			"parentToolUseId": "tool-1",
+			"taskId":          "task-1",
+			"taskDescription": "Review changes",
+		},
+	}
+	if consumed := router.Handle(ctx, agenttypes.Event{Type: agenttypes.EventTypeToolCall, Data: parentTask}); consumed {
+		t.Fatalf("parent task lifecycle should not be consumed")
+	}
+	if created != nil {
+		t.Fatalf("parent task lifecycle should not create child")
+	}
+
+	if consumed := router.Handle(ctx, agenttypes.Event{
+		Type: agenttypes.EventTypeMessageChunk,
+		Data: agenttypes.MessageChunk{
+			Content:         "child response",
+			ParentToolUseID: "tool-1",
+			TaskID:          "task-1",
+		},
+	}); !consumed {
+		t.Fatalf("subagent chunk was not consumed")
+	}
+	if created == nil {
+		t.Fatalf("child session was not created")
+	}
+	if created.ParentSessionKey != parent.Key || created.ParentToolCallID != "tool-1" {
+		t.Fatalf("created child parent fields = %#v", created)
+	}
+	if consumed := router.Handle(ctx, agenttypes.Event{
+		Type: agenttypes.EventTypeMessageDone,
+		Data: agenttypes.MessageDone{ParentToolUseID: "tool-1", TaskID: "task-1"},
+	}); !consumed {
+		t.Fatalf("subagent done was not consumed")
+	}
+
+	loaded, err := manager.Get(ctx, created.Key, 0)
+	if err != nil {
+		t.Fatalf("get child: %v", err)
+	}
+	if len(loaded.Exchanges) != 1 || loaded.Exchanges[0].Content != "child response" {
+		t.Fatalf("child exchanges = %#v", loaded.Exchanges)
+	}
+	if !sawDone {
+		t.Fatalf("sub session done update was not emitted")
+	}
+}
+
+func TestClaudeSubagentRouterDoesNotCreateChildFromTaskIDOnly(t *testing.T) {
+	ctx := context.Background()
+	rootDir := t.TempDir()
+	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
+	manager := session.NewManager(root)
+	parent, err := manager.Create(ctx, session.CreateInput{Type: session.TypeChat, Agent: "claude", Name: "parent"})
+	if err != nil {
+		t.Fatalf("create parent: %v", err)
+	}
+
+	var createdCount int
+	router := newClaudeSubagentRouter(subagentSessionInput{
+		RootID:  root.ID,
+		Parent:  parent,
+		Agent:   "claude",
+		Manager: manager,
+		OnCreated: func(*session.Session) {
+			createdCount++
+		},
+	})
+
+	taskOnly := agenttypes.ToolCall{
+		CallID:  "task-opaque-id",
+		Title:   "Task progress",
+		Status:  "running",
+		Kind:    agenttypes.ToolKindTask,
+		RawType: "claude_task",
+		Meta: map[string]any{
+			"taskId": "task-opaque-id",
+		},
+	}
+	if consumed := router.Handle(ctx, agenttypes.Event{Type: agenttypes.EventTypeToolUpdate, Data: taskOnly}); consumed {
+		t.Fatalf("task lifecycle should stay on parent")
+	}
+	if createdCount != 0 {
+		t.Fatalf("createdCount = %d, want 0", createdCount)
+	}
+
+	if consumed := router.Handle(ctx, agenttypes.Event{
+		Type: agenttypes.EventTypeMessageChunk,
+		Data: agenttypes.MessageChunk{Content: "orphan task text", TaskID: "task-opaque-id"},
+	}); consumed {
+		t.Fatalf("task-id-only chunk should not create child")
+	}
+	if createdCount != 0 {
+		t.Fatalf("createdCount after task chunk = %d, want 0", createdCount)
+	}
+
+	if consumed := router.Handle(ctx, agenttypes.Event{
+		Type: agenttypes.EventTypeMessageChunk,
+		Data: agenttypes.MessageChunk{
+			Content:         "subagent text",
+			ParentToolUseID: "call_e365874817b34ca79e665ee9",
+			TaskID:          "task-opaque-id",
+		},
+	}); !consumed {
+		t.Fatalf("parent-tool-use chunk should create child")
+	}
+	if createdCount != 1 {
+		t.Fatalf("createdCount after parent chunk = %d, want 1", createdCount)
+	}
+}
+
+func TestDedupeExchangeAuxBufferMergesDuplicateToolCalls(t *testing.T) {
+	items := []session.ExchangeAux{
+		{
+			Seq:  1,
+			Line: 0,
+			ToolCall: &agenttypes.ToolCall{
+				CallID:  "call-1",
+				Title:   "Print hi",
+				Status:  "running",
+				Kind:    agenttypes.ToolKindTask,
+				RawType: "tool_use",
+				Content: []agenttypes.ToolCallContentItem{{Type: "text", Text: "prompt body"}},
+				Meta:    map[string]any{"prompt": "prompt body"},
+			},
+		},
+		{
+			Seq:  1,
+			Line: 0,
+			ToolCall: &agenttypes.ToolCall{
+				CallID:  "call-1",
+				Status:  "running",
+				Kind:    agenttypes.ToolKindTask,
+				RawType: "claude_task",
+				Meta:    map[string]any{"lastToolName": "Bash"},
+			},
+		},
+	}
+
+	got := dedupeExchangeAuxBuffer(items)
+	if len(got) != 1 || got[0].ToolCall == nil {
+		t.Fatalf("deduped items = %#v, want one toolcall", got)
+	}
+	toolCall := got[0].ToolCall
+	if toolCall.Title != "Print hi" || toolCall.RawType != "claude_task" {
+		t.Fatalf("toolCall latest fields = %#v", toolCall)
+	}
+	if len(toolCall.Content) != 1 || toolCall.Content[0].Text != "prompt body" {
+		t.Fatalf("toolCall content = %#v, want original prompt body", toolCall.Content)
+	}
+	if toolCall.Meta["prompt"] != "prompt body" || toolCall.Meta["lastToolName"] != "Bash" {
+		t.Fatalf("toolCall meta = %#v", toolCall.Meta)
+	}
+}
+
+func TestShouldPersistToolCallAuxSkipsClaudeTaskProgress(t *testing.T) {
+	if shouldPersistToolCallAux(agenttypes.ToolCall{
+		CallID:  "call-1",
+		Kind:    agenttypes.ToolKindTask,
+		RawType: "claude_task",
+		Meta:    map[string]any{"subtype": "task_progress"},
+	}) {
+		t.Fatalf("claude task progress should not persist")
+	}
+	if !shouldPersistToolCallAux(agenttypes.ToolCall{
+		CallID:  "call-1",
+		Kind:    agenttypes.ToolKindTask,
+		RawType: "claude_task",
+		Meta:    map[string]any{"subtype": "task_started"},
+	}) {
+		t.Fatalf("claude task start should persist")
+	}
+}
+
 func TestSendCommandMessageUsesLongShellPerSession(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("windows long-shell behavior is covered by cross-compile checks")

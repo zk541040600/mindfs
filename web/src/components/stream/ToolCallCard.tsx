@@ -43,6 +43,23 @@ function shouldPreserveDisplayStatus(current?: string, incoming?: string): boole
   return currentIsTerminal && incomingIsRunning;
 }
 
+function isRunningStatus(status?: string): boolean {
+  const normalized = (status || "").toLowerCase();
+  return normalized === "running" || normalized === "pending" || normalized === "in_progress";
+}
+
+function stringMeta(meta: Record<string, unknown> | undefined, key: string): string {
+  const value = meta?.[key];
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function toolProgressText(meta: Record<string, unknown> | undefined): string {
+  const progress = stringMeta(meta, "progress");
+  if (progress) return progress;
+  const lastToolName = stringMeta(meta, "lastToolName");
+  return lastToolName ? `Using ${lastToolName}` : "";
+}
+
 const toolIcons: Record<string, string> = {
   delete: "🗑️",
   move: "📦",
@@ -380,12 +397,17 @@ export const ToolCallCard = memo(function ToolCallCard({
   const shouldStickDetailsToBottomRef = useRef(true);
   const effectiveKind = loadedToolCall?.kind || kind;
   const effectiveTitle = loadedToolCall?.title || title;
-  const effectiveStatus = shouldPreserveDisplayStatus(status, loadedToolCall?.status)
+  const effectiveStatus = isRunningStatus(status)
+    ? status
+    : shouldPreserveDisplayStatus(status, loadedToolCall?.status)
     ? status
     : loadedToolCall?.status || status;
   const effectiveContent = loadedToolCall?.content || content;
   const effectiveLocations = loadedToolCall?.locations || locations;
-  const effectiveMeta = loadedToolCall?.meta || meta;
+  const effectiveMeta =
+    loadedToolCall?.meta || meta
+      ? { ...(loadedToolCall?.meta || {}), ...(meta || {}) }
+      : undefined;
   const labelKind = (effectiveKind || "").trim();
   const labelTitle = (effectiveTitle || "").trim();
   const normalizedKind = labelKind.toLowerCase();
@@ -446,6 +468,8 @@ export const ToolCallCard = memo(function ToolCallCard({
   const isRunning = normalizedStatus === "running" || normalizedStatus === "in_progress";
   const isComplete = normalizedStatus === "complete" || normalizedStatus === "success";
   const isFailed = normalizedStatus === "failed" || normalizedStatus === "error";
+  const progressText = toolProgressText(effectiveMeta);
+  const showProgress = Boolean(progressText);
   const hasStructuredDetails = detailSections.length > 0;
   useEffect(() => {
     if (!hasDetails) {
@@ -514,6 +538,7 @@ export const ToolCallCard = memo(function ToolCallCard({
   const statusColor = statusColors[normalizedStatus] || "#9ca3af";
 
   return (
+    <>
     <div
       style={{
         width: "100%",
@@ -546,7 +571,7 @@ export const ToolCallCard = memo(function ToolCallCard({
       >
         <span style={{ display: "flex", alignItems: "center", gap: "6px", minWidth: 0, flex: 1 }}>
           <span>{icon}</span>
-          <span style={{ fontWeight: 500, color: "var(--text-primary)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+          <span style={{ fontWeight: 500, color: "var(--text-primary)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", maxWidth: "100%", minWidth: 0 }}>
             {label}
           </span>
           {isFileChange ? (
@@ -693,6 +718,50 @@ export const ToolCallCard = memo(function ToolCallCard({
         }
       `}</style>
     </div>
+      {showProgress ? (
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: "5px",
+            marginTop: "3px",
+            paddingLeft: "8px",
+            paddingRight: "4px",
+            color: "var(--text-secondary)",
+            fontSize: "11px",
+            lineHeight: 1.25,
+            minWidth: 0,
+          }}
+        >
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            width="13"
+            height="13"
+            viewBox="0 0 36 36"
+            aria-hidden="true"
+            style={{
+              flexShrink: 0,
+              opacity: isRunning ? 1 : 0.72,
+            }}
+          >
+            <path d="M0 0h36v36H0z" fill="none" />
+            <path fill="#ffe8b6" d="M21 18c0-2.001 3.246-3.369 5-6c2-3 2-10 2-10H8s0 7 2 10c1.754 2.631 5 3.999 5 6s-3.246 3.369-5 6c-2 3-2 10-2 10h20s0-7-2-10c-1.754-2.631-5-3.999-5-6" />
+            <path fill="#ffac33" d="M18 2h-8s0 4 1 7c1.304 3.912 6 4.999 6 9s0 13 1 13s1-9 1-13s4.697-5.088 6-9c1-3 1-7 1-7z" />
+            <path fill="#3b88c3" d="M30 34a2 2 0 0 1-2 2H8a2 2 0 0 1 0-4h20a2 2 0 0 1 2 2m0-32a2 2 0 0 1-2 2H8a2 2 0 0 1 0-4h20a2 2 0 0 1 2 2" />
+          </svg>
+          <span
+            style={{
+              minWidth: 0,
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+            }}
+          >
+            {progressText}
+          </span>
+        </div>
+      ) : null}
+    </>
   );
 });
 

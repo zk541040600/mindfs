@@ -1331,9 +1331,25 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 		})
 	}
 	lastResponseUpdateType := ""
+	claudeSubagents := newClaudeSubagentRouter(subagentSessionInput{
+		RootID:      in.RootID,
+		Parent:      current,
+		Agent:       in.Agent,
+		Model:       in.Model,
+		Mode:        in.Mode,
+		Effort:      in.Effort,
+		FastService: in.FastService,
+		RootAbs:     rootAbs,
+		Manager:     manager,
+		OnCreated:   in.OnSubSessionCreated,
+		OnUpdate:    in.OnSubSessionUpdate,
+	})
 	attachSessionUpdates := func(runtime agenttypes.Session) {
 		runtime.OnUpdate(func(update agenttypes.Event) {
 			update = normalizeAgentUpdatePaths(root, update)
+			if claudeSubagents.Handle(context.Background(), update) {
+				return
+			}
 			switch update.Type {
 			case agenttypes.EventTypeThoughtChunk:
 				if chunk, ok := update.Data.(agenttypes.ThoughtChunk); ok && chunk.Content != "" {
@@ -1378,13 +1394,15 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 						OnCreated:   in.OnSubSessionCreated,
 						OnUpdate:    in.OnSubSessionUpdate,
 					})
-					toolCallCopy := toolCall
-					auxBuffer = append(auxBuffer, session.ExchangeAux{
-						Seq:      plannedAssistantSeq,
-						Line:     currentAssistantLine(responseText),
-						ToolCall: &toolCallCopy,
-					})
-					_ = manager.UpsertPendingExchangeAux(context.Background(), current.Key, session.ExchangeAux{ToolCall: &toolCallCopy})
+					if shouldPersistToolCallAux(toolCall) {
+						toolCallCopy := toolCall
+						auxBuffer = append(auxBuffer, session.ExchangeAux{
+							Seq:      plannedAssistantSeq,
+							Line:     currentAssistantLine(responseText),
+							ToolCall: &toolCallCopy,
+						})
+						_ = manager.UpsertPendingExchangeAux(context.Background(), current.Key, session.ExchangeAux{ToolCall: &toolCallCopy})
+					}
 				}
 			}
 			if update.Type == agenttypes.EventTypePlanUpdate {
@@ -1473,6 +1491,7 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 		}
 	}
 	flushThought()
+	claudeSubagents.FinishAll()
 	if sendErr != nil && !isCanceledTurnError(sendErr) {
 		log.Printf("[session] turn.send.error root=%s session=%s agent=%s err=%v", in.RootID, current.Key, in.Agent, sendErr)
 	}
@@ -1533,6 +1552,340 @@ type subagentSessionInput struct {
 	ToolCall    agenttypes.ToolCall
 	OnCreated   func(*session.Session)
 	OnUpdate    func(sessionKey string, update agenttypes.Event)
+}
+
+type claudeSubagentRouter struct {
+	in       subagentSessionInput
+	byRef    map[string]*claudeSyntheticSubagent
+	children []*claudeSyntheticSubagent
+}
+
+type claudeSyntheticSubagent struct {
+	key     string
+	child   *session.Session
+	runtime *syntheticAgentSession
+	done    func()
+	closed  bool
+}
+
+func newClaudeSubagentRouter(in subagentSessionInput) *claudeSubagentRouter {
+	return &claudeSubagentRouter{
+		in:    in,
+		byRef: make(map[string]*claudeSyntheticSubagent),
+	}
+}
+
+func (r *claudeSubagentRouter) Handle(ctx context.Context, update agenttypes.Event) bool {
+	if r == nil || r.in.Parent == nil || r.in.Manager == nil {
+		return false
+	}
+	if r.handleSubagentResult(ctx, update) {
+		return false
+	}
+	ref := claudeSubagentRefFromUpdate(update)
+	if !ref.hasRef() {
+		return false
+	}
+	if isClaudeParentTaskLifecycle(update) {
+		return false
+	}
+	if strings.TrimSpace(ref.ParentToolUseID) == "" && r.find(ref) == nil {
+		return false
+	}
+	child, err := r.ensure(ctx, ref, toolCallFromUpdate(update))
+	if err != nil {
+		log.Printf("[subagent/claude] session.ensure.error root=%s parent=%s ref=%s err=%v", r.in.RootID, r.in.Parent.Key, ref.key(), err)
+		return false
+	}
+	if child == nil || child.closed {
+		return false
+	}
+	child.runtime.emit(update)
+	if update.Type == agenttypes.EventTypeMessageDone {
+		child.closed = true
+	}
+	return true
+}
+
+func (r *claudeSubagentRouter) FinishAll() {
+	if r == nil {
+		return
+	}
+	for _, child := range r.children {
+		if child == nil || child.closed {
+			continue
+		}
+		child.done()
+		child.closed = true
+	}
+}
+
+func (r *claudeSubagentRouter) handleSubagentResult(ctx context.Context, update agenttypes.Event) bool {
+	if update.Type != agenttypes.EventTypeToolUpdate {
+		return false
+	}
+	toolCall, ok := update.Data.(agenttypes.ToolCall)
+	if !ok || toolCall.RawType != "subagent_result" {
+		return false
+	}
+	child := r.onlyOpenChild()
+	if child == nil {
+		return false
+	}
+	for _, item := range toolCall.Content {
+		if strings.TrimSpace(item.Text) != "" {
+			child.runtime.emit(agenttypes.Event{
+				Type:      agenttypes.EventTypeMessageChunk,
+				SessionID: update.SessionID,
+				Data:      agenttypes.MessageChunk{Content: item.Text},
+			})
+			break
+		}
+	}
+	child.runtime.emit(agenttypes.Event{Type: agenttypes.EventTypeMessageDone, SessionID: update.SessionID, Data: agenttypes.MessageDone{}})
+	child.closed = true
+	_ = ctx
+	return true
+}
+
+func (r *claudeSubagentRouter) onlyOpenChild() *claudeSyntheticSubagent {
+	var found *claudeSyntheticSubagent
+	for _, child := range r.children {
+		if child == nil || child.closed {
+			continue
+		}
+		if found != nil {
+			return nil
+		}
+		found = child
+	}
+	return found
+}
+
+func (r *claudeSubagentRouter) ensure(ctx context.Context, ref claudeSubagentRef, source *agenttypes.ToolCall) (*claudeSyntheticSubagent, error) {
+	keys := ref.keys()
+	if child := r.find(ref); child != nil {
+		r.bindKeys(child, keys)
+		return child, nil
+	}
+	primary := ref.key()
+	if primary == "" {
+		return nil, nil
+	}
+	if existing, err := r.in.Manager.FindAgentBindingByAgentSession(ctx, r.in.Agent, "claude-subagent:"+primary); err != nil {
+		return nil, err
+	} else if existing != nil {
+		loaded, err := r.in.Manager.Get(ctx, existing.SessionKey, 0)
+		if err != nil {
+			return nil, err
+		}
+		child := r.attach(loaded, ref)
+		r.bindKeys(child, keys)
+		return child, nil
+	}
+	parentToolCallID := firstNonEmptyString(ref.ParentToolUseID, sourceCallID(source), ref.TaskID)
+	child, err := r.in.Manager.Create(ctx, session.CreateInput{
+		Type:             session.TypeChat,
+		ParentSessionKey: r.in.Parent.Key,
+		ParentToolCallID: parentToolCallID,
+		Agent:            r.in.Agent,
+		Model:            firstNonEmptyString(sourceModel(source), r.in.Model),
+		PlanMode:         false,
+		Name:             claudeSubagentSessionName(ref, source),
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := r.in.Manager.UpsertAgentBinding(ctx, session.AgentBinding{
+		SessionKey:     child.Key,
+		Agent:          r.in.Agent,
+		AgentSessionID: "claude-subagent:" + primary,
+	}); err != nil {
+		return nil, err
+	}
+	attached := r.attach(child, ref)
+	r.bindKeys(attached, keys)
+	if r.in.OnCreated != nil {
+		r.in.OnCreated(child)
+	}
+	return attached, nil
+}
+
+func (r *claudeSubagentRouter) find(ref claudeSubagentRef) *claudeSyntheticSubagent {
+	for _, key := range ref.keys() {
+		if child := r.byRef[key]; child != nil {
+			return child
+		}
+	}
+	return nil
+}
+
+func (r *claudeSubagentRouter) attach(child *session.Session, ref claudeSubagentRef) *claudeSyntheticSubagent {
+	runtime := &syntheticAgentSession{id: firstNonEmptyString(ref.ParentToolUseID, ref.TaskID, child.Key)}
+	in := r.in
+	done := attachBackgroundSessionUpdates(context.Background(), in, child, runtime)
+	attached := &claudeSyntheticSubagent{
+		key:     child.Key,
+		child:   child,
+		runtime: runtime,
+		done:    done,
+	}
+	r.children = append(r.children, attached)
+	return attached
+}
+
+func (r *claudeSubagentRouter) bindKeys(child *claudeSyntheticSubagent, keys []string) {
+	for _, key := range keys {
+		if key != "" {
+			r.byRef[key] = child
+		}
+	}
+}
+
+type claudeSubagentRef struct {
+	ParentToolUseID string
+	TaskID          string
+	SubagentType    string
+	TaskDescription string
+}
+
+func (r claudeSubagentRef) hasRef() bool {
+	return strings.TrimSpace(r.ParentToolUseID) != "" || strings.TrimSpace(r.TaskID) != ""
+}
+
+func (r claudeSubagentRef) key() string {
+	return firstNonEmptyString(r.ParentToolUseID, r.TaskID)
+}
+
+func (r claudeSubagentRef) keys() []string {
+	keys := make([]string, 0, 2)
+	if value := strings.TrimSpace(r.ParentToolUseID); value != "" {
+		keys = append(keys, "tool:"+value)
+	}
+	if value := strings.TrimSpace(r.TaskID); value != "" {
+		keys = append(keys, "task:"+value)
+	}
+	return keys
+}
+
+func claudeSubagentRefFromUpdate(update agenttypes.Event) claudeSubagentRef {
+	switch data := update.Data.(type) {
+	case agenttypes.MessageChunk:
+		return claudeSubagentRef{
+			ParentToolUseID: data.ParentToolUseID,
+			TaskID:          data.TaskID,
+			SubagentType:    data.SubagentType,
+			TaskDescription: data.TaskDescription,
+		}
+	case agenttypes.ThoughtChunk:
+		return claudeSubagentRef{
+			ParentToolUseID: data.ParentToolUseID,
+			TaskID:          data.TaskID,
+			SubagentType:    data.SubagentType,
+			TaskDescription: data.TaskDescription,
+		}
+	case agenttypes.MessageDone:
+		return claudeSubagentRef{
+			ParentToolUseID: data.ParentToolUseID,
+			TaskID:          data.TaskID,
+			SubagentType:    data.SubagentType,
+			TaskDescription: data.TaskDescription,
+		}
+	case agenttypes.ToolCall:
+		return claudeSubagentRef{
+			ParentToolUseID: stringMeta(data.Meta, "parentToolUseId"),
+			TaskID:          stringMeta(data.Meta, "taskId"),
+			SubagentType:    stringMeta(data.Meta, "subagentType"),
+			TaskDescription: stringMeta(data.Meta, "taskDescription"),
+		}
+	default:
+		return claudeSubagentRef{}
+	}
+}
+
+func isClaudeParentTaskLifecycle(update agenttypes.Event) bool {
+	if update.Type != agenttypes.EventTypeToolCall && update.Type != agenttypes.EventTypeToolUpdate {
+		return false
+	}
+	toolCall, ok := update.Data.(agenttypes.ToolCall)
+	return ok && toolCall.Kind == agenttypes.ToolKindTask && toolCall.RawType == "claude_task"
+}
+
+func toolCallFromUpdate(update agenttypes.Event) *agenttypes.ToolCall {
+	toolCall, ok := update.Data.(agenttypes.ToolCall)
+	if !ok {
+		return nil
+	}
+	return &toolCall
+}
+
+func sourceCallID(toolCall *agenttypes.ToolCall) string {
+	if toolCall == nil {
+		return ""
+	}
+	return strings.TrimSpace(toolCall.CallID)
+}
+
+func sourceModel(toolCall *agenttypes.ToolCall) string {
+	if toolCall == nil {
+		return ""
+	}
+	return stringMeta(toolCall.Meta, "model")
+}
+
+func claudeSubagentSessionName(ref claudeSubagentRef, source *agenttypes.ToolCall) string {
+	if value := strings.TrimSpace(ref.TaskDescription); value != "" {
+		return truncateRunes(value, 48)
+	}
+	if source != nil {
+		if value := strings.TrimSpace(source.Title); value != "" {
+			return truncateRunes(value, 48)
+		}
+		if value := stringMeta(source.Meta, "prompt"); value != "" {
+			return truncateRunes(value, 48)
+		}
+	}
+	if value := strings.TrimSpace(ref.SubagentType); value != "" {
+		return truncateRunes(value, 48)
+	}
+	return truncateRunes(ref.key(), 16)
+}
+
+type syntheticAgentSession struct {
+	id       string
+	onUpdate func(agenttypes.Event)
+}
+
+func (s *syntheticAgentSession) SendMessage(context.Context, string) error { return nil }
+func (s *syntheticAgentSession) AnswerQuestion(context.Context, agenttypes.AskUserAnswer) error {
+	return nil
+}
+func (s *syntheticAgentSession) CurrentModel() string                   { return "" }
+func (s *syntheticAgentSession) SetModel(context.Context, string) error { return nil }
+func (s *syntheticAgentSession) ListModels(context.Context) (agenttypes.ModelList, error) {
+	return agenttypes.ModelList{}, nil
+}
+func (s *syntheticAgentSession) SetMode(context.Context, string) error   { return nil }
+func (s *syntheticAgentSession) SetPlanMode(context.Context, bool) error { return nil }
+func (s *syntheticAgentSession) ListModes(context.Context) (agenttypes.ModeList, error) {
+	return agenttypes.ModeList{}, nil
+}
+func (s *syntheticAgentSession) ListCommands(context.Context) (agenttypes.CommandList, error) {
+	return agenttypes.CommandList{}, nil
+}
+func (s *syntheticAgentSession) CancelCurrentTurn() error { return nil }
+func (s *syntheticAgentSession) OnUpdate(onUpdate func(agenttypes.Event)) {
+	s.onUpdate = onUpdate
+}
+func (s *syntheticAgentSession) SessionID() string { return s.id }
+func (s *syntheticAgentSession) ContextWindow(context.Context) (agenttypes.ContextWindow, error) {
+	return agenttypes.ContextWindow{}, nil
+}
+func (s *syntheticAgentSession) Close() error { return nil }
+func (s *syntheticAgentSession) emit(event agenttypes.Event) {
+	if s.onUpdate != nil {
+		s.onUpdate(event)
+	}
 }
 
 func (s *Service) ensureSubagentSessions(ctx context.Context, in subagentSessionInput) {
@@ -1696,13 +2049,15 @@ func attachBackgroundSessionUpdates(ctx context.Context, in subagentSessionInput
 		clientUpdate := compactAgentUpdate(update)
 		if update.Type == agenttypes.EventTypeToolCall || update.Type == agenttypes.EventTypeToolUpdate {
 			if toolCall, ok := update.Data.(agenttypes.ToolCall); ok {
-				toolCallCopy := toolCall
-				auxBuffer = append(auxBuffer, session.ExchangeAux{
-					Seq:      plannedAssistantSeq,
-					Line:     currentAssistantLine(responseText),
-					ToolCall: &toolCallCopy,
-				})
-				_ = in.Manager.UpsertPendingExchangeAux(context.Background(), child.Key, session.ExchangeAux{ToolCall: &toolCallCopy})
+				if shouldPersistToolCallAux(toolCall) {
+					toolCallCopy := toolCall
+					auxBuffer = append(auxBuffer, session.ExchangeAux{
+						Seq:      plannedAssistantSeq,
+						Line:     currentAssistantLine(responseText),
+						ToolCall: &toolCallCopy,
+					})
+					_ = in.Manager.UpsertPendingExchangeAux(context.Background(), child.Key, session.ExchangeAux{ToolCall: &toolCallCopy})
+				}
 			}
 		}
 		if update.Type == agenttypes.EventTypePlanUpdate {
@@ -2135,7 +2490,7 @@ func dedupeExchangeAuxBuffer(items []session.ExchangeAux) []session.ExchangeAux 
 	if len(items) == 0 {
 		return nil
 	}
-	seenToolCallIDs := make(map[string]struct{}, len(items))
+	seenToolCallIDs := make(map[string]int, len(items))
 	seenPlanIDs := make(map[string]struct{}, len(items))
 	seenCompactIDs := make(map[string]struct{}, len(items))
 	out := make([]session.ExchangeAux, 0, len(items))
@@ -2146,10 +2501,14 @@ func dedupeExchangeAuxBuffer(items []session.ExchangeAux) []session.ExchangeAux 
 			callID = strings.TrimSpace(item.ToolCall.CallID)
 		}
 		if callID != "" {
-			if _, exists := seenToolCallIDs[callID]; exists {
+			if existingIndex, exists := seenToolCallIDs[callID]; exists {
+				if out[existingIndex].ToolCall != nil {
+					merged := mergeBufferedToolCall(*item.ToolCall, *out[existingIndex].ToolCall)
+					out[existingIndex].ToolCall = &merged
+				}
 				continue
 			}
-			seenToolCallIDs[callID] = struct{}{}
+			seenToolCallIDs[callID] = len(out)
 		}
 		if item.Plan != nil {
 			planID := strings.TrimSpace(item.Plan.ID)
@@ -2175,6 +2534,48 @@ func dedupeExchangeAuxBuffer(items []session.ExchangeAux) []session.ExchangeAux 
 		out[left], out[right] = out[right], out[left]
 	}
 	return out
+}
+
+func shouldPersistToolCallAux(toolCall agenttypes.ToolCall) bool {
+	if toolCall.RawType != "claude_task" {
+		return true
+	}
+	return strings.TrimSpace(stringMeta(toolCall.Meta, "subtype")) != "task_progress"
+}
+
+func mergeBufferedToolCall(base, next agenttypes.ToolCall) agenttypes.ToolCall {
+	merged := base
+	if strings.TrimSpace(next.CallID) != "" {
+		merged.CallID = next.CallID
+	}
+	if strings.TrimSpace(next.Title) != "" {
+		merged.Title = next.Title
+	}
+	if strings.TrimSpace(next.Status) != "" {
+		merged.Status = next.Status
+	}
+	if next.Kind != "" {
+		merged.Kind = next.Kind
+	}
+	if len(next.Content) > 0 {
+		merged.Content = append([]agenttypes.ToolCallContentItem(nil), next.Content...)
+	}
+	if len(next.Locations) > 0 {
+		merged.Locations = append([]agenttypes.ToolCallLocation(nil), next.Locations...)
+	}
+	if strings.TrimSpace(next.RawType) != "" {
+		merged.RawType = next.RawType
+	}
+	if len(base.Meta) > 0 || len(next.Meta) > 0 {
+		merged.Meta = make(map[string]any, len(base.Meta)+len(next.Meta))
+		for key, value := range base.Meta {
+			merged.Meta[key] = value
+		}
+		for key, value := range next.Meta {
+			merged.Meta[key] = value
+		}
+	}
+	return merged
 }
 
 func appendResponseChunk(responseText, lastResponseUpdateType, chunk string) string {

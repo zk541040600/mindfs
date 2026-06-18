@@ -2520,6 +2520,9 @@ export function App({ onGoHome }: AppProps) {
       const mergeToolCall = (existing: any, incoming: any) => {
         const merged = { ...(existing || {}), ...incoming };
         const incomingMeta = (incoming?.meta || {}) as Record<string, unknown>;
+        if (existing?.meta || incoming?.meta) {
+          merged.meta = { ...(existing?.meta || {}), ...incomingMeta };
+        }
         const isUserShellStream =
           incomingMeta.source === "userShell" && incomingMeta.phase === "stream";
         if (isUserShellStream) {
@@ -6578,8 +6581,6 @@ export function App({ onGoHome }: AppProps) {
             streamKey,
             event.data?.contextWindow,
           );
-          playCompletionSound();
-          handleSessionStreamDone(activeRoot, streamKey);
           break;
         case "error":
           reportError(
@@ -6969,7 +6970,6 @@ export function App({ onGoHome }: AppProps) {
         case "session.done": {
           const sessionKey =
             typeof payload?.session_key === "string" ? payload.session_key : "";
-          console.info("[session/ws] done", { rootId: typeof payload?.root_id === "string" ? payload.root_id : null, sessionKey: sessionKey || null });
           const rootID =
             typeof payload?.root_id === "string" && payload.root_id
               ? payload.root_id
@@ -6977,6 +6977,7 @@ export function App({ onGoHome }: AppProps) {
                 currentRootIdRef.current ||
                 "";
           if (rootID && sessionKey) {
+            playCompletionSound();
             handleSessionStreamDone(rootID, sessionKey);
             const newest = sessionsRef.current[0]?.updated_at || "";
             void loadSessionsForRoot(

@@ -198,16 +198,28 @@ type Event struct {
 }
 
 type MessageChunk struct {
-	Content string `json:"content"`
+	Content         string `json:"content"`
+	ParentToolUseID string `json:"parentToolUseId,omitempty"`
+	TaskID          string `json:"taskId,omitempty"`
+	SubagentType    string `json:"subagentType,omitempty"`
+	TaskDescription string `json:"taskDescription,omitempty"`
 }
 
 type ThoughtChunk struct {
-	ID      string `json:"id,omitempty"`
-	Content string `json:"content"`
+	ID              string `json:"id,omitempty"`
+	Content         string `json:"content"`
+	ParentToolUseID string `json:"parentToolUseId,omitempty"`
+	TaskID          string `json:"taskId,omitempty"`
+	SubagentType    string `json:"subagentType,omitempty"`
+	TaskDescription string `json:"taskDescription,omitempty"`
 }
 
 type MessageDone struct {
-	ContextWindow ContextWindow `json:"contextWindow"`
+	ContextWindow   ContextWindow `json:"contextWindow"`
+	ParentToolUseID string        `json:"parentToolUseId,omitempty"`
+	TaskID          string        `json:"taskId,omitempty"`
+	SubagentType    string        `json:"subagentType,omitempty"`
+	TaskDescription string        `json:"taskDescription,omitempty"`
 }
 
 type RecoveryStatus struct {
