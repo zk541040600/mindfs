@@ -25,6 +25,8 @@ interface LauncherNode {
 interface DownloadInput {
   url?: string;
   filename?: string;
+  dataBase64?: string;
+  mimeType?: string;
 }
 
 interface ReplyPollerConfig {
@@ -220,6 +222,32 @@ export class MindFSNativeBridge {
 
     this.startDownload(url, filename);
     return '';
+  }
+
+  saveBase64(rawInput: string): string {
+    const input = parseDownloadInput(rawInput);
+    const dataBase64 = `${input.dataBase64 ?? ''}`.trim();
+    const filename = sanitizeFilename(`${input.filename ?? ''}`.trim()) || 'download';
+    if (!dataBase64) {
+      return 'download content is empty';
+    }
+    try {
+      const data = decodeBase64(dataBase64);
+      const targetPath = uniqueDownloadPath(environment.getUserDownloadDir(), filename);
+      const file = fileIo.openSync(
+        targetPath,
+        fileIo.OpenMode.WRITE_ONLY | fileIo.OpenMode.CREATE | fileIo.OpenMode.TRUNC
+      );
+      try {
+        fileIo.writeSync(file.fd, data.buffer);
+        fileIo.fsyncSync(file.fd);
+      } finally {
+        fileIo.closeSync(file);
+      }
+      return '';
+    } catch (error) {
+      return `Failed to save download: ${errorSummary(error)}`;
+    }
   }
 
   openExternalURL(url: string): string {
