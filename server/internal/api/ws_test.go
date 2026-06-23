@@ -5,10 +5,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
 	"mindfs/server/internal/agent"
+	agenttypes "mindfs/server/internal/agent/types"
 	"mindfs/server/internal/e2ee"
 )
 
@@ -36,6 +38,23 @@ func TestParseClientContext(t *testing.T) {
 	got = parseClientContext(map[string]any{}, "fallback-root")
 	if got.CurrentRoot != "fallback-root" {
 		t.Fatalf("expected fallback root, got %q", got.CurrentRoot)
+	}
+}
+
+func TestAppendReplyEventPrefixesTruncatedSummary(t *testing.T) {
+	hub := NewStreamHub(nil)
+
+	hub.AppendReplyEvent("sess-1", StreamEvent{
+		Type: "message_chunk",
+		Data: agenttypes.MessageChunk{Content: strings.Repeat("前", 51) + "后"},
+	})
+
+	snapshot := hub.PendingSessionSnapshot("sess-1")
+	if !strings.HasPrefix(snapshot.Summary, "...") {
+		t.Fatalf("summary should start with ellipsis when truncated, got %q", snapshot.Summary)
+	}
+	if !strings.HasSuffix(snapshot.Summary, "后") {
+		t.Fatalf("summary should keep the end of the content, got %q", snapshot.Summary)
 	}
 }
 

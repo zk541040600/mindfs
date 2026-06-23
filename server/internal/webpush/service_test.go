@@ -57,6 +57,19 @@ func TestBuildAskUserPayloadRequiresInteraction(t *testing.T) {
 	}
 }
 
+func TestBuildSessionPayloadPrefixesTruncatedBody(t *testing.T) {
+	payload := BuildSessionPayload(SessionNotification{
+		Summary: strings.Repeat("前", 181) + "后",
+	})
+
+	if !strings.HasPrefix(payload.Body, "...") {
+		t.Fatalf("truncated body should start with ellipsis, got %q", payload.Body)
+	}
+	if !strings.HasSuffix(payload.Body, "后") {
+		t.Fatalf("truncated body should keep the end of the content, got %q", payload.Body)
+	}
+}
+
 func TestBuildScheduledPayload(t *testing.T) {
 	done := BuildScheduledPayload(ScheduledNotification{
 		RootTitle:  "MindFS",

@@ -727,5 +727,5 @@ func truncateRunes(value string, max int) string {
 	if len(runes) <= max {
 		return value
 	}
-	return string(runes[:max]) + "..."
+	return "..." + string(runes[len(runes)-max:])
 }

@@ -788,7 +788,7 @@ func lastRunes(value string, max int) string {
 		return value
 	}
 	runes := []rune(value)
-	return string(runes[len(runes)-max:])
+	return "..." + string(runes[len(runes)-max:])
 }
 
 func (h *StreamHub) WriteJSON(clientID string, conn *websocket.Conn, value any) error {
