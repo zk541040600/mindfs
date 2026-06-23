@@ -1914,6 +1914,20 @@ export function App({ onGoHome }: AppProps) {
           pending: false,
         } as Session));
       }
+      if (currentRootIdRef.current === resolvedRoot) {
+        setSessions((prev) =>
+          prev.map((item) => {
+            const itemKey = item.key || item.session_key;
+            if (itemKey !== resolvedKey) {
+              return item;
+            }
+            return clearPendingAck({
+              ...(item as any),
+              pending: false,
+            } as SessionItem);
+          }),
+        );
+      }
       bumpCacheVersion();
     },
     [bumpCacheVersion, rootSessionKey, setDrawerSessionForRoot],
@@ -2280,6 +2294,29 @@ export function App({ onGoHome }: AppProps) {
               ? (latestReal as any).name
               : "") || pendingName,
         } as Session);
+      }
+      if (currentRootIdRef.current === rootID) {
+        setSessions((prev) =>
+          prev.map((item) => {
+            const itemKey = item.key || item.session_key;
+            if (itemKey !== pendingKey) {
+              return item;
+            }
+            return {
+              ...(item as any),
+              ...(latestReal as any),
+              key: sessionKey,
+              session_key: sessionKey,
+              root_id: rootID,
+              name:
+                (typeof (latestReal as any)?.name === "string" &&
+                (latestReal as any).name
+                  ? (latestReal as any).name
+                  : "") || pendingName,
+              pending: true,
+            } as SessionItem;
+          }),
+        );
       }
 
       setSelectedSession((prev) => {
@@ -4208,6 +4245,28 @@ export function App({ onGoHome }: AppProps) {
         timestamp: now,
         pending_ack: true,
       };
+      if (sendSessionKey) {
+        const targetSessionKey = sendSessionKey;
+        setSessions((prev) =>
+          prev.map((item) => {
+            const itemKey = item.key || item.session_key;
+            if (itemKey !== targetSessionKey) {
+              return item;
+            }
+            return {
+              ...(item as any),
+              pending: true,
+              updated_at: now,
+              agent: effectiveAgent,
+              model: effectiveModel,
+              mode: effectiveAgentMode,
+              effort: effectiveEffort,
+              fast_service: effectiveFastService,
+              shell: effectiveShell,
+            } as SessionItem;
+          }),
+        );
+      }
       pendingRequestRef.current[requestId] = {
         rootId: activeRoot,
         mode: effectiveMode,
@@ -4265,6 +4324,18 @@ export function App({ onGoHome }: AppProps) {
         if (tempSessionKey) {
           sessionCacheRef.current[rootSessionKey(activeRoot, tempSessionKey)] =
             draftSession;
+          const draftItem = toSessionItem(activeRoot, {
+            ...(draftSession as any),
+            key: tempSessionKey,
+            session_key: tempSessionKey,
+            root_id: activeRoot,
+            created_at: now,
+            updated_at: now,
+            pending: true,
+          });
+          if (draftItem) {
+            setSessions((prev) => mergeSessionItems(prev, [draftItem]));
+          }
           bumpCacheVersion();
         }
         session = draftSession;
@@ -4351,8 +4422,33 @@ export function App({ onGoHome }: AppProps) {
       if (!sent && sendSessionKey) {
         const failedSessionKey = sendSessionKey;
         setSelectedPendingByKey(failedSessionKey, false);
+        setSessions((prev) =>
+          prev.map((item) => {
+            const itemKey = item.key || item.session_key;
+            if (itemKey !== failedSessionKey) {
+              return item;
+            }
+            return { ...(item as any), pending: false } as SessionItem;
+          }),
+        );
         const latest = drawerSessionByRootRef.current[activeRoot];
         if (latest && latest.key === failedSessionKey) {
+          setDrawerSessionForRoot(activeRoot, {
+            ...(latest as any),
+            pending: false,
+          } as Session);
+        }
+      }
+      if (!sent && !sendSessionKey && tempKey) {
+        setSessions((prev) =>
+          prev.filter((item) => (item.key || item.session_key) !== tempKey),
+        );
+        delete sessionCacheRef.current[rootSessionKey(activeRoot, tempKey)];
+        if (boundSessionByRootRef.current[activeRoot] === tempKey) {
+          setBoundSessionForRoot(activeRoot, null);
+        }
+        const latest = drawerSessionByRootRef.current[activeRoot];
+        if (latest && latest.key === tempKey) {
           setDrawerSessionForRoot(activeRoot, {
             ...(latest as any),
             pending: false,
@@ -4363,6 +4459,7 @@ export function App({ onGoHome }: AppProps) {
     [
       attachedFileContext,
       rootSessionKey,
+      mergeSessionItems,
       setSelectedPendingByKey,
       bumpCacheVersion,
       setBoundSessionForRoot,
@@ -4448,6 +4545,21 @@ export function App({ onGoHome }: AppProps) {
           pending: true,
           updated_at: now,
         } as Session);
+      }
+      if (currentRootIdRef.current === rootID) {
+        setSessions((prev) =>
+          prev.map((item) => {
+            const itemKey = item.key || item.session_key;
+            if (itemKey !== sessionKey) {
+              return item;
+            }
+            return {
+              ...(item as any),
+              pending: true,
+              updated_at: now,
+            } as SessionItem;
+          }),
+        );
       }
     },
     [bumpCacheVersion, rootSessionKey, setDrawerSessionForRoot, setSelectedPendingByKey],
@@ -6444,6 +6556,20 @@ export function App({ onGoHome }: AppProps) {
           ...(latest as any),
           pending: false,
         } as Session));
+      }
+      if (currentRootIdRef.current === rootID) {
+        setSessions((prev) =>
+          prev.map((item) => {
+            const itemKey = item.key || item.session_key;
+            if (itemKey !== sessionKey) {
+              return item;
+            }
+            return clearPendingAck({
+              ...(item as any),
+              pending: false,
+            } as SessionItem);
+          }),
+        );
       }
       bumpCacheVersion();
     };

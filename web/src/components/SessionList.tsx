@@ -17,6 +17,7 @@ export type SessionItem = {
   created_at?: string;
   updated_at?: string;
   closed_at?: string;
+  pending?: boolean;
   related_files?: Array<{ path: string }>;
   search_seq?: number;
   search_snippet?: string;
@@ -417,6 +418,12 @@ export function SessionList({
           </div>
         )}
       </div>
+      <style>{`
+        @keyframes mindfs-bound-pulse {
+          0%, 100% { opacity: 1; box-shadow: 0 0 0 1.5px rgba(37,99,235,0.14); }
+          50% { opacity: 0.18; box-shadow: 0 0 0 4px rgba(37,99,235,0.08); }
+        }
+      `}</style>
     </div>
   );
 }
@@ -806,28 +813,46 @@ function SessionCard({
         <div
           style={{
             flexShrink: 0,
-            minWidth: 0,
+            minWidth: "24px",
             display: "flex",
             alignItems: "center",
             justifyContent: "flex-end",
             paddingLeft: "2px",
           }}
         >
-          <span
-            style={{
-              fontSize: "10px",
-              color: "var(--text-secondary)",
-              opacity: 0.8,
-              whiteSpace: "nowrap",
-              textAlign: "right",
-            }}
-          >
-            {formatTime(
-              isClosed && session.closed_at
-                ? session.closed_at
-                : session.updated_at || "",
-            )}
-          </span>
+          {session.pending ? (
+            <span
+              aria-label="正在回复"
+              title="正在回复"
+              style={{
+                width: "8px",
+                height: "8px",
+                borderRadius: "999px",
+                flexShrink: 0,
+                boxSizing: "border-box",
+                border: "1.5px solid #2563eb",
+                background: "#2563eb",
+                animation: "mindfs-bound-pulse 2.2s ease-in-out infinite",
+                boxShadow: "0 0 0 1.5px rgba(37,99,235,0.14)",
+              }}
+            />
+          ) : (
+            <span
+              style={{
+                fontSize: "10px",
+                color: "var(--text-secondary)",
+                opacity: 0.8,
+                whiteSpace: "nowrap",
+                textAlign: "right",
+              }}
+            >
+              {formatTime(
+                isClosed && session.closed_at
+                  ? session.closed_at
+                  : session.updated_at || "",
+              )}
+            </span>
+          )}
         </div>
       ) : null}
 
