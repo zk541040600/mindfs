@@ -4269,6 +4269,11 @@ export function App({ onGoHome }: AppProps) {
       }
       const now = new Date().toISOString();
       const requestId = sessionService.createRequestId("msg");
+      if (sendSessionKey) {
+        delete cancelRequestedBySessionRef.current[
+          rootSessionKey(activeRoot, sendSessionKey)
+        ];
+      }
       const tempKey = sendSessionKey ? "" : session?.key || "";
       const userEx: Exchange = {
         role: "user",
@@ -4497,8 +4502,12 @@ export function App({ onGoHome }: AppProps) {
       const activeRoot = currentRootIdRef.current;
       if (!activeRoot || !sessionKey) return;
       const cacheKey = rootSessionKey(activeRoot, sessionKey);
+      const requestId =
+        runningTurnBySessionRef.current[cacheKey]?.requestId ||
+        pendingBySessionRef.current[cacheKey]?.requestId ||
+        "";
       cancelRequestedBySessionRef.current[cacheKey] = true;
-      const sent = await sessionService.cancelMessage(activeRoot, sessionKey);
+      const sent = await sessionService.cancelMessage(activeRoot, sessionKey, requestId);
       if (!sent) {
         delete cancelRequestedBySessionRef.current[cacheKey];
         return;
@@ -4602,6 +4611,7 @@ export function App({ onGoHome }: AppProps) {
       }
       optimisticDequeuedIdsRef.current[cacheKey].add(queueId);
       setQueueVersion((v) => v + 1);
+      delete cancelRequestedBySessionRef.current[cacheKey];
       markSessionPending(activeRoot, sessionKey);
       const sent = await sessionService.sendQueuedMessageNow(activeRoot, sessionKey, queueId);
       if (!sent) {
@@ -6655,9 +6665,6 @@ export function App({ onGoHome }: AppProps) {
         return;
       }
       const wasCanceled = !!cancelRequestedBySessionRef.current[cacheKey];
-      if (wasCanceled) {
-        delete cancelRequestedBySessionRef.current[cacheKey];
-      }
       forgetSessionTurnRunning(rootID, sessionKey);
       const queued = queuedMessagesBySessionRef.current[cacheKey] || [];
       const queueFrozen = !!queueFrozenBySessionRef.current[cacheKey];
@@ -6681,6 +6688,18 @@ export function App({ onGoHome }: AppProps) {
           : resolveRootForSessionKey(streamKey) || currentRootIdRef.current;
       if (!streamKey || !activeRoot) return;
       const ck = rootSessionKey(activeRoot, streamKey);
+      const event = payload.event;
+      if (!event?.type) return;
+      const isTerminalStreamEvent =
+        event.type === "message_done" || event.type === "error";
+      if (cancelRequestedBySessionRef.current[ck] && !isTerminalStreamEvent) {
+        console.info("[session/stream] ignore_late_after_cancel", {
+          rootId: activeRoot,
+          sessionKey: streamKey,
+          eventType: event.type,
+        });
+        return;
+      }
       let pending = pendingBySessionRef.current[ck];
       if (!pending) {
         const draft = pendingDraftRef.current;
@@ -6777,13 +6796,11 @@ export function App({ onGoHome }: AppProps) {
           sessionCacheRef.current[ck] || null,
         );
       }
-      const event = payload.event;
-      if (!event?.type) return;
-      if (event.type !== "error") {
+      if (event.type !== "error" && !cancelRequestedBySessionRef.current[ck]) {
         markSessionTurnRunning(activeRoot, streamKey, pending?.requestId);
       }
       const markStreamPending = () => {
-        if (event.type === "message_done" || event.type === "error") return;
+        if (isTerminalStreamEvent) return;
         markSessionPending(activeRoot, streamKey);
       };
       const updateDrawerIfShowingStream = () => {

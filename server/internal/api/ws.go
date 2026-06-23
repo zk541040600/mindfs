@@ -778,6 +778,7 @@ func (h *WSHandler) runSessionMessage(job sessionMessageJob) {
 	err := uc.SendMessage(msgCtx, usecase.SendMessageInput{
 		RootID:       rootID,
 		Key:          key,
+		RequestID:    requestID,
 		Agent:        job.User.Agent,
 		Model:        job.User.Model,
 		Mode:         job.User.Mode,
@@ -925,8 +926,9 @@ func (h *WSHandler) handleSessionCancel(ctx context.Context, conn *websocket.Con
 
 	uc := &usecase.Service{Registry: h.AppContext}
 	if err := uc.CancelSessionTurn(ctx, usecase.CancelSessionTurnInput{
-		RootID: rootID,
-		Key:    key,
+		RootID:    rootID,
+		Key:       key,
+		RequestID: getString(req.Payload, "request_id"),
 	}); err != nil {
 		if queue, changed := streamHub.UnfreezeQueuedSessionMessages(key); changed {
 			streamHub.BroadcastSessionQueueUpdated(rootID, key, queue)
@@ -1000,7 +1002,7 @@ func (h *WSHandler) handleSessionQueueSendNow(ctx context.Context, conn *websock
 		return
 	}
 	uc := &usecase.Service{Registry: h.AppContext}
-	if err := uc.CancelSessionTurn(ctx, usecase.CancelSessionTurnInput{RootID: rootID, Key: key}); err != nil {
+	if err := uc.CancelSessionTurn(ctx, usecase.CancelSessionTurnInput{RootID: rootID, Key: key, SkipPendingIntent: true}); err != nil {
 		log.Printf("[ws] session.queue.send_now.cancel.error root=%s session=%s request=%s err=%v", rootID, key, req.ID, err)
 	}
 }

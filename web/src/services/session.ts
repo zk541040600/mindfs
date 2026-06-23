@@ -856,7 +856,7 @@ class SessionService {
     }
   }
 
-  async cancelMessage(rootId: string, sessionKey: string): Promise<boolean> {
+  async cancelMessage(rootId: string, sessionKey: string, requestId?: string): Promise<boolean> {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       console.error("[Session] WebSocket not connected");
       return false;
@@ -871,6 +871,7 @@ class SessionService {
       payload: {
         root_id: rootId,
         session_key: sessionKey,
+        request_id: requestId || undefined,
       },
     };
 

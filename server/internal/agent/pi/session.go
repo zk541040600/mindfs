@@ -1142,10 +1142,10 @@ func (s *session) ListCommands(ctx context.Context) (agenttypes.CommandList, err
 }
 
 func (s *session) CancelCurrentTurn() error {
+	abortID := s.nextID("abort")
+	err := s.writeJSON(map[string]any{"type": "abort", "id": abortID})
 	s.turn.Cancel()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	_, err := s.request(ctx, "abort", map[string]any{"type": "abort"})
+	s.signalTurnDone(context.Canceled)
 	if err != nil && !strings.Contains(err.Error(), "closed") {
 		return err
 	}

@@ -28,6 +28,7 @@ fail_once_file = os.environ.get("FAKE_PI_FAIL_ONCE_FILE")
 if fail_once_file and not os.path.exists(fail_once_file):
     open(fail_once_file, "w").close()
     sys.exit(141)
+abort_hangs = os.environ.get("FAKE_PI_ABORT_HANG") == "1"
 
 out_lock = threading.Lock()
 pending_prompt_id = None
@@ -130,6 +131,8 @@ for line in sys.stdin:
         else:
             send({"type": "response", "success": False, "error": "no pending extension ui"})
     elif typ == "abort":
+        if abort_hangs:
+            continue
         send({"id": req_id, "type": "response", "command": "abort", "success": True})
         send({"type": "agent_end", "willRetry": False})
     elif typ == "get_session_stats":
@@ -465,6 +468,50 @@ func TestCancelCurrentTurnUnblocksSlowPrompt(t *testing.T) {
 			t.Fatalf("unexpected cancel error: %v", err)
 		}
 	case <-time.After(3 * time.Second):
+		t.Fatal("SendMessage did not unblock after cancel")
+	}
+}
+
+func TestCancelCurrentTurnDoesNotWaitForMissingAbortResponse(t *testing.T) {
+	cmd := writeFakePiRPC(t)
+	r := NewRuntime()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	sess, err := r.OpenSession(ctx, OpenOptions{
+		AgentName:  "pi",
+		SessionKey: "cancel-abort-hang",
+		Command:    cmd,
+		Args:       []string{"--mode", "rpc", "--no-session"},
+		RootPath:   t.TempDir(),
+		Model:      "fake/model",
+		Mode:       "off",
+		Env:        map[string]string{"FAKE_PI_ABORT_HANG": "1"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sess.Close() })
+	s, ok := sess.(*session)
+	if !ok {
+		t.Fatalf("expected *session, got %T", sess)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- s.SendMessage(ctx, "slow") }()
+	time.Sleep(250 * time.Millisecond)
+	started := time.Now()
+	if err := s.CancelCurrentTurn(); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("CancelCurrentTurn took %s, want it not to wait for abort response", elapsed)
+	}
+	select {
+	case err := <-done:
+		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, io.EOF) {
+			t.Fatalf("unexpected cancel error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
 		t.Fatal("SendMessage did not unblock after cancel")
 	}
 }

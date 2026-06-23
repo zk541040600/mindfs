@@ -425,6 +425,7 @@ func prependSwitchHint(in BuildPromptInput, prompt string) string {
 type SendMessageInput struct {
 	RootID              string
 	Key                 string
+	RequestID           string
 	Agent               string
 	Model               string
 	Mode                string
@@ -458,8 +459,10 @@ type AnswerExtensionUIInput struct {
 }
 
 type CancelSessionTurnInput struct {
-	RootID string
-	Key    string
+	RootID            string
+	Key               string
+	RequestID         string
+	SkipPendingIntent bool
 }
 
 const (
@@ -468,6 +471,7 @@ const (
 	sessionNameMinMessageLen = 12
 	sessionRecoveryAttempts  = 3
 	sessionRecoveryDelay     = 30 * time.Second
+	activeTurnCancelTTL      = 30 * time.Second
 )
 
 type SuggestSessionNameInput struct {
@@ -482,11 +486,18 @@ var (
 	sessionSendLocks   = make(map[string]*sync.Mutex)
 	activeTurnsMu      sync.Mutex
 	activeTurns        = make(map[string]*activeTurnState)
+	pendingTurnCancel  = make(map[string]pendingTurnCancelState)
 )
 
 type activeTurnState struct {
-	cancel  context.CancelFunc
-	session agenttypes.Session
+	cancel    context.CancelFunc
+	session   agenttypes.Session
+	requestID string
+}
+
+type pendingTurnCancelState struct {
+	requestID string
+	createdAt time.Time
 }
 
 func getSessionSendLock(sessionKey string) *sync.Mutex {
@@ -504,13 +515,61 @@ func activeTurnKey(rootID, sessionKey string) string {
 	return rootID + "::" + sessionKey
 }
 
-func registerActiveTurn(rootID, sessionKey string, cancel context.CancelFunc) {
+func registerActiveTurn(rootID, sessionKey, requestID string, cancel context.CancelFunc) bool {
 	if strings.TrimSpace(rootID) == "" || strings.TrimSpace(sessionKey) == "" || cancel == nil {
+		return false
+	}
+	key := activeTurnKey(rootID, sessionKey)
+	requestID = strings.TrimSpace(requestID)
+	now := time.Now()
+	shouldCancel := false
+	activeTurnsMu.Lock()
+	pruneExpiredPendingTurnCancelsLocked(now)
+	activeTurns[key] = &activeTurnState{cancel: cancel, requestID: requestID}
+	shouldCancel = consumePendingTurnCancelLocked(key, requestID, now)
+	activeTurnsMu.Unlock()
+	if shouldCancel {
+		cancel()
+	}
+	return shouldCancel
+}
+
+func markPendingTurnCancel(rootID, sessionKey, requestID string) {
+	if strings.TrimSpace(rootID) == "" || strings.TrimSpace(sessionKey) == "" {
 		return
 	}
+	now := time.Now()
 	activeTurnsMu.Lock()
-	activeTurns[activeTurnKey(rootID, sessionKey)] = &activeTurnState{cancel: cancel}
+	pruneExpiredPendingTurnCancelsLocked(now)
+	pendingTurnCancel[activeTurnKey(rootID, sessionKey)] = pendingTurnCancelState{
+		requestID: strings.TrimSpace(requestID),
+		createdAt: now,
+	}
 	activeTurnsMu.Unlock()
+}
+
+func pruneExpiredPendingTurnCancelsLocked(now time.Time) {
+	for key, state := range pendingTurnCancel {
+		if state.createdAt.IsZero() || now.Sub(state.createdAt) > activeTurnCancelTTL {
+			delete(pendingTurnCancel, key)
+		}
+	}
+}
+
+func consumePendingTurnCancelLocked(key, requestID string, now time.Time) bool {
+	state, ok := pendingTurnCancel[key]
+	if !ok {
+		return false
+	}
+	if state.createdAt.IsZero() || now.Sub(state.createdAt) > activeTurnCancelTTL {
+		delete(pendingTurnCancel, key)
+		return false
+	}
+	if state.requestID != "" && requestID != state.requestID {
+		return false
+	}
+	delete(pendingTurnCancel, key)
+	return true
 }
 
 func setActiveTurnSession(rootID, sessionKey string, sess agenttypes.Session) {
@@ -529,8 +588,10 @@ func unregisterActiveTurn(rootID, sessionKey string) {
 	if strings.TrimSpace(rootID) == "" || strings.TrimSpace(sessionKey) == "" {
 		return
 	}
+	key := activeTurnKey(rootID, sessionKey)
 	activeTurnsMu.Lock()
-	delete(activeTurns, activeTurnKey(rootID, sessionKey))
+	delete(activeTurns, key)
+	delete(pendingTurnCancel, key)
 	activeTurnsMu.Unlock()
 }
 
@@ -1313,8 +1374,11 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 	sendLock.Lock()
 	defer sendLock.Unlock()
 	turnCtx, turnCancel := context.WithCancel(ctx)
-	registerActiveTurn(in.RootID, in.Key, turnCancel)
+	cancelledBeforeStart := registerActiveTurn(in.RootID, in.Key, in.RequestID, turnCancel)
 	defer unregisterActiveTurn(in.RootID, in.Key)
+	if cancelledBeforeStart {
+		return context.Canceled
+	}
 	if in.OnStart != nil {
 		in.OnStart()
 	}
@@ -1667,8 +1731,11 @@ func (s *Service) startSubagentSubscription(in subagentSessionInput, child *sess
 	go func() {
 		defer activeSubagentSubscriptions.Delete(key)
 		ctx, cancel := context.WithCancel(in.Pool.Context())
-		registerActiveTurn(in.RootID, child.Key, cancel)
+		cancelledBeforeStart := registerActiveTurn(in.RootID, child.Key, "", cancel)
 		defer unregisterActiveTurn(in.RootID, child.Key)
+		if cancelledBeforeStart {
+			return
+		}
 		openInput := agenttypes.OpenSessionInput{
 			SessionKey:     agentPoolSessionKey(child.Key, in.Agent),
 			AgentName:      in.Agent,
@@ -2531,8 +2598,15 @@ func (s *Service) CancelSessionTurn(ctx context.Context, in CancelSessionTurnInp
 	if err != nil {
 		return err
 	}
+	if !in.SkipPendingIntent {
+		markPendingTurnCancel(in.RootID, current.Key, in.RequestID)
+	}
 	active := getActiveTurn(in.RootID, current.Key)
 	if active == nil {
+		return nil
+	}
+	requestID := strings.TrimSpace(in.RequestID)
+	if requestID != "" && active.requestID != "" && active.requestID != requestID {
 		return nil
 	}
 	if active.session != nil {

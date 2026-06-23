@@ -40,12 +40,15 @@ async function fulfillJSON(route: Route, body: unknown, status = 200) {
 async function openPendingApp(
   page: Page,
   replyingState: { current: boolean },
+  onWSMessage?: (message: string) => void,
 ) {
   let socket: WebSocketRoute | null = null;
 
   await page.routeWebSocket((url) => url.pathname === "/ws", (ws) => {
     socket = ws;
-    ws.onMessage(() => {});
+    ws.onMessage((message) => {
+      onWSMessage?.(String(message));
+    });
   });
 
   await page.route("**/api/**", async (route) => {
@@ -272,6 +275,46 @@ test("keeps pending after message_done until session.done arrives", async ({ pag
 
   await expect(page.getByText("已发送，等待响应...")).toHaveCount(0);
   await expect(page.getByText("左滑蓝环开始新会话...")).toBeVisible();
+});
+
+test("ignores late stream events after cancelling a pending turn", async ({ page }) => {
+  const replying = { current: true };
+  let cancelSeen = false;
+  const app = await openPendingApp(page, replying, (message) => {
+    try {
+      const parsed = JSON.parse(message);
+      if (parsed?.type === "session.cancel") {
+        cancelSeen = true;
+      }
+    } catch {
+      // Ignore non-JSON websocket traffic in the harness.
+    }
+  });
+
+  await expect(page.getByText("已发送，等待响应...")).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect.poll(() => cancelSeen).toBe(true);
+  await expect(page.getByText("已发送，等待响应...")).toHaveCount(0);
+  await expect(page.getByText("左滑蓝环开始新会话...")).toBeVisible();
+
+  app.socket?.send(
+    JSON.stringify({
+      type: "session.stream",
+      payload: {
+        root_id: rootId,
+        session_key: sessionKey,
+        event: {
+          type: "message_chunk",
+          data: { content: "late chunk after cancel" },
+        },
+      },
+    }),
+  );
+
+  await page.waitForTimeout(150);
+  await expect(page.getByText("已发送，等待响应...")).toHaveCount(0);
+  await expect(page.getByText("左滑蓝环开始新会话...")).toBeVisible();
+  await expect(page.getByText("late chunk after cancel")).toHaveCount(0);
 });
 
 test("keeps pending when replying-sessions drops before terminal event", async ({ page }) => {
