@@ -973,6 +973,30 @@ class SessionService {
     }
   }
 
+  async fetchChildSessions(
+    rootId: string,
+    parentSessionKey: string,
+    options?: { beforeTime?: string; limit?: number },
+  ): Promise<Session[]> {
+    try {
+      const params = new URLSearchParams({
+        root: rootId,
+        parent_session_key: parentSessionKey,
+      });
+      if (options?.beforeTime) {
+        params.set("before_time", options.beforeTime);
+      }
+      if (typeof options?.limit === "number" && options.limit > 0) {
+        params.set("limit", String(options.limit));
+      }
+      const data = await protectedJSON<any[]>(appURL("/api/sessions/children", params));
+      return Array.isArray(data) ? data : [];
+    } catch (err) {
+      console.error("[Session] Failed to fetch child sessions:", err);
+      return [];
+    }
+  }
+
   async searchSessions(
     rootId: string,
     query: string,

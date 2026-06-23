@@ -44,6 +44,13 @@ type ListSessionsOutput struct {
 	Sessions []*session.Session
 }
 
+type ListChildSessionsInput struct {
+	RootID           string
+	ParentSessionKey string
+	BeforeTime       time.Time
+	Limit            int
+}
+
 type SearchSessionsInput struct {
 	RootID string
 	Query  string
@@ -66,6 +73,39 @@ func (s *Service) ListSessions(ctx context.Context, in ListSessionsInput) (ListS
 		BeforeTime: in.BeforeTime,
 		AfterTime:  in.AfterTime,
 		Limit:      in.Limit,
+	})
+	if err != nil {
+		return ListSessionsOutput{}, err
+	}
+	for _, item := range items {
+		if item == nil || item.Type != session.TypeCommand {
+			continue
+		}
+		aux, err := manager.GetExchangeAux(ctx, item.Key, 0)
+		if err != nil {
+			return ListSessionsOutput{}, err
+		}
+		item.Shell = session.InferCommandShellFromAux(aux)
+	}
+	return ListSessionsOutput{Sessions: items}, nil
+}
+
+func (s *Service) ListChildSessions(ctx context.Context, in ListChildSessionsInput) (ListSessionsOutput, error) {
+	if err := s.ensureRegistry(); err != nil {
+		return ListSessionsOutput{}, err
+	}
+	parentKey := strings.TrimSpace(in.ParentSessionKey)
+	if parentKey == "" {
+		return ListSessionsOutput{}, errors.New("parent_session_key required")
+	}
+	manager, err := s.Registry.GetSessionManager(in.RootID)
+	if err != nil {
+		return ListSessionsOutput{}, err
+	}
+	items, err := manager.List(ctx, session.ListOptions{
+		BeforeTime:       in.BeforeTime,
+		ParentSessionKey: parentKey,
+		Limit:            in.Limit,
 	})
 	if err != nil {
 		return ListSessionsOutput{}, err

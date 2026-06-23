@@ -56,6 +56,8 @@ const (
 	maxUploadRequestBytes = 64 << 20
 	maxUploadFileCount    = 20
 	sessionListPageSize   = 50
+	childSessionPageSize  = 20
+	childSessionMaxLimit  = 50
 	e2eeHeaderName        = "X-MindFS-E2EE"
 	clientIDHeaderName    = "X-MindFS-Client-ID"
 	e2eeProofHeaderName   = "X-MindFS-Proof"
@@ -282,6 +284,7 @@ func (h *HTTPHandler) Routes() http.Handler {
 	r.Get("/api/sessions", h.protectedEndpoint(h.handleSessions))
 	r.Get("/api/replying-sessions", h.protectedEndpoint(h.handleReplyingSessions))
 	r.Get("/api/sessions/search", h.protectedEndpoint(h.handleSessionSearch))
+	r.Get("/api/sessions/children", h.protectedEndpoint(h.handleSessionChildren))
 	r.Get("/api/sessions/external", h.protectedEndpoint(h.handleExternalSessionsList))
 	r.Post("/api/sessions/import", h.protectedEndpoint(h.handleExternalSessionImport))
 	r.Post("/api/sessions/import/batch", h.protectedEndpoint(h.handleExternalSessionImportBatch))
@@ -352,6 +355,45 @@ func (h *HTTPHandler) handleSessions(w http.ResponseWriter, r *http.Request) {
 		BeforeTime: beforeTime,
 		AfterTime:  afterTime,
 		Limit:      sessionListPageSize,
+	})
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err)
+		return
+	}
+	payload := make([]map[string]any, 0, len(out.Sessions))
+	for _, s := range out.Sessions {
+		payload = append(payload, h.sessionListResponse(s))
+	}
+	respondJSON(w, http.StatusOK, payload)
+}
+
+func (h *HTTPHandler) handleSessionChildren(w http.ResponseWriter, r *http.Request) {
+	rootID := r.URL.Query().Get("root")
+	parentSessionKey := strings.TrimSpace(r.URL.Query().Get("parent_session_key"))
+	if parentSessionKey == "" {
+		respondError(w, http.StatusBadRequest, errInvalidRequest("parent_session_key required"))
+		return
+	}
+	beforeTime, err := parseOptionalTimeQuery(r, "before_time")
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err)
+		return
+	}
+	limit, err := parsePositiveIntQuery(r, "limit")
+	if err != nil {
+		respondError(w, http.StatusBadRequest, errInvalidRequest("limit must be a positive integer"))
+		return
+	}
+	if limit <= 0 {
+		limit = childSessionPageSize
+	} else if limit > childSessionMaxLimit {
+		limit = childSessionMaxLimit
+	}
+	out, err := h.service().ListChildSessions(r.Context(), usecase.ListChildSessionsInput{
+		RootID:           rootID,
+		ParentSessionKey: parentSessionKey,
+		BeforeTime:       beforeTime,
+		Limit:            limit,
 	})
 	if err != nil {
 		respondError(w, http.StatusServiceUnavailable, err)

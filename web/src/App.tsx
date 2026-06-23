@@ -108,6 +108,8 @@ import { fetchAgents, type AgentStatus } from "./services/agents";
 type SessionMode = "chat" | "plugin" | "command";
 type WSStatus = "connecting" | "connected" | "reconnecting" | "disconnected";
 
+const CHILD_SESSION_PAGE_SIZE = 100;
+
 function normalizeFastService(
   value: unknown,
 ): "" | "on" | "off" {
@@ -3159,6 +3161,32 @@ export function App({ onGoHome }: AppProps) {
         }
         setSessions((prev) => mergeSessionItems(prev, next));
       } catch {}
+    },
+    [mergeSessionItems],
+  );
+
+  const loadChildSessionsForParent = useCallback(
+    async (
+      parent: SessionItem,
+      options?: { beforeTime?: string },
+    ): Promise<{ hasMore: boolean }> => {
+      const rootID =
+        (parent.root_id as string | undefined) || currentRootIdRef.current || "";
+      const parentKey = parent.key || parent.session_key || "";
+      if (!rootID || !parentKey) {
+        return { hasMore: false };
+      }
+      const items = await sessionService.fetchChildSessions(rootID, parentKey, {
+        beforeTime: options?.beforeTime,
+        limit: CHILD_SESSION_PAGE_SIZE,
+      });
+      const next = items
+        .map((item) => toSessionItem(rootID, item))
+        .filter((item): item is SessionItem => !!item);
+      if (currentRootIdRef.current === rootID && next.length > 0) {
+        setSessions((prev) => mergeSessionItems(prev, next));
+      }
+      return { hasMore: items.length >= CHILD_SESSION_PAGE_SIZE };
     },
     [mergeSessionItems],
   );
@@ -9078,6 +9106,11 @@ export function App({ onGoHome }: AppProps) {
         onSync={handleSyncSession}
         onRename={handleRenameSession}
         onDelete={handleDeleteSession}
+        onLoadChildren={
+          sessionSearchOpen && sessionSearchResultsMode
+            ? undefined
+            : loadChildSessionsForParent
+        }
         onLoadOlder={
           sessionSearchOpen && sessionSearchResultsMode
             ? undefined

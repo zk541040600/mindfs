@@ -144,9 +144,10 @@ type AgentBinding struct {
 }
 
 type ListOptions struct {
-	BeforeTime time.Time
-	AfterTime  time.Time
-	Limit      int
+	BeforeTime       time.Time
+	AfterTime        time.Time
+	ParentSessionKey string
+	Limit            int
 }
 
 func NewManager(root fs.RootInfo, opts ...Option) *Manager {
@@ -1095,14 +1096,21 @@ func (m *Manager) listSessionsUnsafe(opts ListOptions) ([]*Session, error) {
 	query := `
 SELECT key FROM sessions`
 	args := make([]any, 0, 2)
+	where := make([]string, 0, 2)
+	if parentKey := strings.TrimSpace(opts.ParentSessionKey); parentKey != "" {
+		where = append(where, "parent_session_key = ?")
+		args = append(args, parentKey)
+	}
 	if !opts.BeforeTime.IsZero() {
-		query += `
-WHERE updated_at < ?`
+		where = append(where, "updated_at < ?")
 		args = append(args, opts.BeforeTime.UTC().Format(time.RFC3339Nano))
 	} else if !opts.AfterTime.IsZero() {
-		query += `
-WHERE updated_at > ?`
+		where = append(where, "updated_at > ?")
 		args = append(args, opts.AfterTime.UTC().Format(time.RFC3339Nano))
+	}
+	if len(where) > 0 {
+		query += `
+WHERE ` + strings.Join(where, " AND ")
 	}
 	query += `
 ORDER BY updated_at DESC`

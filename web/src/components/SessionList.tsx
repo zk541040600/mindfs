@@ -43,10 +43,26 @@ type SessionListProps = {
   onSync?: (session: SessionItem) => Promise<void> | void;
   onRename?: (session: SessionItem, nextName: string) => Promise<boolean> | boolean;
   onDelete?: (session: SessionItem) => void;
+  onLoadChildren?: (
+    session: SessionItem,
+    options?: { beforeTime?: string },
+  ) => Promise<{ hasMore?: boolean } | void> | { hasMore?: boolean } | void;
   onLoadOlder?: () => void;
   loadingOlder?: boolean;
   hasMore?: boolean;
 };
+
+const COLLAPSED_CHILD_SESSION_LIMIT = 3;
+
+type VisibleSessionRow =
+  | { type: "session"; session: SessionItem }
+  | {
+      type: "child-toggle";
+      parent: SessionItem;
+      loadedChildCount: number;
+      hiddenCount: number;
+      expanded: boolean;
+    };
 
 function shellBadgeLabel(shell?: string): string {
   const normalized = String(shell || "").trim().replace(/\\/g, "/");
@@ -115,15 +131,19 @@ export function SessionList({
   onSync,
   onRename,
   onDelete,
+  onLoadChildren,
   onLoadOlder,
   loadingOlder = false,
   hasMore = false,
 }: SessionListProps) {
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const searchBlurTimerRef = useRef<number | null>(null);
+  const [expandedChildren, setExpandedChildren] = useState<Record<string, boolean>>({});
+  const [loadingChildren, setLoadingChildren] = useState<Record<string, boolean>>({});
+  const [childrenHasMore, setChildrenHasMore] = useState<Record<string, boolean>>({});
   const visibleSessions = useMemo(() => {
     if (searchResultsMode) {
-      return sessions;
+      return sessions.map((session): VisibleSessionRow => ({ type: "session", session }));
     }
     const childrenByParent = new Map<string, SessionItem[]>();
     const topLevel: SessionItem[] = [];
@@ -138,16 +158,31 @@ export function SessionList({
         topLevel.push(item);
       }
     }
-    const out: SessionItem[] = [];
+    const out: VisibleSessionRow[] = [];
     const append = (item: SessionItem) => {
-      out.push(item);
-      for (const child of childrenByParent.get(item.key) || []) {
+      out.push({ type: "session", session: item });
+      const children = childrenByParent.get(item.key) || [];
+      const expanded = !!expandedChildren[item.key];
+      const visibleChildren = expanded
+        ? children
+        : children.slice(0, COLLAPSED_CHILD_SESSION_LIMIT);
+      for (const child of visibleChildren) {
         append(child);
+      }
+      const hiddenCount = Math.max(0, children.length - COLLAPSED_CHILD_SESSION_LIMIT);
+      if (children.length > COLLAPSED_CHILD_SESSION_LIMIT || expanded || childrenHasMore[item.key]) {
+        out.push({
+          type: "child-toggle",
+          parent: item,
+          loadedChildCount: children.length,
+          hiddenCount,
+          expanded,
+        });
       }
     };
     topLevel.forEach((item) => append(item));
     return out;
-  }, [searchResultsMode, sessions]);
+  }, [childrenHasMore, expandedChildren, searchResultsMode, sessions]);
   const selectedParentKey = useMemo(() => {
     if (!selectedKey) return "";
     return sessions.find((item) => item.key === selectedKey)?.parent_session_key || "";
@@ -173,6 +208,36 @@ export function SessionList({
       }
     };
   }, []);
+
+  const loadChildren = async (parent: SessionItem, beforeTime?: string) => {
+    if (!onLoadChildren || loadingChildren[parent.key]) {
+      return;
+    }
+    setLoadingChildren((prev) => ({ ...prev, [parent.key]: true }));
+    try {
+      const result = await onLoadChildren(parent, beforeTime ? { beforeTime } : undefined);
+      setChildrenHasMore((prev) => ({ ...prev, [parent.key]: !!result?.hasMore }));
+    } finally {
+      setLoadingChildren((prev) => ({ ...prev, [parent.key]: false }));
+    }
+  };
+
+  const handleChildToggle = async (row: Extract<VisibleSessionRow, { type: "child-toggle" }>) => {
+    const parentKey = row.parent.key;
+    if (!row.expanded) {
+      setExpandedChildren((prev) => ({ ...prev, [parentKey]: true }));
+      await loadChildren(row.parent);
+      return;
+    }
+    if (childrenHasMore[parentKey]) {
+      const lastChild = sessions
+        .filter((item) => item.parent_session_key === parentKey)
+        .sort((left, right) => (Date.parse(left.updated_at || "") || 0) - (Date.parse(right.updated_at || "") || 0))[0];
+      await loadChildren(row.parent, lastChild?.updated_at);
+    } else {
+      setExpandedChildren((prev) => ({ ...prev, [parentKey]: false }));
+    }
+  };
 
   return (
     <div
@@ -382,20 +447,68 @@ export function SessionList({
           ) : null
         ) : (
           <div style={{ display: "flex", flexDirection: "column", gap: "2px" }}>
-            {visibleSessions.map((session) => (
-              <SessionCard
-                key={session.key}
-                session={session}
-                sessionByKey={sessionByKey}
-                selected={session.key === selectedKey}
-                parentHighlighted={!!selectedParentKey && session.key === selectedParentKey}
-                highlightQuery={searchResultsMode ? searchQuery : ""}
-                onSelect={onSelect}
-                onSync={onSync}
-                onRename={onRename}
-                onDelete={onDelete}
-              />
-            ))}
+            {visibleSessions.map((row) => {
+              if (row.type === "child-toggle") {
+                const loading = !!loadingChildren[row.parent.key];
+                const hasMoreChildren = !!childrenHasMore[row.parent.key];
+                const label = loading
+                  ? "加载中..."
+                  : row.expanded
+                    ? hasMoreChildren
+                      ? "加载更多子会话"
+                      : "收起子会话"
+                    : row.hiddenCount > 0
+                      ? `还有 ${row.hiddenCount} 个子会话，展开`
+                      : "展开子会话";
+                return (
+                  <button
+                    key={`children-toggle-${row.parent.key}`}
+                    type="button"
+                    disabled={loading}
+                    onClick={() => void handleChildToggle(row)}
+                    style={{
+                      marginLeft: "10px",
+                      marginTop: "-1px",
+                      border: "none",
+                      background: "var(--menu-active-bg)",
+                      color: "var(--text-primary)",
+                      borderRadius: "7px",
+                      padding: "5px 8px",
+                      cursor: loading ? "default" : "pointer",
+                      fontSize: "11px",
+                      textAlign: "left",
+                      opacity: loading ? 0.6 : 1,
+                      display: "inline-flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                    }}
+                    onMouseEnter={(e) => {
+                      e.currentTarget.style.background = "var(--selection-bg)";
+                    }}
+                    onMouseLeave={(e) => {
+                      e.currentTarget.style.background = "var(--menu-active-bg)";
+                    }}
+                  >
+                    {label}
+                  </button>
+                );
+              }
+              const session = row.session;
+              return (
+                <SessionCard
+                  key={session.key}
+                  session={session}
+                  sessionByKey={sessionByKey}
+                  selected={session.key === selectedKey}
+                  parentHighlighted={!!selectedParentKey && session.key === selectedParentKey}
+                  highlightQuery={searchResultsMode ? searchQuery : ""}
+                  onSelect={onSelect}
+                  onSync={onSync}
+                  onRename={onRename}
+                  onDelete={onDelete}
+                />
+              );
+            })}
             {hasMore ? (
               <button
                 type="button"
