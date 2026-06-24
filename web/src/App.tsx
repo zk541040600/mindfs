@@ -1004,6 +1004,7 @@ type AppProps = {
 };
 
 const MOBILE_ENTER_KEY_SEND_STORAGE_KEY = "mindfs-mobile-enter-key-sends";
+const SIDEBARS_SWAPPED_STORAGE_KEY = "mindfs-sidebars-swapped";
 
 function loadMobileEnterKeySends(): boolean {
   if (typeof window === "undefined") {
@@ -1011,6 +1012,17 @@ function loadMobileEnterKeySends(): boolean {
   }
   try {
     return window.localStorage.getItem(MOBILE_ENTER_KEY_SEND_STORAGE_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function loadSidebarsSwapped(): boolean {
+  if (typeof window === "undefined") {
+    return false;
+  }
+  try {
+    return window.localStorage.getItem(SIDEBARS_SWAPPED_STORAGE_KEY) === "1";
   } catch {
     return false;
   }
@@ -1135,6 +1147,7 @@ export function App({ onGoHome }: AppProps) {
   const [isDrawerOpen, setIsDrawerOpen] = useState(false);
   const { isMobile } = useResponsive();
   const [mobileEnterKeySends, setMobileEnterKeySends] = useState(loadMobileEnterKeySends);
+  const [sidebarsSwapped, setSidebarsSwapped] = useState(loadSidebarsSwapped);
   const [isLeftOpen, setIsLeftOpen] = useState(() => window.innerWidth >= 768);
   const [isRightOpen, setIsRightOpen] = useState(
     () => window.innerWidth >= 768,
@@ -1152,6 +1165,17 @@ export function App({ onGoHome }: AppProps) {
       // Ignore storage failures; the setting can still apply for this session.
     }
   }, [mobileEnterKeySends]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(
+        SIDEBARS_SWAPPED_STORAGE_KEY,
+        sidebarsSwapped ? "1" : "0",
+      );
+    } catch {
+      // Ignore storage failures; the setting can still apply for this session.
+    }
+  }, [sidebarsSwapped]);
 
   const [managedRootIds, setManagedRootIds] = useState<string[]>([]);
   const managedRootByIdRef = useRef<Record<string, ManagedRootPayload>>({});
@@ -9420,6 +9444,7 @@ export function App({ onGoHome }: AppProps) {
       <AppShell
         leftOpen={isLeftOpen}
         rightOpen={isRightOpen}
+        sidebarsSwapped={sidebarsSwapped}
         onCloseLeft={() => setIsLeftOpen(false)}
         onCloseRight={() => setIsRightOpen(false)}
         onOpenLeft={() => setIsLeftOpen(true)}
@@ -9489,6 +9514,8 @@ export function App({ onGoHome }: AppProps) {
             showEnterKeySendOption={isMobile}
             enterKeySends={mobileEnterKeySends}
             onEnterKeySendsChange={setMobileEnterKeySends}
+            sidebarsSwapped={sidebarsSwapped}
+            onSidebarsSwappedChange={setSidebarsSwapped}
             multiProjectSessionsEnabled={multiProjectSessionsEnabled}
             onMultiProjectSessionsChange={setMultiProjectSessionsEnabled}
             onRunAgentLifecycleCommand={handleRunAgentLifecycleCommand}
@@ -9567,6 +9594,7 @@ export function App({ onGoHome }: AppProps) {
             onClearFileContext={handleClearFileContext}
             onToggleLeftSidebar={() => setIsLeftOpen((v) => !v)}
             onToggleRightSidebar={() => setIsRightOpen((v) => !v)}
+            sidebarsSwapped={sidebarsSwapped}
             onSessionClick={() => {
               const rootID = currentRootIdRef.current;
               if (!activeBoundSessionKey) return;

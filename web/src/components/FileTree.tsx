@@ -118,6 +118,8 @@ type FileTreeProps = {
   showEnterKeySendOption?: boolean;
   enterKeySends?: boolean;
   onEnterKeySendsChange?: (enabled: boolean) => void;
+  sidebarsSwapped?: boolean;
+  onSidebarsSwappedChange?: (enabled: boolean) => void;
   multiProjectSessionsEnabled?: boolean;
   onMultiProjectSessionsChange?: (enabled: boolean) => void;
   onRunAgentLifecycleCommand?: (agentName: string, action: "install" | "update", commands: string[]) => void | Promise<void>;
@@ -1022,6 +1024,8 @@ export function FileTree({
   showEnterKeySendOption = false,
   enterKeySends = false,
   onEnterKeySendsChange,
+  sidebarsSwapped = false,
+  onSidebarsSwappedChange,
   multiProjectSessionsEnabled = false,
   onMultiProjectSessionsChange,
   onRunAgentLifecycleCommand,
@@ -2242,6 +2246,31 @@ export function FileTree({
               >
                 <span>多项目会话列表</span>
                 <span style={{ fontSize: "11px", opacity: multiProjectSessionsEnabled ? 1 : 0 }}>✓</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  onSidebarsSwappedChange?.(!sidebarsSwapped);
+                  setIsAppearanceMenuOpen(false);
+                  setIsSortMenuOpen(false);
+                }}
+                style={{
+                  width: "100%",
+                  border: "none",
+                  background: sidebarsSwapped ? "var(--selection-bg)" : "transparent",
+                  color: sidebarsSwapped ? "var(--accent-color)" : "var(--text-primary)",
+                  borderRadius: "8px",
+                  padding: "8px 10px",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  textAlign: "left",
+                  cursor: "pointer",
+                  fontSize: "12px",
+                }}
+              >
+                <span>交换左右侧边栏</span>
+                <span style={{ fontSize: "11px", opacity: sidebarsSwapped ? 1 : 0 }}>✓</span>
               </button>
               {showEnterKeySendOption ? (
                 <button

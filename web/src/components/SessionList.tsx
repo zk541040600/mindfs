@@ -913,10 +913,10 @@ export function MultiProjectSessionList({
           boxSizing: "border-box",
         }}
       >
-        <h3 style={{ margin: 0, fontSize: "11px", fontWeight: 700, color: "var(--text-secondary)", letterSpacing: "0.5px", textTransform: "uppercase" }}>
-          SESSIONS
-        </h3>
         <div style={{ display: "inline-flex", alignItems: "center", gap: "4px" }}>
+          <h3 style={{ margin: 0, fontSize: "11px", fontWeight: 700, color: "var(--text-secondary)", letterSpacing: "0.5px", textTransform: "uppercase" }}>
+            SESSIONS
+          </h3>
           {onSearchToggle ? (
             <button
               type="button"
@@ -944,8 +944,8 @@ export function MultiProjectSessionList({
               </svg>
             </button>
           ) : null}
-          {headerAction ? <div style={{ display: "inline-flex", alignItems: "center" }}>{headerAction}</div> : null}
         </div>
+        {headerAction ? <div style={{ display: "inline-flex", alignItems: "center" }}>{headerAction}</div> : null}
       </div>
       <div style={{ flex: 1, minHeight: 0, overflow: "auto", padding: "8px" }}>
         {loading && groups.length === 0 ? (
