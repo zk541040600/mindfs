@@ -883,6 +883,10 @@ type RunTransientSlashCommandInput struct {
 	OnUpdate    func(agenttypes.Event)
 }
 
+type codexDeviceCodeLoginSession interface {
+	LoginChatGPTDeviceCode(context.Context) error
+}
+
 var activeSubagentSubscriptions sync.Map
 
 type AnswerQuestionInput struct {
@@ -2012,33 +2016,43 @@ func (s *Service) RunTransientSlashCommand(ctx context.Context, in RunTransientS
 	}
 	command := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(in.Command)), "/")
 	agentName := strings.TrimSpace(in.Agent)
-	if agentName != "codex" || command != "status" {
+	if agentName != "codex" || (command != "status" && command != "login") {
 		return errors.New("unsupported transient slash command")
 	}
-	if strings.TrimSpace(in.Key) == "" {
-		return errors.New("session key required")
+	key := strings.TrimSpace(in.Key)
+	if key == "" {
+		key = fmt.Sprintf("transient-%s-%d", command, time.Now().UnixNano())
 	}
-	sendLock := getSessionSendLock(in.Key)
+	sendLock := getSessionSendLock(key)
 	sendLock.Lock()
 	defer sendLock.Unlock()
 
 	turnCtx, turnCancel := context.WithCancel(ctx)
-	registerActiveTurn(in.RootID, in.Key, turnCancel)
-	defer unregisterActiveTurn(in.RootID, in.Key)
+	registerActiveTurn(in.RootID, key, turnCancel)
+	defer unregisterActiveTurn(in.RootID, key)
 
 	manager, err := s.Registry.GetSessionManager(in.RootID)
 	if err != nil {
 		return err
 	}
-	current, err := manager.Get(ctx, in.Key, 0)
+	current, err := manager.Get(ctx, key, 0)
 	if err != nil {
-		return err
-	}
-	if current.Type == session.TypeCommand {
-		return errors.New("slash commands are not supported for command sessions")
-	}
-	if currentAgent := strings.TrimSpace(session.InferAgentFromSession(current)); currentAgent != "" && currentAgent != agentName {
-		return errors.New("slash command agent does not match session agent")
+		current = &session.Session{
+			Key:         key,
+			Type:        session.TypeChat,
+			Model:       strings.TrimSpace(in.Model),
+			AgentCtxSeq: map[string]int{},
+			Name:        "Transient slash command",
+			CreatedAt:   time.Now(),
+			UpdatedAt:   time.Now(),
+		}
+	} else {
+		if current.Type == session.TypeCommand {
+			return errors.New("slash commands are not supported for command sessions")
+		}
+		if currentAgent := strings.TrimSpace(session.InferAgentFromSession(current)); currentAgent != "" && currentAgent != agentName {
+			return errors.New("slash command agent does not match session agent")
+		}
 	}
 	if err := s.validateAgentModel(agentName, in.Model); err != nil {
 		return err
@@ -2063,7 +2077,15 @@ func (s *Service) RunTransientSlashCommand(ctx context.Context, in RunTransientS
 		}
 	})
 
-	err = sess.SendMessage(turnCtx, "/"+command)
+	if command == "login" {
+		loginSess, ok := sess.(codexDeviceCodeLoginSession)
+		if !ok {
+			return errors.New("codex login is not supported by this runtime")
+		}
+		err = loginSess.LoginChatGPTDeviceCode(turnCtx)
+	} else {
+		err = sess.SendMessage(turnCtx, "/"+command)
+	}
 	if err != nil && !isCanceledTurnError(err) {
 		if prober := s.Registry.GetProber(); prober != nil {
 			prober.ReportRuntimeFailure(agentName, err)
@@ -3376,7 +3398,24 @@ func (s *Service) CancelSessionTurn(ctx context.Context, in CancelSessionTurnInp
 	if err != nil {
 		return err
 	}
-	current, err := manager.Get(ctx, in.Key, 0)
+	key := strings.TrimSpace(in.Key)
+	if key == "" {
+		return errors.New("session key required")
+	}
+	if strings.HasPrefix(key, "transient-") {
+		active := getActiveTurn(in.RootID, key)
+		if active == nil {
+			return nil
+		}
+		active.cancel()
+		if active.session != nil {
+			if err := active.session.CancelCurrentTurn(); err != nil {
+				log.Printf("[session] turn.cancel.error root=%s session=%s err=%v", in.RootID, key, err)
+			}
+		}
+		return nil
+	}
+	current, err := manager.Get(ctx, key, 0)
 	if err != nil {
 		return err
 	}

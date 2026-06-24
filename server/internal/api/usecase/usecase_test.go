@@ -915,6 +915,19 @@ func TestCommandCandidatesFromStatus(t *testing.T) {
 	}
 }
 
+func TestCodexSlashCandidatesIncludeTransientCommands(t *testing.T) {
+	provider := NewSlashCommandCandidateProvider(func(agentName string) (agent.Status, bool) {
+		return agent.Status{Name: agentName}, true
+	})
+	items, err := provider.Search(context.Background(), rootfs.RootInfo{}, "codex", "lo")
+	if err != nil {
+		t.Fatalf("Search returned error: %v", err)
+	}
+	if len(items) != 1 || items[0].Name != "login" {
+		t.Fatalf("items = %#v, want login", items)
+	}
+}
+
 func TestMergeCandidateItemsPreferSlash(t *testing.T) {
 	items := mergeCandidateItemsPreferSlash([]CandidateItem{
 		{Type: CandidateTypeSlashCommand, Name: "review", Description: "Slash review"},
@@ -1407,6 +1420,32 @@ func (s *fakeUsecaseAgentSession) Close() error {
 func (s *fakeUsecaseAgentSession) emit(event agenttypes.Event) {
 	if s.onUpdate != nil {
 		s.onUpdate(event)
+	}
+}
+
+func TestCancelSessionTurnCancelsTransientActiveTurn(t *testing.T) {
+	rootDir := t.TempDir()
+	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
+	manager := session.NewManager(root)
+	service := Service{Registry: &commandTestRegistry{root: root, manager: manager}}
+	sessionKey := "transient-login-test"
+	turnCtx, cancel := context.WithCancel(context.Background())
+	fakeSession := &fakeUsecaseAgentSession{}
+	registerActiveTurn(root.ID, sessionKey, cancel)
+	setActiveTurnSession(root.ID, sessionKey, fakeSession)
+	defer unregisterActiveTurn(root.ID, sessionKey)
+
+	if err := service.CancelSessionTurn(context.Background(), CancelSessionTurnInput{
+		RootID: root.ID,
+		Key:    sessionKey,
+	}); err != nil {
+		t.Fatalf("CancelSessionTurn returned error: %v", err)
+	}
+	if turnCtx.Err() == nil {
+		t.Fatal("expected transient turn context to be canceled")
+	}
+	if fakeSession.cancelCalls != 1 {
+		t.Fatalf("CancelCurrentTurn calls = %d, want 1", fakeSession.cancelCalls)
 	}
 }
 

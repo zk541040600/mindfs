@@ -72,6 +72,7 @@ import {
   type PluginInput,
 } from "./plugins/manager";
 import { appPath, appURL, isRelayNodePage } from "./services/base";
+import { copyText } from "./services/clipboard";
 import { triggerUpdate, type UpdateState } from "./services/update";
 import {
   cancelScheduledWebViewCacheClear,
@@ -192,6 +193,16 @@ type SlashCommandResult = {
   content: string;
   status: "running" | "complete" | "failed";
   error?: string;
+  createdAt?: number;
+  loginNotice?: {
+    status?: string;
+    loginId?: string;
+    verificationUrl?: string;
+    userCode?: string;
+    error?: string;
+    authMode?: string;
+    planType?: string;
+  };
 };
 
 function latestExchangeText(
@@ -1152,6 +1163,10 @@ export function App({ onGoHome }: AppProps) {
   const [slashCommandResults, setSlashCommandResults] = useState<
     Record<string, SlashCommandResult>
   >({});
+  const [copiedSlashCommandKeys, setCopiedSlashCommandKeys] = useState<
+    Record<string, true>
+  >({});
+  const slashCopyResetTimersRef = useRef<Record<string, number>>({});
   const [queueVersion, setQueueVersion] = useState(0);
   const [interactionMode, setInteractionMode] = useState<"main" | "drawer">(
     "main",
@@ -1178,6 +1193,15 @@ export function App({ onGoHome }: AppProps) {
       // Ignore storage failures; the setting can still apply for this session.
     }
   }, [mobileEnterKeySends]);
+
+  useEffect(() => {
+    return () => {
+      Object.values(slashCopyResetTimersRef.current).forEach((timer) =>
+        window.clearTimeout(timer),
+      );
+      slashCopyResetTimersRef.current = {};
+    };
+  }, []);
 
   useEffect(() => {
     try {
@@ -4442,7 +4466,14 @@ export function App({ onGoHome }: AppProps) {
       const messageRequestsPlanMode =
         message.trim().toLowerCase() === "/plan" ||
         message.trim().toLowerCase().startsWith("/plan ");
-      const messageRequestsStatus = message.trim().toLowerCase() === "/status";
+      const normalizedMessage = message.trim().toLowerCase();
+      const messageRequestsStatus = normalizedMessage === "/status";
+      const messageRequestsLogin = normalizedMessage === "/login";
+      const transientSlashCommand = messageRequestsStatus
+        ? "status"
+        : messageRequestsLogin
+          ? "login"
+          : "";
       const isQueueSend =
         !!sendSessionKey &&
         !!session &&
@@ -4508,50 +4539,63 @@ export function App({ onGoHome }: AppProps) {
           } as Session);
         }
       } else {
-        if (messageRequestsStatus) {
-          reportError(
-            "session.slash_command_failed",
-            "/status 需要在已有 codex 会话中运行",
-          );
-          return;
+        if (transientSlashCommand) {
+          sendSessionKey = `transient-${Date.now()}`;
+          session = null;
+        } else {
+          sendSessionKey = undefined;
+          const tempKey = `pending-${Date.now()}`;
+          session = {
+            key: tempKey,
+            type: mode,
+            agent,
+            model: effectiveModel,
+            mode: effectiveAgentMode,
+            effort: effectiveEffort,
+            fast_service: effectiveFastService,
+            shell: effectiveShell,
+            plan_mode: pendingPlanMode || messageRequestsPlanMode,
+            name: "新会话",
+            pending: true,
+          } as any;
+          setBoundSessionForRoot(activeRoot, tempKey);
         }
-        sendSessionKey = undefined;
-        const tempKey = `pending-${Date.now()}`;
-        session = {
-          key: tempKey,
-          type: mode,
-          agent,
-          model: effectiveModel,
-          mode: effectiveAgentMode,
-          effort: effectiveEffort,
-          fast_service: effectiveFastService,
-          shell: effectiveShell,
-          plan_mode: pendingPlanMode || messageRequestsPlanMode,
-          name: "新会话",
-          pending: true,
-        } as any;
-        setBoundSessionForRoot(activeRoot, tempKey);
       }
-      if (messageRequestsStatus) {
-        if (!sendSessionKey || !session) {
-          reportError(
-            "session.slash_command_failed",
-            "/status 需要在已有 codex 会话中运行",
-          );
-          return;
-        }
+      if (transientSlashCommand) {
+        if (!sendSessionKey) return;
         if (effectiveAgent !== "codex") {
           reportError(
             "session.slash_command_failed",
-            "/status 目前只支持 codex 会话",
+            `/${transientSlashCommand} 目前只支持 codex`,
           );
           return;
         }
 	        const requestId = sessionService.createRequestId("slash");
 	        const targetSessionKey = sendSessionKey;
 	        const resultKey = rootSessionKey(activeRoot, targetSessionKey);
-	        setSelectedPendingByKey(targetSessionKey, false);
-	        setMultiProjectSessionPending(activeRoot, targetSessionKey, false);
+        const runningTransientLoginKeys = Array.from(
+          new Set(
+            Object.values(slashCommandResults)
+              .filter(
+                (value) =>
+                  value.rootId === activeRoot &&
+                  value.command === "login" &&
+                  value.status === "running",
+              )
+              .map((value) => value.sessionKey),
+          ),
+        );
+        if (runningTransientLoginKeys.length > 0) {
+          await Promise.all(
+            runningTransientLoginKeys.map((sessionKey) =>
+              sessionService.cancelMessage(activeRoot, sessionKey),
+            ),
+          );
+        }
+	        if (session) {
+	          setSelectedPendingByKey(targetSessionKey, false);
+	          setMultiProjectSessionPending(activeRoot, targetSessionKey, false);
+	        }
 	        setSessions((prev) =>
 	          prev.map((item) => {
 	            const itemKey = item.key || item.session_key;
@@ -4568,21 +4612,31 @@ export function App({ onGoHome }: AppProps) {
 	            pending: false,
 	          } as Session);
 	        }
-	        setSlashCommandResults((prev) => ({
-	          ...prev,
-	          [resultKey]: {
+	        setSlashCommandResults((prev) => {
+          const next = { ...prev };
+          for (const [key, value] of Object.entries(prev)) {
+            if (
+              value.rootId === activeRoot &&
+              value.sessionKey.startsWith("transient-")
+            ) {
+              delete next[key];
+            }
+          }
+          next[resultKey] = {
             rootId: activeRoot,
             sessionKey: targetSessionKey,
             requestId,
-            command: "status",
+            command: transientSlashCommand,
             content: "",
             status: "running",
-          },
-        }));
+            createdAt: Date.now(),
+          };
+          return next;
+        });
         const sent = await sessionService.runSlashCommand(
           activeRoot,
           targetSessionKey,
-          "status",
+          transientSlashCommand,
           effectiveAgent,
           effectiveModel || undefined,
           effectiveAgentMode || undefined,
@@ -4597,10 +4651,11 @@ export function App({ onGoHome }: AppProps) {
               rootId: activeRoot,
               sessionKey: targetSessionKey,
               requestId,
-              command: "status",
+              command: transientSlashCommand,
               content: "",
               status: "failed",
               error: "连接未就绪，请稍后重试",
+              createdAt: Date.now(),
             },
           }));
           reportError(
@@ -4613,6 +4668,36 @@ export function App({ onGoHome }: AppProps) {
       if (sendSessionKey) {
         clearSlashCommandResultForSession(activeRoot, sendSessionKey);
       }
+      const runningTransientLoginKeys = Array.from(
+        new Set(
+          Object.values(slashCommandResults)
+            .filter(
+              (value) =>
+                value.rootId === activeRoot &&
+                value.command === "login" &&
+                value.status === "running",
+            )
+            .map((value) => value.sessionKey),
+        ),
+      );
+      if (runningTransientLoginKeys.length > 0) {
+        await Promise.all(
+          runningTransientLoginKeys.map((sessionKey) =>
+            sessionService.cancelMessage(activeRoot, sessionKey),
+          ),
+        );
+      }
+      setSlashCommandResults((prev) => {
+        let changed = false;
+        const next = { ...prev };
+        for (const [key, value] of Object.entries(prev)) {
+          if (value.rootId === activeRoot && value.sessionKey.startsWith("transient-")) {
+            delete next[key];
+            changed = true;
+          }
+        }
+        return changed ? next : prev;
+      });
       const now = new Date().toISOString();
       const requestId = sessionService.createRequestId("msg");
       const tempKey = sendSessionKey ? "" : session?.key || "";
@@ -4848,6 +4933,7 @@ export function App({ onGoHome }: AppProps) {
       setSelectedPendingByKey,
       bumpCacheVersion,
       clearSlashCommandResultForSession,
+      slashCommandResults,
       setBoundSessionForRoot,
       setDrawerOpenForRoot,
       setDrawerSessionForRoot,
@@ -7210,6 +7296,16 @@ export function App({ onGoHome }: AppProps) {
         }
         setSlashCommandResults((prev) => {
           const current = prev[resultKey];
+          if (!current && sessionKey.startsWith("transient-")) {
+            return prev;
+          }
+          if (
+            current?.requestId &&
+            requestId &&
+            current.requestId !== requestId
+          ) {
+            return prev;
+          }
           return {
             ...prev,
             [resultKey]: {
@@ -7224,6 +7320,69 @@ export function App({ onGoHome }: AppProps) {
         });
         return;
       }
+      if (event.type === "login_notice") {
+        const notice = event.data || {};
+        const noticeStatus = typeof notice.status === "string" ? notice.status : "";
+        const failed = noticeStatus === "error";
+        const complete = noticeStatus === "success";
+        setSlashCommandResults((prev) => {
+          const current = prev[resultKey];
+          if (!current && sessionKey.startsWith("transient-")) {
+            return prev;
+          }
+          if (
+            current?.requestId &&
+            requestId &&
+            current.requestId !== requestId
+          ) {
+            return prev;
+          }
+          return {
+            ...prev,
+            [resultKey]: {
+              rootId: rootID,
+              sessionKey,
+              requestId: current?.requestId || requestId,
+              command: current?.command || command || "login",
+              content: current?.content || "",
+              status: failed ? "failed" : complete ? "complete" : "running",
+              error:
+                failed && typeof notice.error === "string"
+                  ? notice.error
+                  : current?.error,
+              createdAt: current?.createdAt || Date.now(),
+              loginNotice: {
+                ...current?.loginNotice,
+                status: noticeStatus,
+                loginId: typeof notice.loginId === "string" ? notice.loginId : current?.loginNotice?.loginId,
+                verificationUrl:
+                  typeof notice.verificationUrl === "string"
+                    ? notice.verificationUrl
+                    : current?.loginNotice?.verificationUrl,
+                userCode:
+                  typeof notice.userCode === "string"
+                    ? notice.userCode
+                    : current?.loginNotice?.userCode,
+                error: typeof notice.error === "string" ? notice.error : current?.loginNotice?.error,
+                authMode:
+                  typeof notice.authMode === "string"
+                    ? notice.authMode
+                    : current?.loginNotice?.authMode,
+                planType:
+                  typeof notice.planType === "string"
+                    ? notice.planType
+                    : current?.loginNotice?.planType,
+              },
+            },
+          };
+        });
+        if (failed) {
+          reportError("session.slash_command_failed", notice.error || "登录失败", {
+            details: { rootId: rootID, sessionKey, command },
+          });
+        }
+        return;
+      }
       if (event.type === "error") {
         const message =
           typeof event.data?.message === "string"
@@ -7231,6 +7390,16 @@ export function App({ onGoHome }: AppProps) {
             : "命令执行失败";
         setSlashCommandResults((prev) => {
           const current = prev[resultKey];
+          if (!current && sessionKey.startsWith("transient-")) {
+            return prev;
+          }
+          if (
+            current?.requestId &&
+            requestId &&
+            current.requestId !== requestId
+          ) {
+            return prev;
+          }
           return {
             ...prev,
             [resultKey]: {
@@ -7263,6 +7432,19 @@ export function App({ onGoHome }: AppProps) {
       setSlashCommandResults((prev) => {
         const current = prev[resultKey];
         if (!current || current.status === "failed") {
+          return prev;
+        }
+        const requestId =
+          typeof payload?.request_id === "string"
+            ? payload.request_id
+            : typeof payload?.id === "string"
+              ? payload.id
+              : "";
+        if (
+          current.requestId &&
+          requestId &&
+          current.requestId !== requestId
+        ) {
           return prev;
         }
         return {
@@ -8717,11 +8899,195 @@ export function App({ onGoHome }: AppProps) {
   ) => {
     const sessionKey = session?.key || session?.session_key || "";
     const resolvedRoot = rootID || "";
-    if (!resolvedRoot || !sessionKey) {
+    if (!resolvedRoot) {
       return null;
+    }
+    if (!sessionKey) {
+      let best: SlashCommandResult | null = null;
+      for (const value of Object.values(slashCommandResults)) {
+        if (value.rootId !== resolvedRoot || !value.sessionKey.startsWith("transient-")) {
+          continue;
+        }
+        if (!best || (value.createdAt || 0) > (best.createdAt || 0)) {
+          best = value;
+        }
+      }
+      return best;
     }
     return slashCommandResults[rootSessionKey(resolvedRoot, sessionKey)] || null;
   };
+  const renderRootSlashCommandResult = (result: SlashCommandResult | null) => {
+    if (!result || !result.sessionKey.startsWith("transient-")) {
+      return null;
+    }
+    const commandLabel = `/${result.command || "status"}`;
+    const loginNotice = result.loginNotice;
+    const isLogin = (result.command || "") === "login";
+    const fallback =
+      result.status === "running"
+        ? isLogin
+          ? "等待登录完成..."
+          : "正在获取状态..."
+        : "";
+    const content = result.error || loginNotice?.error || result.content || fallback;
+    const loginCodeCopyKey = loginNotice?.loginId
+      ? `login-code:${loginNotice.loginId}`
+      : `login-code:${result.sessionKey}`;
+    const loginCodeCopied = !!copiedSlashCommandKeys[loginCodeCopyKey];
+    return (
+      <div
+        style={{
+          width: "100%",
+          boxSizing: "border-box",
+          border: "1px solid rgba(148,163,184,0.36)",
+          background: "rgba(148,163,184,0.10)",
+          borderRadius: "8px",
+          padding: "10px 12px",
+          color: "var(--text-primary)",
+        }}
+      >
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: "8px",
+            marginBottom: content || loginNotice?.userCode ? "6px" : 0,
+            fontSize: "11px",
+            lineHeight: 1.4,
+            color: "var(--text-secondary)",
+          }}
+        >
+          <span style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" }}>
+            {commandLabel}
+          </span>
+          <span>{result.status === "running" ? "运行中" : result.status === "failed" ? "失败" : "完成"}</span>
+        </div>
+        {isLogin && loginNotice?.userCode ? (
+          <div style={{ display: "flex", flexDirection: "column", gap: "8px", fontSize: "13px", lineHeight: 1.5 }}>
+            {loginNotice.verificationUrl ? (
+              <a
+                href={loginNotice.verificationUrl}
+                target="_blank"
+                rel="noreferrer"
+                style={{ color: "var(--accent)", overflowWrap: "anywhere" }}
+              >
+                {loginNotice.verificationUrl}
+              </a>
+            ) : null}
+            <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+              <span
+                style={{
+                  fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+                  fontSize: "20px",
+                  letterSpacing: "0",
+                }}
+              >
+                {loginNotice.userCode}
+              </span>
+              <button
+                type="button"
+                onClick={() => {
+                  const userCode = loginNotice.userCode || "";
+                  if (!userCode) {
+                    reportError("clipboard.write_failed", "验证码为空，无法复制");
+                    return;
+                  }
+                  void copyText(userCode)
+                    .then(() => {
+                      setCopiedSlashCommandKeys((prev) => ({
+                        ...prev,
+                        [loginCodeCopyKey]: true,
+                      }));
+                      if (slashCopyResetTimersRef.current[loginCodeCopyKey]) {
+                        window.clearTimeout(
+                          slashCopyResetTimersRef.current[loginCodeCopyKey],
+                        );
+                      }
+                      slashCopyResetTimersRef.current[loginCodeCopyKey] =
+                        window.setTimeout(() => {
+                          setCopiedSlashCommandKeys((prev) => {
+                            const next = { ...prev };
+                            delete next[loginCodeCopyKey];
+                            return next;
+                          });
+                          delete slashCopyResetTimersRef.current[
+                            loginCodeCopyKey
+                          ];
+                        }, 1000);
+                    })
+                    .catch((err) => {
+                      reportError(
+                        "clipboard.write_failed",
+                        String((err as Error)?.message || "复制失败"),
+                      );
+                    });
+                }}
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  width: "22px",
+                  height: "22px",
+                  border: "none",
+                  background: "transparent",
+                  color: "var(--text-secondary)",
+                  borderRadius: "6px",
+                  padding: 0,
+                  cursor: "pointer",
+                }}
+                aria-label={loginCodeCopied ? "已复制验证码" : "复制验证码"}
+                title={loginCodeCopied ? "已复制" : "复制验证码"}
+              >
+                {loginCodeCopied ? (
+                  <span
+                    aria-hidden="true"
+                    style={{ fontSize: "13px", fontWeight: 800, lineHeight: 1 }}
+                  >
+                    ✓
+                  </span>
+                ) : (
+                  <svg
+                    xmlns="http://www.w3.org/2000/svg"
+                    width="14"
+                    height="14"
+                    viewBox="0 0 24 24"
+                    aria-hidden="true"
+                  >
+                    <path
+                      fill="currentColor"
+                      d="M20 2H10c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h10c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2m0 12H10V4h10z"
+                    />
+                    <path
+                      fill="currentColor"
+                      d="M14 20H4V10h2V8H4c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h10c1.1 0 2-.9 2-2v-2h-2z"
+                    />
+                  </svg>
+                )}
+              </button>
+            </div>
+            {result.status === "complete" ? (
+              <div style={{ color: "var(--text-secondary)" }}>
+                登录完成{loginNotice.planType ? ` · ${loginNotice.planType}` : ""}
+              </div>
+            ) : null}
+          </div>
+        ) : content ? (
+          <div
+            style={{
+              fontSize: "13px",
+              lineHeight: "1.6",
+              whiteSpace: "pre-wrap",
+              overflowWrap: "anywhere",
+            }}
+          >
+            {content}
+          </div>
+        ) : null}
+      </div>
+    );
+  };
+  const currentRootSlashCommandResult = slashCommandResultForSession(currentRootId, null);
   const sessionView = (
     <SessionViewer
       session={selectedSessionSnapshot}
@@ -9799,32 +10165,53 @@ export function App({ onGoHome }: AppProps) {
           </div>
         }
         footer={
-          <ActionBar
-            status={status}
-            agentsVersion={agentsVersion}
-            currentRootId={currentRootId}
-            currentSession={actionBarSession}
-            pendingPlanMode={pendingPlanMode}
-            attachedFileContext={attachedFileContext}
-            canOpenSessionDrawer={canOpenSessionDrawer}
-            sessionDrawerOpen={isDrawerOpen}
-            detachedBoundSession={detachedBoundSession}
-            editDraftRequest={editDraftRequest}
-	            queuedMessages={actionBarQueuedMessages}
-	            onSendMessage={handleSendMessage}
-	            onSetPlanMode={handleSetPlanMode}
-	            onCancelCurrentTurn={handleCancelCurrentTurn}
-            onRemoveQueuedMessage={handleRemoveQueuedMessage}
-            onUpdateQueuedMessage={handleUpdateQueuedMessage}
-            onSendQueuedMessageNow={handleSendQueuedMessageNow}
-            mobileEnterKeySends={mobileEnterKeySends}
-            onNewSession={handleNewSession}
-            onRequestFileContext={handleRequestFileContext}
-            onClearFileContext={handleClearFileContext}
-            onToggleLeftSidebar={() => setIsLeftOpen((v) => !v)}
-            onToggleRightSidebar={() => setIsRightOpen((v) => !v)}
-            sidebarsSwapped={sidebarsSwapped}
-            onSessionClick={() => {
+          <div
+            style={{
+              width: "100%",
+              minWidth: 0,
+              display: "flex",
+              flexDirection: "column",
+              alignItems: "stretch",
+              background: "var(--content-bg)",
+            }}
+          >
+            {currentRootSlashCommandResult ? (
+              <div
+                style={{
+                  width: "100%",
+                  boxSizing: "border-box",
+                  padding: isMobile ? "0 0 6px" : "0 16px 8px",
+                }}
+              >
+                {renderRootSlashCommandResult(currentRootSlashCommandResult)}
+              </div>
+            ) : null}
+            <ActionBar
+              status={status}
+              agentsVersion={agentsVersion}
+              currentRootId={currentRootId}
+              currentSession={actionBarSession}
+              pendingPlanMode={pendingPlanMode}
+              attachedFileContext={attachedFileContext}
+              canOpenSessionDrawer={canOpenSessionDrawer}
+              sessionDrawerOpen={isDrawerOpen}
+              detachedBoundSession={detachedBoundSession}
+              editDraftRequest={editDraftRequest}
+	              queuedMessages={actionBarQueuedMessages}
+	              onSendMessage={handleSendMessage}
+	              onSetPlanMode={handleSetPlanMode}
+	              onCancelCurrentTurn={handleCancelCurrentTurn}
+              onRemoveQueuedMessage={handleRemoveQueuedMessage}
+              onUpdateQueuedMessage={handleUpdateQueuedMessage}
+              onSendQueuedMessageNow={handleSendQueuedMessageNow}
+              mobileEnterKeySends={mobileEnterKeySends}
+              onNewSession={handleNewSession}
+              onRequestFileContext={handleRequestFileContext}
+              onClearFileContext={handleClearFileContext}
+              onToggleLeftSidebar={() => setIsLeftOpen((v) => !v)}
+              onToggleRightSidebar={() => setIsRightOpen((v) => !v)}
+              sidebarsSwapped={sidebarsSwapped}
+              onSessionClick={() => {
               const rootID = currentRootIdRef.current;
               if (!activeBoundSessionKey) return;
               const selectedKey =
@@ -9843,8 +10230,9 @@ export function App({ onGoHome }: AppProps) {
               }
               setInteractionMode("drawer");
               setDrawerOpenForRoot(rootID, true);
-            }}
-          />
+              }}
+            />
+          </div>
         }
         drawer={
           <BottomSheet

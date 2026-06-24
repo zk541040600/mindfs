@@ -228,6 +228,46 @@ func (s *session) SendMessage(ctx context.Context, content string) error {
 	return nil
 }
 
+func (s *session) LoginChatGPTDeviceCode(ctx context.Context) error {
+	if s == nil || s.client == nil {
+		return errors.New("codex session not initialized")
+	}
+	turnCtx, turnID := s.turn.Begin(ctx)
+	defer s.turn.End(turnID)
+	events, err := s.client.LoginChatGPTDeviceCode(turnCtx)
+	if err != nil {
+		return err
+	}
+	for event := range events {
+		notice := types.LoginNotice{
+			Status:          strings.TrimSpace(event.Status),
+			LoginID:         strings.TrimSpace(event.LoginID),
+			VerificationURL: strings.TrimSpace(event.VerificationURL),
+			UserCode:        strings.TrimSpace(event.UserCode),
+			Error:           strings.TrimSpace(event.Error),
+		}
+		if event.AccountUpdated != nil {
+			if event.AccountUpdated.AuthMode != nil {
+				notice.AuthMode = strings.TrimSpace(*event.AccountUpdated.AuthMode)
+			}
+			if event.AccountUpdated.PlanType != nil {
+				notice.PlanType = strings.TrimSpace(string(*event.AccountUpdated.PlanType))
+			}
+		}
+		if notice.Status == "" {
+			notice.Status = "running"
+		}
+		if notice.Status == "error" && notice.Error == "" {
+			notice.Error = "login failed"
+		}
+		s.emit(types.Event{Type: types.EventTypeLogin, SessionID: s.SessionID(), Data: notice})
+		if notice.Status == "error" {
+			return errors.New(notice.Error)
+		}
+	}
+	return nil
+}
+
 func (s *session) SubscribeThreadEvents(ctx context.Context) error {
 	if s == nil || s.client == nil {
 		return errors.New("codex session not initialized")

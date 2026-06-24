@@ -232,6 +232,7 @@ const (
 	EventTypeTodoUpdate   EventType = "todo_update"
 	EventTypePlanUpdate   EventType = "plan_update"
 	EventTypeCompact      EventType = "compact_notice"
+	EventTypeLogin        EventType = "login_notice"
 	EventTypeMessageDone  EventType = "message_done"
 	EventTypeRecovery     EventType = "recovery"
 )
@@ -292,6 +293,16 @@ type CompactNotice struct {
 	ID      string `json:"id,omitempty"`
 	Status  string `json:"status,omitempty"`
 	Summary string `json:"summary,omitempty"`
+}
+
+type LoginNotice struct {
+	Status          string `json:"status"`
+	LoginID         string `json:"loginId,omitempty"`
+	VerificationURL string `json:"verificationUrl,omitempty"`
+	UserCode        string `json:"userCode,omitempty"`
+	Error           string `json:"error,omitempty"`
+	AuthMode        string `json:"authMode,omitempty"`
+	PlanType        string `json:"planType,omitempty"`
 }
 
 type AskUserQuestionOption struct {

@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -662,12 +663,19 @@ func (h *WSHandler) handleSessionSlashCommandRun(ctx context.Context, conn *webs
 	fastService := normalizeFastServiceValue(getString(req.Payload, "fast_service"))
 	command := strings.TrimSpace(getString(req.Payload, "command"))
 	normalizedCommand := strings.TrimPrefix(strings.ToLower(command), "/")
-	if rootID == "" || key == "" || agentName == "" || normalizedCommand == "" {
-		h.sendWSError(conn, clientID, req.ID, "invalid_request", "root_id, session_key, agent and command required")
+	if rootID == "" || agentName == "" || normalizedCommand == "" {
+		h.sendWSError(conn, clientID, req.ID, "invalid_request", "root_id, agent and command required")
 		return
 	}
-	if agentName != "codex" || normalizedCommand != "status" {
-		h.sendWSError(conn, clientID, req.ID, "unsupported_slash_command", "only codex /status is supported")
+	if key == "" {
+		if requestID != "" {
+			key = "transient-" + requestID
+		} else {
+			key = "transient-" + normalizedCommand + "-" + strconv.FormatInt(time.Now().UnixNano(), 10)
+		}
+	}
+	if agentName != "codex" || (normalizedCommand != "status" && normalizedCommand != "login") {
+		h.sendWSError(conn, clientID, req.ID, "unsupported_slash_command", "only codex /status and /login are supported")
 		return
 	}
 	if requestID != "" {
@@ -1112,6 +1120,10 @@ func updateToEvent(update agenttypes.Event) *StreamEvent {
 	case agenttypes.EventTypeCompact:
 		if compact, ok := update.Data.(agenttypes.CompactNotice); ok {
 			return &StreamEvent{Type: "compact_notice", Data: compact}
+		}
+	case agenttypes.EventTypeLogin:
+		if login, ok := update.Data.(agenttypes.LoginNotice); ok {
+			return &StreamEvent{Type: "login_notice", Data: login}
 		}
 	case agenttypes.EventTypeMessageDone:
 		if done, ok := update.Data.(agenttypes.MessageDone); ok {

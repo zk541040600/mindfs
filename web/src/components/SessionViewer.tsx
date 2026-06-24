@@ -56,6 +56,15 @@ type SessionViewerProps = {
     content: string;
     status: "running" | "complete" | "failed";
     error?: string;
+    loginNotice?: {
+      status?: string;
+      loginId?: string;
+      verificationUrl?: string;
+      userCode?: string;
+      error?: string;
+      authMode?: string;
+      planType?: string;
+    };
   } | null;
   rootId?: string | null;
   rootPath?: string | null;
@@ -1836,10 +1845,21 @@ if (useInnerScrollContainer && !container) {
       return null;
     }
     const commandLabel = `/${slashCommandResult.command || "status"}`;
+    const loginNotice = slashCommandResult.loginNotice;
+    const isLogin = (slashCommandResult.command || "") === "login";
     const content =
       slashCommandResult.error ||
+      loginNotice?.error ||
       slashCommandResult.content ||
-      (slashCommandResult.status === "running" ? "正在获取状态..." : "");
+      (slashCommandResult.status === "running"
+        ? isLogin
+          ? "等待登录完成..."
+          : "正在获取状态..."
+        : "");
+    const loginCodeCopyKey = loginNotice?.loginId
+      ? `login-code:${loginNotice.loginId}`
+      : `login-code:${slashCommandResult.sessionKey}`;
+    const loginCodeCopied = !!copiedMessageKeys[loginCodeCopyKey];
     return (
       <div
         style={{
@@ -1876,7 +1896,131 @@ if (useInnerScrollContainer && !container) {
                 : "完成"}
           </span>
         </div>
-        {content ? (
+        {isLogin && loginNotice?.userCode ? (
+          <div
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              gap: "8px",
+              fontSize: "13px",
+              lineHeight: 1.5,
+            }}
+          >
+            {loginNotice.verificationUrl ? (
+              <a
+                href={loginNotice.verificationUrl}
+                target="_blank"
+                rel="noreferrer"
+                style={{ color: "var(--accent)", overflowWrap: "anywhere" }}
+              >
+                {loginNotice.verificationUrl}
+              </a>
+            ) : null}
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: "8px",
+                flexWrap: "wrap",
+              }}
+            >
+              <span
+                style={{
+                  fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+                  fontSize: "20px",
+                  letterSpacing: "0",
+                  color: "var(--text-primary)",
+                }}
+              >
+                {loginNotice.userCode}
+              </span>
+              <button
+                type="button"
+                onClick={() => {
+                  const userCode = loginNotice.userCode || "";
+                  if (!userCode) {
+                    reportError("clipboard.write_failed", "验证码为空，无法复制");
+                    return;
+                  }
+                  void copyText(userCode)
+                    .then(() => {
+                      setCopiedMessageKeys((prev) => ({
+                        ...prev,
+                        [loginCodeCopyKey]: true,
+                      }));
+                      if (copyResetTimersRef.current[loginCodeCopyKey]) {
+                        window.clearTimeout(
+                          copyResetTimersRef.current[loginCodeCopyKey],
+                        );
+                      }
+                      copyResetTimersRef.current[loginCodeCopyKey] =
+                        window.setTimeout(() => {
+                          setCopiedMessageKeys((prev) => {
+                            const next = { ...prev };
+                            delete next[loginCodeCopyKey];
+                            return next;
+                          });
+                          delete copyResetTimersRef.current[loginCodeCopyKey];
+                        }, 1000);
+                    })
+                    .catch((err) => {
+                      reportError(
+                        "clipboard.write_failed",
+                        String((err as Error)?.message || "复制失败"),
+                      );
+                    });
+                }}
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  width: "22px",
+                  height: "22px",
+                  border: "none",
+                  background: "transparent",
+                  color: "var(--text-secondary)",
+                  borderRadius: "6px",
+                  padding: 0,
+                  cursor: "pointer",
+                }}
+                aria-label={loginCodeCopied ? "已复制验证码" : "复制验证码"}
+                title={loginCodeCopied ? "已复制" : "复制验证码"}
+              >
+                {loginCodeCopied ? (
+                  <span
+                    aria-hidden="true"
+                    style={{ fontSize: "13px", fontWeight: 800, lineHeight: 1 }}
+                  >
+                    ✓
+                  </span>
+                ) : (
+                  <svg
+                    xmlns="http://www.w3.org/2000/svg"
+                    width="14"
+                    height="14"
+                    viewBox="0 0 24 24"
+                    aria-hidden="true"
+                  >
+                    <path
+                      fill="currentColor"
+                      d="M20 2H10c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h10c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2m0 12H10V4h10z"
+                    />
+                    <path
+                      fill="currentColor"
+                      d="M14 20H4V10h2V8H4c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h10c1.1 0 2-.9 2-2v-2h-2z"
+                    />
+                  </svg>
+                )}
+              </button>
+            </div>
+            {slashCommandResult.status === "complete" ? (
+              <div style={{ color: "var(--text-secondary)" }}>
+                登录完成
+                {loginNotice.planType ? ` · ${loginNotice.planType}` : ""}
+              </div>
+            ) : null}
+          </div>
+        ) : content ? (
           <div
             style={{
               fontSize: "13px",

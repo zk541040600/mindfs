@@ -352,12 +352,25 @@ func (p *SlashCommandCandidateProvider) Search(ctx context.Context, _ rootfs.Roo
 	}
 	query = strings.TrimSpace(strings.ToLower(query))
 	items := make([]CandidateItem, 0, 1)
-	if matchesCandidateName("plan", query) {
+	appendSlash := func(name, description string) {
+		if !matchesCandidateName(name, query) {
+			return
+		}
+		for _, item := range items {
+			if item.Name == name {
+				return
+			}
+		}
 		items = append(items, CandidateItem{
 			Type:        CandidateTypeSlashCommand,
-			Name:        "plan",
-			Description: "open Plan mode",
+			Name:        name,
+			Description: description,
 		})
+	}
+	appendSlash("plan", "open Plan mode")
+	if strings.TrimSpace(agentName) == "codex" {
+		appendSlash("status", "show Codex status")
+		appendSlash("login", "sign in to ChatGPT")
 	}
 	status, ok := p.getStatus(strings.TrimSpace(agentName))
 	if !ok || len(status.Commands) == 0 {
