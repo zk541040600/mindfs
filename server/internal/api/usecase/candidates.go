@@ -44,7 +44,7 @@ type SearchCandidatesOutput struct {
 	Items []CandidateItem
 }
 
-const maxCandidateItems = 20
+const maxCandidateItems = 10
 
 type CandidateProvider interface {
 	Type() CandidateType
