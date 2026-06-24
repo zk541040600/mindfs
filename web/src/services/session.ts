@@ -233,6 +233,22 @@ type SessionServiceEvent = {
 type FetchSessionsOptions = {
   beforeTime?: string;
   afterTime?: string;
+  limit?: number;
+  topLevel?: boolean;
+  includeChildren?: boolean;
+};
+
+export type SessionListPayload = {
+  items: Session[];
+  totalCount: number;
+};
+
+export type MultiRootSessionGroup = {
+  rootId: string;
+  rootName: string;
+  latestSessionTime: string;
+  items: Session[];
+  totalCount: number;
 };
 
 export type FetchExternalSessionsOptions = {
@@ -956,7 +972,7 @@ class SessionService {
   async fetchSessions(
     rootId: string,
     options?: FetchSessionsOptions,
-  ): Promise<Session[]> {
+  ): Promise<SessionListPayload> {
     try {
       const params = new URLSearchParams({ root: rootId });
       if (options?.beforeTime) {
@@ -965,10 +981,45 @@ class SessionService {
       if (options?.afterTime) {
         params.set("after_time", options.afterTime);
       }
-      const data = await protectedJSON<any[]>(appURL("/api/sessions", params));
-      return Array.isArray(data) ? data : [];
+      if (typeof options?.limit === "number" && options.limit > 0) {
+        params.set("limit", String(options.limit));
+      }
+      if (options?.topLevel) {
+        params.set("top_level", "1");
+      }
+      if (options?.includeChildren) {
+        params.set("include_children", "1");
+      }
+      const data = await protectedJSON<any>(appURL("/api/sessions", params));
+      if (Array.isArray(data)) {
+        return { items: data, totalCount: data.length };
+      }
+      const items = Array.isArray(data?.items) ? data.items : [];
+      const totalCount = Number(data?.total_count ?? data?.totalCount ?? items.length) || 0;
+      return { items, totalCount };
     } catch (err) {
       console.error("[Session] Failed to fetch sessions:", err);
+      return { items: [], totalCount: 0 };
+    }
+  }
+
+  async fetchMultiRootSessions(limitPerRoot = 6): Promise<MultiRootSessionGroup[]> {
+    try {
+      const params = new URLSearchParams({ multi_root: "1" });
+      if (limitPerRoot > 0) {
+        params.set("limit_per_root", String(limitPerRoot));
+      }
+      const data = await protectedJSON<any>(appURL("/api/sessions", params));
+      const groups = Array.isArray(data?.groups) ? data.groups : [];
+      return groups.map((group: any) => ({
+        rootId: String(group?.root_id || group?.rootId || ""),
+        rootName: String(group?.root_name || group?.rootName || ""),
+        latestSessionTime: String(group?.latest_session_time || group?.latestSessionTime || ""),
+        items: Array.isArray(group?.items) ? group.items : [],
+        totalCount: Number(group?.total_count ?? group?.totalCount ?? 0) || 0,
+      })).filter((group: MultiRootSessionGroup) => !!group.rootId);
+    } catch (err) {
+      console.error("[Session] Failed to fetch multi-root sessions:", err);
       return [];
     }
   }

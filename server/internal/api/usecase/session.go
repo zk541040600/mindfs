@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -34,14 +35,33 @@ type Selection struct {
 }
 
 type ListSessionsInput struct {
-	RootID     string
-	BeforeTime time.Time
-	AfterTime  time.Time
-	Limit      int
+	RootID          string
+	BeforeTime      time.Time
+	AfterTime       time.Time
+	Limit           int
+	TopLevelOnly    bool
+	IncludeChildren bool
 }
 
 type ListSessionsOutput struct {
-	Sessions []*session.Session
+	Sessions   []*session.Session
+	TotalCount int
+}
+
+type ListMultiRootSessionsInput struct {
+	LimitPerRoot int
+}
+
+type SessionRootGroup struct {
+	RootID            string
+	RootName          string
+	LatestSessionTime time.Time
+	Sessions          []*session.Session
+	TotalCount        int
+}
+
+type ListMultiRootSessionsOutput struct {
+	Groups []SessionRootGroup
 }
 
 type ListChildSessionsInput struct {
@@ -70,24 +90,82 @@ func (s *Service) ListSessions(ctx context.Context, in ListSessionsInput) (ListS
 		return ListSessionsOutput{}, err
 	}
 	items, err := manager.List(ctx, session.ListOptions{
-		BeforeTime: in.BeforeTime,
-		AfterTime:  in.AfterTime,
-		Limit:      in.Limit,
+		BeforeTime:   in.BeforeTime,
+		AfterTime:    in.AfterTime,
+		TopLevelOnly: in.TopLevelOnly,
+		Limit:        in.Limit,
 	})
 	if err != nil {
 		return ListSessionsOutput{}, err
 	}
-	for _, item := range items {
-		if item == nil || item.Type != session.TypeCommand {
-			continue
-		}
-		aux, err := manager.GetExchangeAux(ctx, item.Key, 0)
+	totalCount, err := manager.Count(ctx, session.ListOptions{
+		BeforeTime:   in.BeforeTime,
+		AfterTime:    in.AfterTime,
+		TopLevelOnly: in.TopLevelOnly,
+	})
+	if err != nil {
+		return ListSessionsOutput{}, err
+	}
+	if in.IncludeChildren {
+		items, err = appendChildSessions(ctx, manager, items)
 		if err != nil {
 			return ListSessionsOutput{}, err
 		}
-		item.Shell = session.InferCommandShellFromAux(aux)
 	}
-	return ListSessionsOutput{Sessions: items}, nil
+	if err := fillCommandShells(ctx, manager, items); err != nil {
+		return ListSessionsOutput{}, err
+	}
+	return ListSessionsOutput{Sessions: items, TotalCount: totalCount}, nil
+}
+
+func (s *Service) ListMultiRootSessions(ctx context.Context, in ListMultiRootSessionsInput) (ListMultiRootSessionsOutput, error) {
+	if err := s.ensureRegistry(); err != nil {
+		return ListMultiRootSessionsOutput{}, err
+	}
+	limit := in.LimitPerRoot
+	if limit <= 0 {
+		limit = 6
+	}
+	groups := make([]SessionRootGroup, 0)
+	for _, root := range s.Registry.ListRoots() {
+		manager, err := s.Registry.GetSessionManager(root.ID)
+		if err != nil {
+			return ListMultiRootSessionsOutput{}, err
+		}
+		totalCount, err := manager.Count(ctx, session.ListOptions{TopLevelOnly: true})
+		if err != nil {
+			return ListMultiRootSessionsOutput{}, err
+		}
+		if totalCount <= 0 {
+			continue
+		}
+		items, err := manager.List(ctx, session.ListOptions{TopLevelOnly: true, Limit: limit})
+		if err != nil {
+			return ListMultiRootSessionsOutput{}, err
+		}
+		items, err = appendChildSessions(ctx, manager, items)
+		if err != nil {
+			return ListMultiRootSessionsOutput{}, err
+		}
+		if err := fillCommandShells(ctx, manager, items); err != nil {
+			return ListMultiRootSessionsOutput{}, err
+		}
+		latest := time.Time{}
+		if len(items) > 0 && items[0] != nil {
+			latest = items[0].UpdatedAt
+		}
+		groups = append(groups, SessionRootGroup{
+			RootID:            root.ID,
+			RootName:          root.Name,
+			LatestSessionTime: latest,
+			Sessions:          items,
+			TotalCount:        totalCount,
+		})
+	}
+	sort.SliceStable(groups, func(i, j int) bool {
+		return groups[i].LatestSessionTime.After(groups[j].LatestSessionTime)
+	})
+	return ListMultiRootSessionsOutput{Groups: groups}, nil
 }
 
 func (s *Service) ListChildSessions(ctx context.Context, in ListChildSessionsInput) (ListSessionsOutput, error) {
@@ -110,17 +188,43 @@ func (s *Service) ListChildSessions(ctx context.Context, in ListChildSessionsInp
 	if err != nil {
 		return ListSessionsOutput{}, err
 	}
+	if err := fillCommandShells(ctx, manager, items); err != nil {
+		return ListSessionsOutput{}, err
+	}
+	return ListSessionsOutput{Sessions: items}, nil
+}
+
+func fillCommandShells(ctx context.Context, manager *session.Manager, items []*session.Session) error {
 	for _, item := range items {
 		if item == nil || item.Type != session.TypeCommand {
 			continue
 		}
 		aux, err := manager.GetExchangeAux(ctx, item.Key, 0)
 		if err != nil {
-			return ListSessionsOutput{}, err
+			return err
 		}
 		item.Shell = session.InferCommandShellFromAux(aux)
 	}
-	return ListSessionsOutput{Sessions: items}, nil
+	return nil
+}
+
+func appendChildSessions(ctx context.Context, manager *session.Manager, parents []*session.Session) ([]*session.Session, error) {
+	if len(parents) == 0 {
+		return parents, nil
+	}
+	out := make([]*session.Session, 0, len(parents))
+	for _, parent := range parents {
+		if parent == nil {
+			continue
+		}
+		out = append(out, parent)
+		children, err := manager.List(ctx, session.ListOptions{ParentSessionKey: parent.Key})
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, children...)
+	}
+	return out, nil
 }
 
 func (s *Service) SearchSessions(ctx context.Context, in SearchSessionsInput) (SearchSessionsOutput, error) {

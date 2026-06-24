@@ -13,6 +13,7 @@ import {
   sessionService,
   setCachedSessionRelatedFiles,
   syncSession,
+  type MultiRootSessionGroup,
   type SyncSessionResult,
   type RelatedFile,
   type Session,
@@ -88,7 +89,7 @@ import { GitHistoryPanel } from "./components/GitHistoryPanel";
 import { GitStatusPanel } from "./components/GitStatusPanel";
 import { SessionViewer } from "./components/SessionViewer";
 import { DefaultListView } from "./components/DefaultListView";
-import { SessionList } from "./components/SessionList";
+import { MultiProjectSessionList, SessionList, type ProjectSessionGroup } from "./components/SessionList";
 import { ExternalSessionList } from "./components/ExternalSessionList";
 import { AgentIcon } from "./components/AgentIcon";
 import { AgentMenuList } from "./components/AgentMenuList";
@@ -109,6 +110,13 @@ type SessionMode = "chat" | "plugin" | "command";
 type WSStatus = "connecting" | "connected" | "reconnecting" | "disconnected";
 
 const CHILD_SESSION_PAGE_SIZE = 100;
+const MULTI_PROJECT_SESSION_LIMIT = 6;
+const SESSION_PAGE_SIZE = 50;
+const MULTI_PROJECT_SESSION_STORAGE_KEY = "mindfs-multi-project-session-list";
+
+function isTopLevelSessionItem(session: SessionItem): boolean {
+  return !String(session?.parent_session_key || "").trim();
+}
 
 function normalizeFastService(
   value: unknown,
@@ -166,6 +174,14 @@ export type SessionItem = {
     };
   }>;
   pending?: boolean;
+};
+
+type MultiProjectSessionGroup = {
+  rootId: string;
+  rootName: string;
+  latestSessionTime: string;
+  sessions: SessionItem[];
+  totalCount: number;
 };
 
 function latestExchangeText(
@@ -1056,6 +1072,14 @@ export function App({ onGoHome }: AppProps) {
 
   const [sessions, setSessions] = useState<SessionItem[]>([]);
   const sessionsRef = useRef<SessionItem[]>([]);
+  const [multiProjectSessionsEnabled, setMultiProjectSessionsEnabled] = useState(() => {
+    if (typeof window === "undefined") return false;
+    return window.localStorage.getItem(MULTI_PROJECT_SESSION_STORAGE_KEY) === "1";
+  });
+  const [multiProjectSessionGroups, setMultiProjectSessionGroups] = useState<MultiProjectSessionGroup[]>([]);
+  const [multiProjectSessionsLoading, setMultiProjectSessionsLoading] = useState(false);
+  const [multiProjectPendingByKey, setMultiProjectPendingByKey] = useState<Record<string, boolean>>({});
+  const multiProjectPendingRef = useRef<Record<string, boolean>>({});
   const [sessionSearchOpen, setSessionSearchOpen] = useState(false);
   const [sessionSearchResultsMode, setSessionSearchResultsMode] = useState(false);
   const [sessionSearchQuery, setSessionSearchQuery] = useState("");
@@ -1476,6 +1500,15 @@ export function App({ onGoHome }: AppProps) {
     sessionsRef.current = sessions;
   }, [sessions]);
   useEffect(() => {
+    multiProjectPendingRef.current = multiProjectPendingByKey;
+  }, [multiProjectPendingByKey]);
+  useEffect(() => {
+    window.localStorage.setItem(
+      MULTI_PROJECT_SESSION_STORAGE_KEY,
+      multiProjectSessionsEnabled ? "1" : "0",
+    );
+  }, [multiProjectSessionsEnabled]);
+  useEffect(() => {
     sessionListModeRef.current = sessionListMode;
     if (sessionListMode !== "local") {
       setSessionSearchOpen(false);
@@ -1707,6 +1740,39 @@ export function App({ onGoHome }: AppProps) {
     [],
   );
   const bumpCacheVersion = useCallback(() => setCacheVersion((v) => v + 1), []);
+  const applyPendingToMultiProjectGroups = useCallback(
+    (groups: MultiProjectSessionGroup[], pendingByKey: Record<string, boolean>) =>
+      groups.map((group) => ({
+        ...group,
+        sessions: group.sessions.map((session) => ({
+          ...(session as any),
+          pending: !!pendingByKey[rootSessionKey(group.rootId, session.key || session.session_key)],
+        }) as SessionItem),
+      })),
+    [rootSessionKey],
+  );
+  const setMultiProjectSessionPending = useCallback(
+    (rootID: string | null | undefined, sessionKey: string | null | undefined, pending: boolean) => {
+      const resolvedRoot = String(rootID || "");
+      const resolvedKey = String(sessionKey || "");
+      if (!resolvedRoot || !resolvedKey) {
+        return;
+      }
+      const key = rootSessionKey(resolvedRoot, resolvedKey);
+      setMultiProjectPendingByKey((prev) => {
+        const next = { ...prev };
+        if (pending) {
+          next[key] = true;
+        } else {
+          delete next[key];
+        }
+        multiProjectPendingRef.current = next;
+        setMultiProjectSessionGroups((groups) => applyPendingToMultiProjectGroups(groups, next));
+        return next;
+      });
+    },
+    [applyPendingToMultiProjectGroups, rootSessionKey],
+  );
   const mergeSessionItems = useCallback(
     (current: SessionItem[], incoming: SessionItem[]) => {
       const byKey = new Map<string, SessionItem>();
@@ -1930,9 +1996,10 @@ export function App({ onGoHome }: AppProps) {
           }),
         );
       }
+      setMultiProjectSessionPending(resolvedRoot, resolvedKey, false);
       bumpCacheVersion();
     },
-    [bumpCacheVersion, rootSessionKey, setDrawerSessionForRoot],
+    [bumpCacheVersion, rootSessionKey, setDrawerSessionForRoot, setMultiProjectSessionPending],
   );
 
   const markSessionStale = useCallback(
@@ -3149,12 +3216,13 @@ export function App({ onGoHome }: AppProps) {
       },
     ) => {
       try {
-        const next = (await sessionService.fetchSessions(rootID, {
+        const payload = await sessionService.fetchSessions(rootID, {
           beforeTime: options?.beforeTime,
           afterTime: options?.afterTime,
-        })) as SessionItem[];
+        });
+        const next = payload.items as SessionItem[];
         if (!options?.force && currentRootIdRef.current !== rootID) return;
-        setHasMoreSessions(next.length >= 50);
+        setHasMoreSessions(payload.totalCount > next.length);
         if (options?.replace || (!options?.beforeTime && !options?.afterTime)) {
           setSessions(next);
           return;
@@ -3186,10 +3254,111 @@ export function App({ onGoHome }: AppProps) {
       if (currentRootIdRef.current === rootID && next.length > 0) {
         setSessions((prev) => mergeSessionItems(prev, next));
       }
+      if (next.length > 0) {
+        setMultiProjectSessionGroups((prev) =>
+          applyPendingToMultiProjectGroups(
+            prev.map((group) =>
+              group.rootId === rootID
+                ? { ...group, sessions: mergeSessionItems(group.sessions, next) }
+                : group,
+            ),
+            multiProjectPendingRef.current,
+          ),
+        );
+      }
       return { hasMore: items.length >= CHILD_SESSION_PAGE_SIZE };
     },
-    [mergeSessionItems],
+    [applyPendingToMultiProjectGroups, mergeSessionItems],
   );
+
+  const loadMultiProjectSessionGroups = useCallback(async () => {
+    if (!multiProjectSessionsEnabled) {
+      return;
+    }
+    setMultiProjectSessionsLoading(true);
+    try {
+      const groups = await sessionService.fetchMultiRootSessions(MULTI_PROJECT_SESSION_LIMIT);
+      const nextGroups = groups.map((group: MultiRootSessionGroup): MultiProjectSessionGroup => ({
+        rootId: group.rootId,
+        rootName: group.rootName || managedRootByIdRef.current[group.rootId]?.display_name || group.rootId,
+        latestSessionTime: group.latestSessionTime,
+        sessions: group.items
+          .map((item) => toSessionItem(group.rootId, { ...(item as any), root_id: group.rootId }))
+          .filter((item): item is SessionItem => !!item),
+        totalCount: group.totalCount,
+      }));
+      setMultiProjectSessionGroups(
+        applyPendingToMultiProjectGroups(nextGroups, multiProjectPendingRef.current),
+      );
+    } finally {
+      setMultiProjectSessionsLoading(false);
+    }
+  }, [applyPendingToMultiProjectGroups, multiProjectSessionsEnabled]);
+
+  const loadMoreMultiProjectSessions = useCallback(
+    async (group: ProjectSessionGroup) => {
+      const topLevelSessions = group.sessions.filter(isTopLevelSessionItem);
+      const oldest = topLevelSessions[topLevelSessions.length - 1]?.updated_at || "";
+      if (!group.rootId || !oldest) {
+        return;
+      }
+      const previousLoaded = topLevelSessions.length;
+      const payload = await sessionService.fetchSessions(group.rootId, {
+        beforeTime: oldest,
+        limit: SESSION_PAGE_SIZE,
+        topLevel: true,
+        includeChildren: true,
+      });
+      const nextItems = payload.items
+        .map((item) => toSessionItem(group.rootId, { ...(item as any), root_id: group.rootId }))
+        .filter((item): item is SessionItem => !!item);
+      setMultiProjectSessionGroups((prev) =>
+        applyPendingToMultiProjectGroups(
+          prev.map((current) => {
+            if (current.rootId !== group.rootId) {
+              return current;
+            }
+            const sessions = mergeSessionItems(current.sessions, nextItems);
+            return {
+              ...current,
+              sessions,
+              totalCount: previousLoaded + payload.totalCount,
+            };
+          }),
+          multiProjectPendingRef.current,
+        ),
+      );
+    },
+    [applyPendingToMultiProjectGroups, mergeSessionItems],
+  );
+
+  const refreshMultiProjectReplyingSessions = useCallback(async () => {
+    try {
+      const payload = await apiProtectedJSON<any>(appPath("/api/replying-sessions"));
+      const items = Array.isArray(payload?.sessions) ? payload.sessions : [];
+      const next: Record<string, boolean> = {};
+      for (const item of items) {
+        const rootID = String(item?.rootId || item?.root_id || "");
+        const sessionKey = String(item?.sessionKey || item?.session_key || "");
+        if (rootID && sessionKey) {
+          next[rootSessionKey(rootID, sessionKey)] = true;
+        }
+      }
+      multiProjectPendingRef.current = next;
+      setMultiProjectPendingByKey(next);
+      setMultiProjectSessionGroups((groups) => applyPendingToMultiProjectGroups(groups, next));
+    } catch (error) {
+      console.warn("[multi-project-sessions] replying refresh failed", error);
+    }
+  }, [applyPendingToMultiProjectGroups, rootSessionKey]);
+
+  useEffect(() => {
+    if (!multiProjectSessionsEnabled) {
+      return;
+    }
+    void refreshMultiProjectReplyingSessions();
+    void loadMultiProjectSessionGroups();
+  }, [loadMultiProjectSessionGroups, multiProjectSessionsEnabled, refreshMultiProjectReplyingSessions]);
 
   const executeSessionSearch = useCallback(() => {
     const trimmed = sessionSearchQuery.trim();
@@ -3417,6 +3586,13 @@ export function App({ onGoHome }: AppProps) {
       const targetRoot =
         (session?.root_id as string | undefined) || currentRootIdRef.current;
       if (!targetRoot || !key) return;
+      if (currentRootIdRef.current !== targetRoot) {
+        setCurrentRootId(targetRoot);
+      }
+      setSelectedDir(targetRoot);
+      setSelectedDirKey(
+        buildDirectorySelectionKey(targetRoot, targetRoot, true),
+      );
       setMainViewPreferenceForRoot(targetRoot, "session");
       const currentDrawer = drawerSessionByRootRef.current[targetRoot];
       const preservePending =
@@ -3673,6 +3849,24 @@ export function App({ onGoHome }: AppProps) {
         setDrawerSessionForRoot(rootID, null);
         setDrawerOpenForRoot(rootID, false);
       }
+      setMultiProjectSessionGroups((prev) =>
+        prev.map((group) => {
+          if (group.rootId !== rootID) {
+            return group;
+          }
+          const sessions = group.sessions.filter(
+            (item) => !deletedKeys.has(item.key || item.session_key || ""),
+          );
+          return {
+            ...group,
+            sessions,
+            totalCount: Math.max(0, group.totalCount - (group.sessions.length - sessions.length)),
+          };
+        }).filter((group) => group.totalCount > 0 || group.sessions.length > 0),
+      );
+      for (const deletedKey of deletedKeys) {
+        setMultiProjectSessionPending(rootID, deletedKey, false);
+      }
 
       const selectedKey =
         selectedSessionRef.current?.key ||
@@ -3702,6 +3896,7 @@ export function App({ onGoHome }: AppProps) {
       setBoundSessionForRoot,
       setDrawerOpenForRoot,
       setDrawerSessionForRoot,
+      setMultiProjectSessionPending,
     ],
   );
 
@@ -3770,6 +3965,24 @@ export function App({ onGoHome }: AppProps) {
           setDrawerSessionForRoot(rootID, latest);
         }
       }
+      setMultiProjectSessionGroups((prev) =>
+        prev.map((group) =>
+          group.rootId === rootID
+            ? {
+                ...group,
+                sessions: group.sessions.map((item) =>
+                  (item.key || item.session_key) === sessionKey
+                    ? ({
+                        ...item,
+                        name: renamed.name,
+                        updated_at: renamed.updated_at,
+                      } as SessionItem)
+                    : item,
+                ),
+              }
+            : group,
+        ),
+      );
 
       bumpCacheVersion();
       return true;
@@ -4081,8 +4294,9 @@ export function App({ onGoHome }: AppProps) {
       if (failedKeys.size === 0) {
         exitImportMode();
       }
-      const next = (await sessionService.fetchSessions(rootID, {})) as SessionItem[];
-      setHasMoreSessions(next.length >= 50);
+      const payload = await sessionService.fetchSessions(rootID, {});
+      const next = payload.items as SessionItem[];
+      setHasMoreSessions(payload.totalCount > next.length);
       setSessions(next);
       const firstImported = successItems[0];
       if (firstImported?.session_key) {
@@ -4275,6 +4489,7 @@ export function App({ onGoHome }: AppProps) {
       };
       if (sendSessionKey) {
         const targetSessionKey = sendSessionKey;
+        setMultiProjectSessionPending(activeRoot, targetSessionKey, true);
         setSessions((prev) =>
           prev.map((item) => {
             const itemKey = item.key || item.session_key;
@@ -4350,6 +4565,7 @@ export function App({ onGoHome }: AppProps) {
           updated_at: now,
         } as Session;
         if (tempSessionKey) {
+          setMultiProjectSessionPending(activeRoot, tempSessionKey, true);
           sessionCacheRef.current[rootSessionKey(activeRoot, tempSessionKey)] =
             draftSession;
           const draftItem = toSessionItem(activeRoot, {
@@ -4468,6 +4684,7 @@ export function App({ onGoHome }: AppProps) {
         }
       }
       if (!sent && !sendSessionKey && tempKey) {
+        setMultiProjectSessionPending(activeRoot, tempKey, false);
         setSessions((prev) =>
           prev.filter((item) => (item.key || item.session_key) !== tempKey),
         );
@@ -4493,6 +4710,7 @@ export function App({ onGoHome }: AppProps) {
       setBoundSessionForRoot,
       setDrawerOpenForRoot,
       setDrawerSessionForRoot,
+      setMultiProjectSessionPending,
       updateSessionAgentForKey,
       pendingPlanMode,
     ],
@@ -4589,8 +4807,9 @@ export function App({ onGoHome }: AppProps) {
           }),
         );
       }
+      setMultiProjectSessionPending(rootID, sessionKey, true);
     },
-    [bumpCacheVersion, rootSessionKey, setDrawerSessionForRoot, setSelectedPendingByKey],
+    [bumpCacheVersion, rootSessionKey, setDrawerSessionForRoot, setMultiProjectSessionPending, setSelectedPendingByKey],
   );
 
   const handleRemoveQueuedMessage = useCallback(
@@ -6599,6 +6818,7 @@ export function App({ onGoHome }: AppProps) {
           }),
         );
       }
+      setMultiProjectSessionPending(rootID, sessionKey, false);
       bumpCacheVersion();
     };
 
@@ -6958,6 +7178,10 @@ export function App({ onGoHome }: AppProps) {
               newest ? { afterTime: newest } : { replace: true },
             );
           }
+          if (multiProjectSessionsEnabled) {
+            void refreshMultiProjectReplyingSessions();
+            void loadMultiProjectSessionGroups();
+          }
           replayTargetsForAllRoots();
           break;
         case "ws.reconnecting":
@@ -6972,6 +7196,10 @@ export function App({ onGoHome }: AppProps) {
               currentRootIdRef.current,
               newest ? { afterTime: newest } : { replace: true },
             );
+          }
+          if (multiProjectSessionsEnabled) {
+            void refreshMultiProjectReplyingSessions();
+            void loadMultiProjectSessionGroups();
           }
           replayTargetsForAllRoots();
           break;
@@ -7049,6 +7277,9 @@ export function App({ onGoHome }: AppProps) {
               }
             }
           }
+          if (multiProjectSessionsEnabled) {
+            void loadMultiProjectSessionGroups();
+          }
           break;
         }
         case "session.created": {
@@ -7056,6 +7287,9 @@ export function App({ onGoHome }: AppProps) {
             typeof payload?.root_id === "string" ? payload.root_id : "";
           if (rootID && rootID === currentRootIdRef.current) {
             void loadSessionsForRoot(rootID, { replace: true });
+          }
+          if (rootID && multiProjectSessionsEnabled) {
+            void loadMultiProjectSessionGroups();
           }
           break;
         }
@@ -7116,6 +7350,8 @@ export function App({ onGoHome }: AppProps) {
               ...pending,
               sessionKey: acceptedSessionKey,
             };
+            setMultiProjectSessionPending(pending.rootId, pending.tempKey, false);
+            setMultiProjectSessionPending(pending.rootId, acceptedSessionKey, true);
             if (pendingDraftRef.current?.requestId === pending.requestId) {
               pendingDraftRef.current = null;
             }
@@ -7178,7 +7414,11 @@ export function App({ onGoHome }: AppProps) {
           console.warn("[session/ws] error", { requestId, rootId: pending.rootId, sessionKey: pending.sessionKey || null, tempKey: pending.tempKey || null });
           delete pendingRequestRef.current[requestId];
           const targetKey = pending.tempKey || "";
+          const failedKey = pending.sessionKey || targetKey;
           const rootID = pending.rootId;
+          if (failedKey) {
+            setMultiProjectSessionPending(rootID, failedKey, false);
+          }
           const latestDrawer = drawerSessionByRootRef.current[rootID];
           if (targetKey && latestDrawer?.key === targetKey) {
             const exchanges = Array.isArray((latestDrawer as any).exchanges)
@@ -7210,18 +7450,26 @@ export function App({ onGoHome }: AppProps) {
                 "";
           if (rootID && sessionKey) {
             playCompletionSound();
+            setMultiProjectSessionPending(rootID, sessionKey, false);
             handleSessionStreamDone(rootID, sessionKey);
             const newest = sessionsRef.current[0]?.updated_at || "";
             void loadSessionsForRoot(
               rootID,
               newest ? { afterTime: newest } : { replace: true },
             );
+            if (multiProjectSessionsEnabled) {
+              void loadMultiProjectSessionGroups();
+            }
           } else if (currentRootIdRef.current) {
             const newest = sessionsRef.current[0]?.updated_at || "";
             void loadSessionsForRoot(
               currentRootIdRef.current,
               newest ? { afterTime: newest } : { replace: true },
             );
+            if (multiProjectSessionsEnabled) {
+              void refreshMultiProjectReplyingSessions();
+              void loadMultiProjectSessionGroups();
+            }
           }
           break;
         }
@@ -7233,6 +7481,7 @@ export function App({ onGoHome }: AppProps) {
             console.info("[session/ws] user_message", { rootId: payload.root_id, sessionKey: payload.session_key });
             const rootID = payload.root_id;
             const sessionKey = payload.session_key;
+            setMultiProjectSessionPending(rootID, sessionKey, true);
             const exchange = payload.exchange;
             const sessionMeta = payload.session;
             const cacheKey = rootSessionKey(rootID, sessionKey);
@@ -7332,6 +7581,9 @@ export function App({ onGoHome }: AppProps) {
               rootID,
               newest ? { afterTime: newest } : { replace: true },
             );
+            if (multiProjectSessionsEnabled) {
+              void loadMultiProjectSessionGroups();
+            }
           }
           break;
         case "session.meta.updated":
@@ -7444,6 +7696,9 @@ export function App({ onGoHome }: AppProps) {
               rootID,
               newest ? { afterTime: newest } : { replace: true },
             );
+            if (multiProjectSessionsEnabled) {
+              void loadMultiProjectSessionGroups();
+            }
           }
           break;
         case "session.related_files.updated": {
@@ -7516,7 +7771,10 @@ export function App({ onGoHome }: AppProps) {
   }, [
     currentRootId,
     loadExternalSessions,
+    loadMultiProjectSessionGroups,
     loadSessionsForRoot,
+    multiProjectSessionsEnabled,
+    refreshMultiProjectReplyingSessions,
     rootSessionKey,
     resolveRootForSessionKey,
     promotePendingSessionForRoot,
@@ -7533,6 +7791,7 @@ export function App({ onGoHome }: AppProps) {
     setSelectedPendingByKey,
     setBoundSessionForRoot,
     setDrawerSessionForRoot,
+    setMultiProjectSessionPending,
     refreshManagedRoots,
     handleRelayWebSocketClosed,
     refreshTreeDir,
@@ -7558,10 +7817,11 @@ export function App({ onGoHome }: AppProps) {
     }
     setLoadingOlderSessions(true);
     try {
-      const next = (await sessionService.fetchSessions(rootID, {
+      const payload = await sessionService.fetchSessions(rootID, {
         beforeTime: oldest,
-      })) as SessionItem[];
-      setHasMoreSessions(next.length >= 50);
+      });
+      const next = payload.items as SessionItem[];
+      setHasMoreSessions(payload.totalCount > next.length);
       setSessions((prev) => mergeSessionItems(prev, next));
     } finally {
       setLoadingOlderSessions(false);
@@ -9034,6 +9294,32 @@ export function App({ onGoHome }: AppProps) {
           void handleLoadOlderExternalSessions();
         }}
       />
+    ) : multiProjectSessionsEnabled && !sessionSearchOpen && !sessionSearchResultsMode ? (
+      <MultiProjectSessionList
+        groups={multiProjectSessionGroups}
+        selectedKey={selectedSession?.key}
+        selectedRootId={(selectedSession?.root_id as string | undefined) || currentRootId || ""}
+        headerAction={sessionImportMenu}
+        loading={multiProjectSessionsLoading}
+        emptyText="暂无会话记录"
+        onSearchToggle={() => {
+          setSessionSearchOpen(true);
+          setSessionSearchResultsMode(false);
+          setSessionSearchQuery("");
+          setSessionSearchAppliedQuery("");
+          setSessionSearchResults([]);
+          setSessionSearchLoading(false);
+        }}
+        onSelect={(s) => {
+          handleSelectSession(s);
+          if (isMobile) setIsRightOpen(false);
+        }}
+        onSync={handleSyncSession}
+        onRename={handleRenameSession}
+        onDelete={handleDeleteSession}
+        onLoadMoreProject={loadMoreMultiProjectSessions}
+        onLoadChildren={loadChildSessionsForParent}
+      />
     ) : (
       <SessionList
         sessions={
@@ -9203,6 +9489,8 @@ export function App({ onGoHome }: AppProps) {
             showEnterKeySendOption={isMobile}
             enterKeySends={mobileEnterKeySends}
             onEnterKeySendsChange={setMobileEnterKeySends}
+            multiProjectSessionsEnabled={multiProjectSessionsEnabled}
+            onMultiProjectSessionsChange={setMultiProjectSessionsEnabled}
             onRunAgentLifecycleCommand={handleRunAgentLifecycleCommand}
             onGoHome={onGoHome}
           />

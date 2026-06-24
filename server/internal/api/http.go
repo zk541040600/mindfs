@@ -56,6 +56,7 @@ const (
 	maxUploadRequestBytes = 64 << 20
 	maxUploadFileCount    = 20
 	sessionListPageSize   = 50
+	multiRootSessionLimit = 6
 	childSessionPageSize  = 20
 	childSessionMaxLimit  = 50
 	e2eeHeaderName        = "X-MindFS-E2EE"
@@ -335,6 +336,10 @@ func (h *HTTPHandler) Routes() http.Handler {
 
 func (h *HTTPHandler) handleSessions(w http.ResponseWriter, r *http.Request) {
 	rootID := r.URL.Query().Get("root")
+	if truthyQuery(r, "multi_root") {
+		h.handleMultiRootSessions(w, r)
+		return
+	}
 	beforeTime, err := parseOptionalTimeQuery(r, "before_time")
 	if err != nil {
 		respondError(w, http.StatusBadRequest, err)
@@ -349,12 +354,22 @@ func (h *HTTPHandler) handleSessions(w http.ResponseWriter, r *http.Request) {
 		respondError(w, http.StatusBadRequest, errInvalidRequest("before_time and after_time are mutually exclusive"))
 		return
 	}
+	limit, err := parsePositiveIntQuery(r, "limit")
+	if err != nil {
+		respondError(w, http.StatusBadRequest, errInvalidRequest("limit must be a positive integer"))
+		return
+	}
+	if limit <= 0 {
+		limit = sessionListPageSize
+	}
 	uc := h.service()
 	out, err := uc.ListSessions(r.Context(), usecase.ListSessionsInput{
-		RootID:     rootID,
-		BeforeTime: beforeTime,
-		AfterTime:  afterTime,
-		Limit:      sessionListPageSize,
+		RootID:          rootID,
+		BeforeTime:      beforeTime,
+		AfterTime:       afterTime,
+		Limit:           limit,
+		TopLevelOnly:    truthyQuery(r, "top_level"),
+		IncludeChildren: truthyQuery(r, "include_children"),
 	})
 	if err != nil {
 		respondError(w, http.StatusServiceUnavailable, err)
@@ -364,7 +379,45 @@ func (h *HTTPHandler) handleSessions(w http.ResponseWriter, r *http.Request) {
 	for _, s := range out.Sessions {
 		payload = append(payload, h.sessionListResponse(s))
 	}
-	respondJSON(w, http.StatusOK, payload)
+	respondJSON(w, http.StatusOK, map[string]any{
+		"items":       payload,
+		"total_count": out.TotalCount,
+	})
+}
+
+func (h *HTTPHandler) handleMultiRootSessions(w http.ResponseWriter, r *http.Request) {
+	limit, err := parsePositiveIntQuery(r, "limit_per_root")
+	if err != nil {
+		respondError(w, http.StatusBadRequest, errInvalidRequest("limit_per_root must be a positive integer"))
+		return
+	}
+	if limit <= 0 {
+		limit = multiRootSessionLimit
+	}
+	out, err := h.service().ListMultiRootSessions(r.Context(), usecase.ListMultiRootSessionsInput{
+		LimitPerRoot: limit,
+	})
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err)
+		return
+	}
+	groups := make([]map[string]any, 0, len(out.Groups))
+	for _, group := range out.Groups {
+		items := make([]map[string]any, 0, len(group.Sessions))
+		for _, s := range group.Sessions {
+			item := h.sessionListResponse(s)
+			item["root_id"] = group.RootID
+			items = append(items, item)
+		}
+		groups = append(groups, map[string]any{
+			"root_id":             group.RootID,
+			"root_name":           group.RootName,
+			"latest_session_time": group.LatestSessionTime,
+			"items":               items,
+			"total_count":         group.TotalCount,
+		})
+	}
+	respondJSON(w, http.StatusOK, map[string]any{"groups": groups})
 }
 
 func (h *HTTPHandler) handleSessionChildren(w http.ResponseWriter, r *http.Request) {
@@ -1780,6 +1833,15 @@ func parsePositiveIntQuery(r *http.Request, key string) (int, error) {
 		return 0, errInvalidRequest(key + " must be positive")
 	}
 	return value, nil
+}
+
+func truthyQuery(r *http.Request, key string) bool {
+	switch strings.ToLower(strings.TrimSpace(r.URL.Query().Get(key))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 func (h *HTTPHandler) handleDirs(w http.ResponseWriter, _ *http.Request) {

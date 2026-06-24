@@ -147,6 +147,7 @@ type ListOptions struct {
 	BeforeTime       time.Time
 	AfterTime        time.Time
 	ParentSessionKey string
+	TopLevelOnly     bool
 	Limit            int
 }
 
@@ -373,6 +374,12 @@ func (m *Manager) List(_ context.Context, opts ListOptions) ([]*Session, error) 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.listSessionsUnsafe(opts)
+}
+
+func (m *Manager) Count(_ context.Context, opts ListOptions) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.countSessionsUnsafe(opts)
 }
 
 func (m *Manager) ListMetas(_ context.Context) ([]*Session, error) {
@@ -1095,19 +1102,7 @@ func (m *Manager) listSessionsUnsafe(opts ListOptions) ([]*Session, error) {
 	}
 	query := `
 SELECT key FROM sessions`
-	args := make([]any, 0, 2)
-	where := make([]string, 0, 2)
-	if parentKey := strings.TrimSpace(opts.ParentSessionKey); parentKey != "" {
-		where = append(where, "parent_session_key = ?")
-		args = append(args, parentKey)
-	}
-	if !opts.BeforeTime.IsZero() {
-		where = append(where, "updated_at < ?")
-		args = append(args, opts.BeforeTime.UTC().Format(time.RFC3339Nano))
-	} else if !opts.AfterTime.IsZero() {
-		where = append(where, "updated_at > ?")
-		args = append(args, opts.AfterTime.UTC().Format(time.RFC3339Nano))
-	}
+	where, args := sessionListWhere(opts)
 	if len(where) > 0 {
 		query += `
 WHERE ` + strings.Join(where, " AND ")
@@ -1144,6 +1139,44 @@ LIMIT ?`
 		items = append(items, session)
 	}
 	return items, nil
+}
+
+func (m *Manager) countSessionsUnsafe(opts ListOptions) (int, error) {
+	db, err := m.ensureSessionMetaDBUnsafe()
+	if err != nil {
+		return 0, err
+	}
+	query := `
+SELECT COUNT(*) FROM sessions`
+	where, args := sessionListWhere(opts)
+	if len(where) > 0 {
+		query += `
+WHERE ` + strings.Join(where, " AND ")
+	}
+	var count int
+	if err := db.QueryRow(query, args...).Scan(&count); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+func sessionListWhere(opts ListOptions) ([]string, []any) {
+	args := make([]any, 0, 2)
+	where := make([]string, 0, 2)
+	if parentKey := strings.TrimSpace(opts.ParentSessionKey); parentKey != "" {
+		where = append(where, "parent_session_key = ?")
+		args = append(args, parentKey)
+	} else if opts.TopLevelOnly {
+		where = append(where, "parent_session_key = ''")
+	}
+	if !opts.BeforeTime.IsZero() {
+		where = append(where, "updated_at < ?")
+		args = append(args, opts.BeforeTime.UTC().Format(time.RFC3339Nano))
+	} else if !opts.AfterTime.IsZero() {
+		where = append(where, "updated_at > ?")
+		args = append(args, opts.AfterTime.UTC().Format(time.RFC3339Nano))
+	}
+	return where, args
 }
 
 func (m *Manager) loadSessionUnsafe(key string, afterSeq int) (*Session, error) {

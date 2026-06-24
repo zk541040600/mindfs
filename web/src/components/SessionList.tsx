@@ -1,12 +1,14 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { AgentIcon } from "./AgentIcon";
 import { ModeIcon } from "./ModeIcon";
+import { rootBadgeStyle } from "./rootBadgeStyle";
 
 export type SessionType = "chat" | "plugin" | "command";
 
 export type SessionItem = {
   key: string;
   session_key: string;
+  root_id?: string;
   type?: SessionType;
   parent_session_key?: string;
   parent_tool_call_id?: string;
@@ -53,6 +55,10 @@ type SessionListProps = {
 };
 
 const COLLAPSED_CHILD_SESSION_LIMIT = 3;
+const MULTI_PROJECT_VISIBLE_LIMIT = 6;
+const MAIN_SESSION_ICON_OFFSET = "2px";
+const SUB_SESSION_ICON_OFFSET = "12px";
+const PINNED_PROJECTS_STORAGE_KEY = "mindfs-pinned-session-projects";
 
 type VisibleSessionRow =
   | { type: "session"; session: SessionItem }
@@ -63,6 +69,147 @@ type VisibleSessionRow =
       hiddenCount: number;
       expanded: boolean;
     };
+
+export type ProjectSessionGroup = {
+  rootId: string;
+  rootName: string;
+  latestSessionTime?: string;
+  sessions: SessionItem[];
+  totalCount: number;
+};
+
+type ProjectSessionListProps = {
+  groups: ProjectSessionGroup[];
+  selectedKey?: string;
+  selectedRootId?: string;
+  headerAction?: React.ReactNode;
+  loading?: boolean;
+  emptyText?: React.ReactNode;
+  onSearchToggle?: () => void;
+  onSelect?: (session: SessionItem) => void;
+  onSync?: (session: SessionItem) => Promise<void> | void;
+  onRename?: (session: SessionItem, nextName: string) => Promise<boolean> | boolean;
+  onDelete?: (session: SessionItem) => void;
+  onLoadMoreProject?: (group: ProjectSessionGroup) => Promise<void> | void;
+  onLoadChildren?: (
+    session: SessionItem,
+    options?: { beforeTime?: string },
+  ) => Promise<{ hasMore?: boolean } | void> | { hasMore?: boolean } | void;
+};
+
+function ToggleRowButton({
+  label,
+  loading,
+  marginLeft,
+  showExpandIcon = false,
+  showCollapseIcon = false,
+  onClick,
+  onCollapse,
+}: {
+  label: string;
+  loading?: boolean;
+  marginLeft: string;
+  showExpandIcon?: boolean;
+  showCollapseIcon?: boolean;
+  onClick: () => void;
+  onCollapse?: () => void;
+}) {
+  const icon = (rotate = false) => (
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      width="1em"
+      height="1em"
+      viewBox="0 0 16 16"
+      aria-hidden="true"
+      style={{
+        width: "13px",
+        height: "13px",
+        flexShrink: 0,
+        transform: rotate ? "rotate(180deg)" : "none",
+      }}
+    >
+      <path d="M0 0h16v16H0z" fill="none" />
+      <path fill="currentColor" d="M12.146 7.146a.5.5 0 0 1 .708.708l-4.5 4.5a.5.5 0 0 1-.708 0l-4.5-4.5a.5.5 0 1 1 .708-.708L8 11.293zm0-4a.5.5 0 0 1 .708.708l-4.5 4.5a.5.5 0 0 1-.708 0l-4.5-4.5a.5.5 0 1 1 .708-.708L8 7.293z" />
+    </svg>
+  );
+
+  return (
+    <button
+      type="button"
+      disabled={loading}
+      onClick={onClick}
+      style={{
+        marginLeft,
+        marginTop: "-2px",
+        border: "none",
+        background: "transparent",
+        color: "var(--text-primary)",
+        borderRadius: 0,
+        padding: 0,
+        minHeight: "13px",
+        width: `calc(100% - ${marginLeft})`,
+        boxSizing: "border-box",
+        cursor: loading ? "default" : "pointer",
+        fontSize: "11px",
+        lineHeight: 1.1,
+        textAlign: "center",
+        opacity: loading ? 0.6 : 1,
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+      }}
+    >
+      <span style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", gap: "6px", minWidth: 0, flexShrink: 1 }}>
+        <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{label}</span>
+        {showExpandIcon ? icon(false) : null}
+        {showCollapseIcon ? (
+          <span
+            role="button"
+            tabIndex={0}
+            aria-label="收起"
+            title="收起"
+            onClick={(event) => {
+              event.stopPropagation();
+              onCollapse?.();
+            }}
+            onKeyDown={(event) => {
+              if (event.key !== "Enter" && event.key !== " ") {
+                return;
+              }
+              event.preventDefault();
+              event.stopPropagation();
+              onCollapse?.();
+            }}
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              justifyContent: "center",
+              cursor: loading ? "default" : "pointer",
+            }}
+          >
+            {icon(true)}
+          </span>
+        ) : null}
+      </span>
+    </button>
+  );
+}
+
+function PinIcon({ pinned }: { pinned: boolean }) {
+  return (
+    <svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M0 0h24v24H0z" fill="none" />
+      <path
+        fill="currentColor"
+        fillRule="evenodd"
+        d="m16.219 4.838l2.964 2.967c2.012 2.014 3.018 3.021 2.784 4.107c-.235 1.085-1.567 1.585-4.23 2.586l-1.845.693c-.713.268-1.07.402-1.345.64q-.181.158-.322.352c-.212.297-.313.664-.515 1.4c-.46 1.672-.69 2.508-1.239 2.821c-.23.132-.492.2-.758.2c-.63 0-1.243-.614-2.469-1.84l-1.466-1.468l-1.079-1.08L5.285 14.8c-1.218-1.219-1.827-1.828-1.83-2.455a1.53 1.53 0 0 1 .203-.773c.313-.543 1.143-.772 2.803-1.23c.737-.203 1.105-.304 1.402-.517q.199-.144.36-.332c.236-.278.368-.637.63-1.355l.669-1.823c.987-2.693 1.48-4.04 2.568-4.28s2.102.774 4.129 2.803"
+        clipRule="evenodd"
+        opacity={pinned ? 1 : 0.5}
+      />
+      <path fill="currentColor" d="m3.302 21.776l4.476-4.48l-1.079-1.08l-4.476 4.48a.764.764 0 0 0 1.08 1.08" />
+    </svg>
+  );
+}
 
 function shellBadgeLabel(shell?: string): string {
   const normalized = String(shell || "").trim().replace(/\\/g, "/");
@@ -105,9 +252,14 @@ function forkSessionDisplayName(
   storedName: string,
   source: ForkSessionSource | null,
   sessionByKey: Map<string, SessionItem>,
+  rootId?: string,
 ): string {
   if (!source) return storedName;
-  const parentName = String(sessionByKey.get(source.sessionKey)?.name || "").trim();
+  const parentName = String(
+    sessionByKey.get(rootId ? `${rootId}:${source.sessionKey}` : source.sessionKey)?.name ||
+      sessionByKey.get(source.sessionKey)?.name ||
+      "",
+  ).trim();
   const fallbackName = storedName.replace(/\s+fork\s+@\d+\s*$/i, "").trim();
   const base = parentName || fallbackName || storedName;
   return source.seq > 0 ? `${base}#${source.seq}` : base;
@@ -541,6 +693,446 @@ export function SessionList({
   );
 }
 
+export function MultiProjectSessionList({
+  groups,
+  selectedKey = "",
+  selectedRootId = "",
+  headerAction,
+  loading = false,
+  emptyText = "暂无会话记录",
+  onSearchToggle,
+  onSelect,
+  onSync,
+  onRename,
+  onDelete,
+  onLoadMoreProject,
+  onLoadChildren,
+}: ProjectSessionListProps) {
+  const [expandedProjects, setExpandedProjects] = useState<Record<string, boolean>>({});
+  const [loadingProjects, setLoadingProjects] = useState<Record<string, boolean>>({});
+  const [expandedChildren, setExpandedChildren] = useState<Record<string, boolean>>({});
+  const [loadingChildren, setLoadingChildren] = useState<Record<string, boolean>>({});
+  const [childrenHasMore, setChildrenHasMore] = useState<Record<string, boolean>>({});
+  const [pinnedProjects, setPinnedProjects] = useState<Record<string, number>>(() => {
+    if (typeof window === "undefined") {
+      return {};
+    }
+    try {
+      const parsed = JSON.parse(window.localStorage.getItem(PINNED_PROJECTS_STORAGE_KEY) || "{}");
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        return {};
+      }
+      const next: Record<string, number> = {};
+      for (const [key, value] of Object.entries(parsed)) {
+        const timestamp = Number(value);
+        if (key && Number.isFinite(timestamp) && timestamp > 0) {
+          next[key] = timestamp;
+        }
+      }
+      return next;
+    } catch {
+      return {};
+    }
+  });
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    window.localStorage.setItem(PINNED_PROJECTS_STORAGE_KEY, JSON.stringify(pinnedProjects));
+  }, [pinnedProjects]);
+  const orderedGroups = useMemo(
+    () =>
+      groups.slice().sort((left, right) => {
+        const leftPinnedAt = pinnedProjects[left.rootId] || 0;
+        const rightPinnedAt = pinnedProjects[right.rootId] || 0;
+        if (leftPinnedAt || rightPinnedAt) {
+          if (leftPinnedAt !== rightPinnedAt) {
+            return rightPinnedAt - leftPinnedAt;
+          }
+        }
+        return 0;
+      }),
+    [groups, pinnedProjects],
+  );
+  const togglePinnedProject = (rootId: string) => {
+    setPinnedProjects((prev) => {
+      const next = { ...prev };
+      if (next[rootId]) {
+        delete next[rootId];
+      } else {
+        next[rootId] = Date.now();
+      }
+      return next;
+    });
+  };
+  const sessionByKey = useMemo(() => {
+    const byKey = new Map<string, SessionItem>();
+    for (const group of groups) {
+      for (const item of group.sessions) {
+        const sessionRoot = item.root_id || group.rootId;
+        byKey.set(`${sessionRoot}:${item.key}`, item);
+        byKey.set(item.key, item);
+      }
+    }
+    return byKey;
+  }, [groups]);
+  const childStateKey = (session: SessionItem) => `${session.root_id || ""}:${session.key}`;
+
+  const loadChildren = async (parent: SessionItem, beforeTime?: string) => {
+    const stateKey = childStateKey(parent);
+    if (!onLoadChildren || loadingChildren[stateKey]) {
+      return;
+    }
+    setLoadingChildren((prev) => ({ ...prev, [stateKey]: true }));
+    try {
+      const result = await onLoadChildren(parent, beforeTime ? { beforeTime } : undefined);
+      setChildrenHasMore((prev) => ({ ...prev, [stateKey]: !!result?.hasMore }));
+    } finally {
+      setLoadingChildren((prev) => ({ ...prev, [stateKey]: false }));
+    }
+  };
+
+  const buildRows = (sessions: SessionItem[]): VisibleSessionRow[] => {
+    const childrenByParent = new Map<string, SessionItem[]>();
+    const topLevel: SessionItem[] = [];
+    const keys = new Set(sessions.map((item) => item.key));
+    for (const item of sessions) {
+      const parentKey = String(item.parent_session_key || "").trim();
+      if (parentKey && keys.has(parentKey)) {
+        const children = childrenByParent.get(parentKey) || [];
+        children.push(item);
+        childrenByParent.set(parentKey, children);
+      } else {
+        topLevel.push(item);
+      }
+    }
+    const out: VisibleSessionRow[] = [];
+    const append = (item: SessionItem) => {
+      out.push({ type: "session", session: item });
+      const children = childrenByParent.get(item.key) || [];
+      const stateKey = childStateKey(item);
+      const expanded = !!expandedChildren[stateKey];
+      const visibleChildren = expanded ? children : children.slice(0, COLLAPSED_CHILD_SESSION_LIMIT);
+      for (const child of visibleChildren) {
+        append(child);
+      }
+      const hiddenCount = Math.max(0, children.length - COLLAPSED_CHILD_SESSION_LIMIT);
+      if (children.length > COLLAPSED_CHILD_SESSION_LIMIT || expanded || childrenHasMore[stateKey]) {
+        out.push({
+          type: "child-toggle",
+          parent: item,
+          loadedChildCount: children.length,
+          hiddenCount,
+          expanded,
+        });
+      }
+    };
+    topLevel.forEach((item) => append(item));
+    return out;
+  };
+
+  const handleChildToggle = async (
+    row: Extract<VisibleSessionRow, { type: "child-toggle" }>,
+    groupSessions: SessionItem[],
+  ) => {
+    const parentKey = row.parent.key;
+    const stateKey = childStateKey(row.parent);
+    if (!row.expanded) {
+      setExpandedChildren((prev) => ({ ...prev, [stateKey]: true }));
+      await loadChildren(row.parent);
+      return;
+    }
+    if (childrenHasMore[stateKey]) {
+      const lastChild = groupSessions
+        .filter((item) => item.parent_session_key === parentKey)
+        .sort((left, right) => (Date.parse(left.updated_at || "") || 0) - (Date.parse(right.updated_at || "") || 0))[0];
+      await loadChildren(row.parent, lastChild?.updated_at);
+    } else {
+      setExpandedChildren((prev) => ({ ...prev, [stateKey]: false }));
+    }
+  };
+
+  const handleProjectToggle = async (group: ProjectSessionGroup) => {
+    const expanded = !!expandedProjects[group.rootId];
+    const remaining = Math.max(0, group.totalCount - group.sessions.length);
+    if (!expanded) {
+      setExpandedProjects((prev) => ({ ...prev, [group.rootId]: true }));
+      if (remaining > 0 && onLoadMoreProject) {
+        setLoadingProjects((prev) => ({ ...prev, [group.rootId]: true }));
+        try {
+          await onLoadMoreProject(group);
+        } finally {
+          setLoadingProjects((prev) => ({ ...prev, [group.rootId]: false }));
+        }
+      }
+      return;
+    }
+    if (remaining > 0 && onLoadMoreProject) {
+      setLoadingProjects((prev) => ({ ...prev, [group.rootId]: true }));
+      try {
+        await onLoadMoreProject(group);
+      } finally {
+        setLoadingProjects((prev) => ({ ...prev, [group.rootId]: false }));
+      }
+    } else {
+      setExpandedProjects((prev) => ({ ...prev, [group.rootId]: false }));
+    }
+  };
+
+  const handleProjectCollapse = (rootId: string) => {
+    setExpandedProjects((prev) => ({ ...prev, [rootId]: false }));
+  };
+
+  const topLevelSessionsForGroup = (sessions: SessionItem[]) =>
+    sessions.filter((session) => !String(session.parent_session_key || "").trim());
+
+  const sessionsForTopLevelLimit = (sessions: SessionItem[], limit: number) => {
+    const topLevel = topLevelSessionsForGroup(sessions);
+    if (limit >= topLevel.length) {
+      return sessions;
+    }
+    const visibleParentKeys = new Set(topLevel.slice(0, limit).map((session) => session.key));
+    return sessions.filter((session) => {
+      const parentKey = String(session.parent_session_key || "").trim();
+      return !parentKey ? visibleParentKeys.has(session.key) : visibleParentKeys.has(parentKey);
+    });
+  };
+
+  return (
+    <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", background: "transparent" }}>
+      <div
+        style={{
+          height: "36px",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          padding: "0 10px 0 16px",
+          borderBottom: "1px solid var(--border-color)",
+          background: "var(--mindfs-topbar-bg, transparent)",
+          flexShrink: 0,
+          boxSizing: "border-box",
+        }}
+      >
+        <h3 style={{ margin: 0, fontSize: "11px", fontWeight: 700, color: "var(--text-secondary)", letterSpacing: "0.5px", textTransform: "uppercase" }}>
+          SESSIONS
+        </h3>
+        <div style={{ display: "inline-flex", alignItems: "center", gap: "4px" }}>
+          {onSearchToggle ? (
+            <button
+              type="button"
+              aria-label="搜索当前项目会话"
+              title="搜索当前项目会话"
+              onClick={onSearchToggle}
+              style={{
+                width: "34px",
+                height: "34px",
+                minWidth: "34px",
+                border: "none",
+                borderRadius: "8px",
+                padding: 0,
+                background: "transparent",
+                color: "var(--text-secondary)",
+                display: "inline-flex",
+                alignItems: "center",
+                justifyContent: "center",
+                cursor: "pointer",
+                transition: "all 0.15s ease",
+              }}
+            >
+              <svg xmlns="http://www.w3.org/2000/svg" width="17" height="17" viewBox="0 0 24 24" aria-hidden="true">
+                <path fill="currentColor" d="M15.5 14h-.79l-.28-.27A6.47 6.47 0 0 0 16 9.5A6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5S14 7.01 14 9.5S11.99 14 9.5 14" />
+              </svg>
+            </button>
+          ) : null}
+          {headerAction ? <div style={{ display: "inline-flex", alignItems: "center" }}>{headerAction}</div> : null}
+        </div>
+      </div>
+      <div style={{ flex: 1, minHeight: 0, overflow: "auto", padding: "8px" }}>
+        {loading && groups.length === 0 ? (
+          <div style={{ fontSize: "12px", color: "var(--text-secondary)", padding: "18px", textAlign: "center" }}>加载中...</div>
+        ) : groups.length === 0 ? (
+          <div style={{ fontSize: "12px", color: "var(--text-secondary)", minHeight: "100%", padding: "12px 18px", display: "flex", alignItems: "center", justifyContent: "center", textAlign: "center", lineHeight: 1.6 }}>
+            {emptyText}
+          </div>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: "9px" }}>
+            {orderedGroups.map((group) => {
+              const expanded = !!expandedProjects[group.rootId];
+              const pinned = !!pinnedProjects[group.rootId];
+              const topLevelSessions = topLevelSessionsForGroup(group.sessions);
+              const sessions = expanded
+                ? group.sessions
+                : sessionsForTopLevelLimit(group.sessions, MULTI_PROJECT_VISIBLE_LIMIT);
+              const rows = buildRows(sessions);
+              const remaining = Math.max(0, group.totalCount - topLevelSessions.length);
+              const projectLoading = !!loadingProjects[group.rootId];
+              return (
+                <section key={group.rootId} style={{ minWidth: 0 }}>
+                  <div
+                    style={{
+                      minWidth: 0,
+                      height: "22px",
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      gap: "8px",
+                      padding: "0 24px 0 2px",
+                      background: "transparent",
+                      boxSizing: "border-box",
+                      position: "relative",
+                    }}
+                  >
+                    <span
+                      aria-hidden="true"
+                      style={{
+                        height: "1px",
+                        flex: 1,
+                        minWidth: "12px",
+                        background: "var(--border-color)",
+                      }}
+                    />
+                    <span
+                      style={{
+                        ...rootBadgeStyle,
+                        flexShrink: 1,
+                        maxWidth: "100%",
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
+                        whiteSpace: "nowrap",
+                      }}
+                    >
+                      {group.rootName || group.rootId}
+                    </span>
+                    <span
+                      aria-hidden="true"
+                      style={{
+                        height: "1px",
+                        flex: 1,
+                        minWidth: "12px",
+                        background: "var(--border-color)",
+                      }}
+                    />
+                    <button
+                      type="button"
+                      aria-label={pinned ? "取消置顶项目" : "置顶项目"}
+                      title={pinned ? "取消置顶" : "置顶"}
+                      onClick={() => togglePinnedProject(group.rootId)}
+                      style={{
+                        position: "absolute",
+                        right: 0,
+                        top: "50%",
+                        transform: "translateY(-50%)",
+                        width: "20px",
+                        height: "20px",
+                        border: "none",
+                        borderRadius: "6px",
+                        padding: 0,
+                        background: "transparent",
+                        color: pinned ? "#4b5563" : "var(--text-secondary)",
+                        display: "inline-flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                        cursor: "pointer",
+                        opacity: pinned ? 1 : 0.72,
+                      }}
+                      onMouseEnter={(e) => {
+                        e.currentTarget.style.background = "rgba(0,0,0,0.05)";
+                        e.currentTarget.style.opacity = "1";
+                      }}
+                      onMouseLeave={(e) => {
+                        e.currentTarget.style.background = "transparent";
+                        e.currentTarget.style.opacity = pinned ? "1" : "0.72";
+                      }}
+                    >
+                      <PinIcon pinned={pinned} />
+                    </button>
+                  </div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: "2px", paddingTop: 0 }}>
+                    {rows.map((row) => {
+                      if (row.type === "child-toggle") {
+                        const stateKey = childStateKey(row.parent);
+                        const loadingChild = !!loadingChildren[stateKey];
+                        const hasMoreChildren = !!childrenHasMore[stateKey];
+                        const label = loadingChild
+                          ? "加载中..."
+                          : row.expanded
+                            ? hasMoreChildren
+                              ? "加载更多子会话"
+                              : "收起"
+                            : row.hiddenCount > 0
+                              ? `还有 ${row.hiddenCount} 个子会话`
+                              : "展开子会话";
+                        return (
+                          <ToggleRowButton
+                            key={`children-toggle-${group.rootId}-${row.parent.key}`}
+                            loading={loadingChild}
+                            label={label}
+                            showExpandIcon={!loadingChild && (!row.expanded || hasMoreChildren)}
+                            showCollapseIcon={!loadingChild && row.expanded}
+                            marginLeft={SUB_SESSION_ICON_OFFSET}
+                            onClick={() => void handleChildToggle(row, group.sessions)}
+                            onCollapse={() =>
+                              setExpandedChildren((prev) => ({
+                                ...prev,
+                                [childStateKey(row.parent)]: false,
+                              }))
+                            }
+                          />
+                        );
+                      }
+                      const session = row.session;
+                      const sessionRoot = session.root_id || group.rootId;
+                      return (
+                        <SessionCard
+                          key={`${sessionRoot}:${session.key}`}
+                          session={{ ...session, root_id: sessionRoot }}
+                          sessionByKey={sessionByKey}
+                          selected={session.key === selectedKey && sessionRoot === selectedRootId}
+                          parentHighlighted={false}
+                          highlightQuery=""
+                          onSelect={onSelect}
+                          onSync={onSync}
+                          onRename={onRename}
+                          onDelete={onDelete}
+                        />
+                      );
+                    })}
+                    {group.totalCount > MULTI_PROJECT_VISIBLE_LIMIT ? (
+                      <ToggleRowButton
+                        loading={projectLoading}
+                        label={
+                          projectLoading
+                            ? "加载中..."
+                            : expanded
+                              ? remaining > 0
+                                ? `还有 ${remaining} 个会话`
+                                : "收起"
+                              : `还有 ${Math.max(0, group.totalCount - MULTI_PROJECT_VISIBLE_LIMIT)} 个会话`
+                        }
+                        showExpandIcon={!projectLoading && (!expanded || remaining > 0)}
+                        showCollapseIcon={!projectLoading && expanded}
+                        marginLeft={MAIN_SESSION_ICON_OFFSET}
+                        onClick={() => void handleProjectToggle(group)}
+                        onCollapse={() => handleProjectCollapse(group.rootId)}
+                      />
+                    ) : null}
+                  </div>
+                </section>
+              );
+            })}
+          </div>
+        )}
+      </div>
+      <style>{`
+        @keyframes mindfs-bound-pulse {
+          0%, 100% { opacity: 1; box-shadow: 0 0 0 1.5px rgba(37,99,235,0.14); }
+          50% { opacity: 0.18; box-shadow: 0 0 0 4px rgba(37,99,235,0.08); }
+        }
+      `}</style>
+    </div>
+  );
+}
+
 function SessionCard({
   session,
   sessionByKey,
@@ -568,7 +1160,7 @@ function SessionCard({
   const isForkSession = !!forkSource;
   const storedName = session.name || `Session ${session.key.slice(0, 8)}`;
   const displayName = isForkSession
-    ? forkSessionDisplayName(storedName, forkSource, sessionByKey)
+    ? forkSessionDisplayName(storedName, forkSource, sessionByKey, session.root_id)
     : storedName;
   const snippet = (session.search_snippet || "").trim();
   const isSearchResult = !!session.search_match_type;
