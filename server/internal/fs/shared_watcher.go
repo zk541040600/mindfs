@@ -70,6 +70,8 @@ type SharedFileWatcher struct {
 
 type SessionFileRecorder interface {
 	RecordOutputFile(ctx context.Context, key, path string) error
+	RecordOutputFileAtHead(ctx context.Context, key, path, head string) error
+	RecordOutputFileInRepo(ctx context.Context, key, rootID, repoKind, repoPath, repoName, path, head string) error
 	RecordRelatedWorktree(ctx context.Context, key, rootID, path, branch, head string) (bool, error)
 }
 
@@ -103,6 +105,15 @@ type RelatedWorktreeMatch struct {
 	Branch  string
 	Head    string
 	Current bool
+}
+
+type relatedFileRecord struct {
+	rootID   string
+	repoKind string
+	repoPath string
+	repoName string
+	path     string
+	head     string
 }
 
 type WorktreeResolver func(ctx context.Context, root RootInfo, filePath string) (RelatedWorktreeMatch, bool)
@@ -177,26 +188,110 @@ func (sw *SharedFileWatcher) RecordSessionFile(sessionKey, filePath string) {
 		return
 	}
 	sw.recordSessionWorktree(context.Background(), sessionKey, filePath)
-	relPath, err := sw.root.NormalizePath(filePath)
-	if err != nil {
+	record, ok := sw.resolveRelatedFileRecord(context.Background(), filePath)
+	if !ok {
 		return
 	}
-	relPath = filepath.ToSlash(relPath)
-	if relPath == "." || relPath == ".." || relPath == "" {
+	if err := sw.sessionStore.RecordOutputFileInRepo(
+		context.Background(),
+		sessionKey,
+		record.rootID,
+		record.repoKind,
+		record.repoPath,
+		record.repoName,
+		record.path,
+		record.head,
+	); err != nil {
 		return
 	}
-	if len(relPath) >= len(".mindfs") && relPath[:len(".mindfs")] == ".mindfs" {
-		return
+	if record.repoKind != "git" || sameCleanPath(record.repoPath, sw.root.RootPath) {
+		sw.root.UpdateFileMeta(record.path, sessionKey, "agent")
 	}
-	if err := sw.sessionStore.RecordOutputFile(context.Background(), sessionKey, relPath); err != nil {
-		return
-	}
-	sw.root.UpdateFileMeta(relPath, sessionKey, "agent")
 	sw.emitRelatedFile(RelatedFileEvent{
 		RootID:     sw.root.ID,
 		SessionKey: sessionKey,
-		Path:       relPath,
+		Path:       record.path,
 	})
+}
+
+func (sw *SharedFileWatcher) resolveRelatedFileRecord(ctx context.Context, filePath string) (relatedFileRecord, bool) {
+	absFilePath := absoluteRelatedFilePath(sw.root.RootPath, filePath)
+	if sw.worktreeResolver != nil && filePath != "" {
+		if match, ok := sw.worktreeResolver(ctx, sw.root, filePath); ok {
+			relPath, ok := relativePathInside(match.Path, absFilePath)
+			if ok && validRelatedPath(relPath) {
+				repoPath := filepath.Clean(match.Path)
+				return relatedFileRecord{
+					rootID:   sw.root.ID,
+					repoKind: "git",
+					repoPath: repoPath,
+					repoName: filepath.Base(repoPath),
+					path:     relPath,
+					head:     strings.TrimSpace(match.Head),
+				}, true
+			}
+		}
+	}
+
+	relPath, err := sw.root.NormalizePath(filePath)
+	if err != nil {
+		return relatedFileRecord{}, false
+	}
+	relPath = filepath.ToSlash(relPath)
+	if !validRelatedPath(relPath) {
+		return relatedFileRecord{}, false
+	}
+	rootPath := filepath.Clean(sw.root.RootPath)
+	return relatedFileRecord{
+		rootID:   sw.root.ID,
+		repoKind: "plain",
+		repoPath: rootPath,
+		repoName: sw.root.Name,
+		path:     relPath,
+	}, true
+}
+
+func absoluteRelatedFilePath(rootPath, filePath string) string {
+	cleanPath := strings.TrimSpace(filePath)
+	if cleanPath == "" {
+		return ""
+	}
+	if filepath.IsAbs(cleanPath) {
+		return filepath.Clean(cleanPath)
+	}
+	return filepath.Clean(filepath.Join(rootPath, cleanPath))
+}
+
+func validRelatedPath(path string) bool {
+	path = filepath.ToSlash(strings.TrimSpace(path))
+	if path == "." || path == ".." || path == "" {
+		return false
+	}
+	return !(len(path) >= len(".mindfs") && path[:len(".mindfs")] == ".mindfs")
+}
+
+func relativePathInside(rootPath, filePath string) (string, bool) {
+	rootPath = filepath.Clean(strings.TrimSpace(rootPath))
+	if rootPath == "" {
+		return "", false
+	}
+	cleanPath := strings.TrimSpace(filePath)
+	if cleanPath == "" {
+		return "", false
+	}
+	if !filepath.IsAbs(cleanPath) {
+		cleanPath = filepath.Join(rootPath, cleanPath)
+	}
+	cleanPath = filepath.Clean(cleanPath)
+	rel, err := filepath.Rel(rootPath, cleanPath)
+	if err != nil || rel == "." || filepath.IsAbs(rel) || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || rel == ".." {
+		return "", false
+	}
+	return filepath.ToSlash(rel), true
+}
+
+func sameCleanPath(a, b string) bool {
+	return filepath.Clean(strings.TrimSpace(a)) == filepath.Clean(strings.TrimSpace(b))
 }
 
 func (sw *SharedFileWatcher) recordSessionWorktree(ctx context.Context, sessionKey, filePath string) {

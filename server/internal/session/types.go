@@ -212,7 +212,12 @@ func truncateStringBytes(value string, maxBytes int) (string, int, bool) {
 }
 
 type RelatedFile struct {
+	RootID           string `json:"root_id,omitempty"`
+	RepoPath         string `json:"repo_path,omitempty"`
+	RepoName         string `json:"repo_name,omitempty"`
+	RepoKind         string `json:"repo_kind,omitempty"`
 	Path             string `json:"path"`
+	Head             string `json:"head,omitempty"`
 	Relation         string `json:"relation"`
 	CreatedBySession bool   `json:"created_by_session"`
 }

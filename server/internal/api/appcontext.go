@@ -164,6 +164,13 @@ func resolveRelatedWorktree(ctx context.Context, root fs.RootInfo, filePath stri
 			Current: item.Current,
 		}, true
 	}
+	if repo, err := gitview.ResolveRepositoryForPath(ctx, cleanPath); err == nil && strings.TrimSpace(repo.Path) != "" {
+		return fs.RelatedWorktreeMatch{
+			Path:    filepath.Clean(repo.Path),
+			Head:    strings.TrimSpace(repo.Head),
+			Current: pathInsideDir(cleanPath, root.RootPath),
+		}, true
+	}
 	return fs.RelatedWorktreeMatch{}, false
 }
 

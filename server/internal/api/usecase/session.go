@@ -770,9 +770,12 @@ func (s *Service) GetSessionRelatedFiles(ctx context.Context, in GetSessionRelat
 }
 
 type RemoveSessionRelatedFileInput struct {
-	RootID string
-	Key    string
-	Path   string
+	RootID   string
+	Key      string
+	Path     string
+	Head     string
+	RepoPath string
+	RepoKind string
 }
 
 func (s *Service) RemoveSessionRelatedFile(ctx context.Context, in RemoveSessionRelatedFileInput) error {
@@ -783,7 +786,7 @@ func (s *Service) RemoveSessionRelatedFile(ctx context.Context, in RemoveSession
 	if err != nil {
 		return err
 	}
-	return manager.RemoveRelatedFile(ctx, in.Key, in.Path)
+	return manager.RemoveRelatedFileAtHead(ctx, in.Key, in.Path, in.Head, in.RepoPath, in.RepoKind)
 }
 
 type CloseSessionInput struct {

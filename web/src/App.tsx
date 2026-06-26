@@ -50,6 +50,7 @@ import {
   discardGitItem,
   fetchGitCommitDiff,
   fetchGitDiff,
+  fetchGitRelatedFileDiff,
   fetchGitBranches,
   fetchGitHistory,
   fetchGitStatus,
@@ -373,6 +374,23 @@ type GitFileStat = {
   additions: number;
   deletions: number;
 };
+type RelatedFileClickTarget = {
+  path: string;
+  head?: string;
+  repo_path?: string;
+  repo_name?: string;
+  repo_kind?: string;
+};
+
+function relatedFileSelectionKey(file: RelatedFileClickTarget | null | undefined): string {
+  if (!file?.path) return "";
+  return [
+    file.repo_kind || "",
+    file.repo_path || "",
+    file.head || "",
+    file.path,
+  ].join("\0");
+}
 type URLState = {
   root: string;
   file: string;
@@ -876,6 +894,38 @@ function normalizePathForRoot(value: string, rootPath?: string): string {
   return normalized;
 }
 
+function relativeDisplayPathFromRoot(rootPath: string | undefined, absolutePath: string): string {
+  const root = normalizePath(rootPath || "");
+  const target = normalizePath(absolutePath);
+  if (!target) return "";
+  if (!root) return target;
+  if (target === root) return ".";
+  if (target.startsWith(`${root}/`)) {
+    return target.slice(root.length + 1);
+  }
+  const rootParts = root.split("/").filter(Boolean);
+  const targetParts = target.split("/").filter(Boolean);
+  let shared = 0;
+  while (
+    shared < rootParts.length &&
+    shared < targetParts.length &&
+    rootParts[shared] === targetParts[shared]
+  ) {
+    shared += 1;
+  }
+  const upward = Array(Math.max(0, rootParts.length - shared)).fill("..");
+  const downward = targetParts.slice(shared);
+  return [...upward, ...downward].join("/") || ".";
+}
+
+function joinDisplayPath(base: string, path: string): string {
+  const normalizedBase = normalizePath(base);
+  const normalizedPath = normalizePath(path);
+  if (!normalizedBase) return normalizedPath;
+  if (!normalizedPath) return normalizedBase;
+  return `${normalizedBase}/${normalizedPath}`;
+}
+
 function parseFileLocation(path: string): {
   path: string;
   targetLine?: number;
@@ -1329,6 +1379,7 @@ export function App({ onGoHome }: AppProps) {
     loadStringBooleanRecord(GIT_HISTORY_EXPANDED_STORAGE_KEY),
   );
   const [gitDiff, setGitDiff] = useState<GitDiffPayload | null>(null);
+  const [relatedSelectedFileKey, setRelatedSelectedFileKey] = useState("");
   const [treeSortMode, setTreeSortMode] = useState<DirectorySortMode>(() => {
     if (typeof window === "undefined") {
       return DEFAULT_DIRECTORY_SORT_MODE;
@@ -3721,11 +3772,14 @@ export function App({ onGoHome }: AppProps) {
   }, [currentRootId, multiProjectSessionsEnabled, sessionListMode, sessionSearchAppliedQuery, sessionSearchOpen]);
 
   const openGitDiff = useCallback(
-    async (rootID: string, item: GitStatusItem) => {
+    async (rootID: string, item: GitStatusItem, options?: { preserveRelatedSelection?: boolean }) => {
       if (!rootID || !item?.path) {
         return;
       }
       fileOpenRequestRef.current += 1;
+      if (!options?.preserveRelatedSelection) {
+        setRelatedSelectedFileKey("");
+      }
       setMainViewPreferenceForRoot(rootID, "git-diff");
       setSelectedSession(null);
       setSelectedSessionLoading(false);
@@ -3762,6 +3816,7 @@ export function App({ onGoHome }: AppProps) {
         return;
       }
       fileOpenRequestRef.current += 1;
+      setRelatedSelectedFileKey("");
       setMainViewPreferenceForRoot(rootID, "git-diff");
       setSelectedSession(null);
       setSelectedSessionLoading(false);
@@ -5590,6 +5645,9 @@ export function App({ onGoHome }: AppProps) {
     () => ({
       open: async (params: any) => {
         const requestId = ++fileOpenRequestRef.current;
+        if (!params?.preserveRelatedSelection) {
+          setRelatedSelectedFileKey("");
+        }
         const isStale = () => fileOpenRequestRef.current !== requestId;
         const parsedLocation = parseFileLocation(String(params.path || ""));
         const root = params.root || currentRootIdRef.current;
@@ -5960,6 +6018,91 @@ export function App({ onGoHome }: AppProps) {
   useEffect(() => {
     actionHandlersRef.current = actionHandlers;
   }, [actionHandlers]);
+
+  const openRelatedFileDiff = useCallback(
+    async (rootID: string, file: RelatedFileClickTarget) => {
+      const path = String(file?.path || "").trim();
+      const head = String(file?.head || "").trim();
+      const repoKind = String(file?.repo_kind || "").trim();
+      if (!rootID || !path) {
+        return;
+      }
+      setRelatedSelectedFileKey(relatedFileSelectionKey(file));
+      if (repoKind === "plain") {
+        actionHandlers.open({ path, root: rootID, preserveRelatedSelection: true });
+        return;
+      }
+      if (!head && !file?.repo_path) {
+        const gitItem = (gitStatus?.items || []).find(
+          (item) => item.path === path,
+        );
+        if (gitItem) {
+          void openGitDiff(rootID, gitItem, { preserveRelatedSelection: true });
+          return;
+        }
+        actionHandlers.open({ path, root: rootID, preserveRelatedSelection: true });
+        return;
+      }
+      fileOpenRequestRef.current += 1;
+      setMainViewPreferenceForRoot(rootID, "git-diff");
+      setSelectedSession(null);
+      setSelectedSessionLoading(false);
+      setFile(null);
+      setGitDiff(null);
+      replaceURLState({
+        root: rootID,
+        file: "",
+        session: "",
+        cursor: 0,
+        pluginQuery: {},
+      });
+      try {
+        const next = await fetchGitRelatedFileDiff(rootID, file);
+        const rootPath = managedRootByIdRef.current[rootID]?.root_path;
+        const repoPath = String(file?.repo_path || "").trim();
+        const displayPath = repoPath
+          ? relativeDisplayPathFromRoot(rootPath, joinDisplayPath(repoPath, path))
+          : path;
+        if (displayPath) {
+          next.display_path = displayPath;
+        }
+        setGitDiff(next);
+        if (currentRootIdRef.current !== rootID) {
+          setCurrentRootId(rootID);
+        }
+        if (isMobile) {
+          setIsLeftOpen(false);
+        }
+      } catch (err) {
+        const message =
+          err instanceof Error ? err.message : "关联文件 diff 不可用";
+        console.error("[git.related-file.diff] failed", {
+          rootID,
+          path,
+          head,
+          err,
+        });
+        reportError("git.related_file_diff_failed", message, {
+          severity: "warning",
+          recoverable: true,
+          details: {
+            root: rootID,
+            path,
+            head,
+            payload: err instanceof ProtectedAPIError ? err.payload : undefined,
+          },
+        });
+      }
+    },
+    [
+      actionHandlers,
+      gitStatus,
+      isMobile,
+      openGitDiff,
+      replaceURLState,
+      setMainViewPreferenceForRoot,
+    ],
+  );
 
   const loadManagedRootPayloads = useCallback(async () => {
     if (bootstrapService.snapshot().phase !== "ready") {
@@ -8505,6 +8648,14 @@ export function App({ onGoHome }: AppProps) {
             typeof payload?.session_key === "string" ? payload.session_key : "";
           if (rootID && sessionKey) {
             void refreshSessionRelatedFiles(rootID, sessionKey);
+            const cachedSession =
+              sessionCacheRef.current[rootSessionKey(rootID, sessionKey)];
+            const parentSessionKey = String(
+              cachedSession?.parent_session_key || "",
+            ).trim();
+            if (parentSessionKey) {
+              void refreshSessionRelatedFiles(rootID, parentSessionKey);
+            }
             if (payload?.related_worktree && typeof payload.related_worktree === "object") {
               updateSessionRelatedWorktreeForKey(
                 rootID,
@@ -9156,7 +9307,7 @@ export function App({ onGoHome }: AppProps) {
   ]);
 
   const handleSelectedSessionFileClick = useCallback(
-    (path: string) => {
+    (target: string | RelatedFileClickTarget) => {
       setProjectTreeTabRequest((prev) => ({
         tab: "related",
         nonce: (prev?.nonce || 0) + 1,
@@ -9166,16 +9317,11 @@ export function App({ onGoHome }: AppProps) {
         currentRootIdRef.current;
       if (!root) return;
       setExpanded((prev) => Array.from(new Set([...prev, root])));
-      const gitItem = (gitStatus?.items || []).find(
-        (item) => item.path === path,
-      );
-      if (gitItem) {
-        void openGitDiff(root, gitItem);
-        return;
-      }
-      actionHandlers.open({ path, root });
+      const file =
+        typeof target === "string" ? { path: target } : target;
+      void openRelatedFileDiff(root, file);
     },
-    [actionHandlers, gitStatus, openGitDiff],
+    [openRelatedFileDiff],
   );
 
   const drawerSessionSnapshot = useMemo(
@@ -9219,19 +9365,14 @@ export function App({ onGoHome }: AppProps) {
   ]);
 
   const handleDrawerSessionFileClick = useCallback(
-    (path: string) => {
+    (target: string | RelatedFileClickTarget) => {
       const root = currentRootIdRef.current;
       if (!root) return;
-      const gitItem = (gitStatus?.items || []).find(
-        (item) => item.path === path,
-      );
-      if (gitItem) {
-        void openGitDiff(root, gitItem);
-        return;
-      }
-      actionHandlers.open({ path, root });
+      const file =
+        typeof target === "string" ? { path: target } : target;
+      void openRelatedFileDiff(root, file);
     },
-    [actionHandlers, gitStatus, openGitDiff],
+    [openRelatedFileDiff],
   );
 
   const handleRemoveSessionRelatedFile = useCallback(
@@ -9239,6 +9380,9 @@ export function App({ onGoHome }: AppProps) {
       rootID: string | null | undefined,
       sessionKey: string | undefined,
       path: string,
+      head = "",
+      repoPath = "",
+      repoKind = "",
     ) => {
       const resolvedRoot = rootID || currentRootIdRef.current;
       const resolvedKey = sessionKey || "";
@@ -9247,6 +9391,9 @@ export function App({ onGoHome }: AppProps) {
         resolvedRoot,
         resolvedKey,
         path,
+        head,
+        repoPath,
+        repoKind,
       );
       if (!removed) return;
       const relatedFiles = await sessionService.getSessionRelatedFiles(
@@ -9512,11 +9659,14 @@ export function App({ onGoHome }: AppProps) {
           suppressTreeExpand: true,
         });
       }}
-      onRemoveRelatedFile={(path) =>
+      onRemoveRelatedFile={(path, head, repoPath, repoKind) =>
         void handleRemoveSessionRelatedFile(
           selectedSession?.root_id || currentRootId,
           selectedSessionSnapshot?.key || selectedSessionSnapshot?.session_key,
           path,
+          head,
+          repoPath,
+          repoKind,
         )
       }
       onAskUserAnswer={handleAskUserAnswer}
@@ -9928,19 +10078,99 @@ export function App({ onGoHome }: AppProps) {
   const selectedSessionRelatedFiles = useMemo(() => {
     const rawRelated = relatedSessionSnapshot?.related_files || (relatedSessionSnapshot as any)?.outputs || [];
     return (Array.isArray(rawRelated) ? rawRelated : [])
-      .map((file: RelatedFile | string | { path?: unknown; name?: unknown }) => {
+      .map((file: RelatedFile | string | { path?: unknown; name?: unknown; head?: unknown; repo_path?: unknown; repo_name?: unknown; repo_kind?: unknown; root_id?: unknown }) => {
         const path = typeof file === "string"
           ? file
           : typeof file?.path === "string"
             ? file.path
             : "";
-        const name = typeof file !== "string" && typeof file?.name === "string"
-          ? file.name
+        const rawName =
+          typeof file !== "string" ? (file as { name?: unknown }).name : "";
+        const name = typeof rawName === "string"
+          ? rawName
           : path.split("/").pop() || path;
-        return { path, name };
+        const head = typeof file !== "string" && typeof file?.head === "string"
+          ? file.head
+          : "";
+        const repoPath = typeof file !== "string" && typeof file?.repo_path === "string"
+          ? file.repo_path
+          : "";
+        const repoName = typeof file !== "string" && typeof file?.repo_name === "string"
+          ? file.repo_name
+          : repoPath.split(/[\\/]/).filter(Boolean).pop() || "";
+        const repoKind = typeof file !== "string" && typeof file?.repo_kind === "string"
+          ? file.repo_kind
+          : "";
+        const rootID = typeof file !== "string" && typeof file?.root_id === "string"
+          ? file.root_id
+          : "";
+        return { path, name, head, repo_path: repoPath, repo_name: repoName, repo_kind: repoKind, root_id: rootID };
       })
       .filter((file) => file.path);
   }, [relatedSessionSnapshot]);
+  const selectedSessionRelatedFileGroups = useMemo(
+    () => {
+      const currentRootPath = normalizePath(
+        managedRootByIdRef.current[relatedSessionRootId || currentRootId || ""]?.root_path || "",
+      );
+      const repoGroups = selectedSessionRelatedFiles.reduce<
+        Array<{
+          key: string;
+          repoPath: string;
+          repoName: string;
+          repoKind: string;
+          headGroups: Array<{ key: string; head: string; files: typeof selectedSessionRelatedFiles }>;
+        }>
+      >((groups, file) => {
+        const head = file.head || "";
+        const rawRepoPath = file.repo_path || "";
+        const isCurrentRepoRecord =
+          !rawRepoPath ||
+          file.repo_name === "当前项目" ||
+          (currentRootPath && normalizePath(rawRepoPath) === currentRootPath);
+        const repoPath = isCurrentRepoRecord ? "" : rawRepoPath;
+        const rawRepoKind = file.repo_kind || "";
+        const repoKind = isCurrentRepoRecord && rawRepoKind !== "plain" ? "" : rawRepoKind;
+        const repoKey = `${repoKind}\0${repoPath}`;
+        let repoGroup = groups.find((group) => group.key === repoKey);
+        if (!repoGroup) {
+          repoGroup = {
+            key: repoKey,
+            repoPath,
+            repoName: isCurrentRepoRecord
+              ? "当前项目"
+              : file.repo_name || repoPath.split(/[\\/]/).filter(Boolean).pop() || "当前项目",
+            repoKind,
+            headGroups: [],
+          };
+          groups.push(repoGroup);
+        }
+        const headKey = `${repoKey}\0${head}`;
+        const existing = repoGroup.headGroups.find((group) => group.key === headKey);
+        if (existing) {
+          existing.files.push(file);
+        } else {
+          repoGroup.headGroups.push({
+            key: headKey,
+            head,
+            files: [file],
+          });
+        }
+        return groups;
+      }, []);
+      return repoGroups.flatMap((repoGroup) =>
+        repoGroup.headGroups.map((headGroup) => ({
+          key: headGroup.key,
+          head: headGroup.head,
+          repoPath: repoGroup.repoPath,
+          repoName: repoGroup.repoName,
+          repoKind: repoGroup.repoKind,
+          files: headGroup.files,
+        })),
+      );
+    },
+    [currentRootId, relatedSessionRootId, selectedSessionRelatedFiles],
+  );
   const renderRootRelatedContent = (root: string): React.ReactNode => {
     if (!root || root !== currentRootId || root !== relatedSessionRootId) {
       return null;
@@ -9961,14 +10191,44 @@ export function App({ onGoHome }: AppProps) {
     }
     return (
       <div style={{ display: "flex", flexDirection: "column", gap: "4px", minWidth: 0 }}>
-        {selectedSessionRelatedFiles.map((file) => {
-          const stats = gitFileStatsByPath[file.path];
-          const isSelected = file.path === relatedSelectedPath;
+        {selectedSessionRelatedFileGroups.map((group) => {
+          const isCurrentRepo =
+            !group.repoPath ||
+            normalizePath(group.repoPath) ===
+              normalizePath(managedRootByIdRef.current[root]?.root_path || "");
+          const showGroupHeader = group.repoKind === "plain" || group.head || !isCurrentRepo;
           return (
-            <div key={file.path} style={{ display: "flex", alignItems: "center", gap: "4px", minWidth: 0 }}>
+            <div key={group.key} style={{ display: "flex", flexDirection: "column", gap: "4px", minWidth: 0 }}>
+              {showGroupHeader ? (
+                <div
+                  title={[group.repoPath, group.head].filter(Boolean).join(" · ") || group.repoName || "当前项目"}
+                  style={{
+                    padding: "3px 6px 0",
+                    fontSize: "11px",
+                    color: "var(--text-secondary)",
+                    fontFamily: group.head ? "var(--mono-font, monospace)" : undefined,
+                  }}
+                >
+                  {group.repoKind === "plain"
+                    ? `${group.repoName || "当前项目"} · 非 Git`
+                    : group.head
+                      ? isCurrentRepo
+                        ? `HEAD ${group.head.slice(0, 8)}`
+                        : `${group.repoName || "当前项目"} · HEAD ${group.head.slice(0, 8)}`
+                      : group.repoName || "当前项目"}
+                </div>
+              ) : null}
+              {group.files.map((file) => {
+          const stats = gitFileStatsByPath[file.path];
+          const fileSelectionKey = relatedFileSelectionKey(file);
+          const isSelected = relatedSelectedFileKey
+            ? fileSelectionKey === relatedSelectedFileKey
+            : file.path === relatedSelectedPath;
+          return (
+            <div key={`${file.head || "legacy"}:${file.path}`} style={{ display: "flex", alignItems: "center", gap: "4px", minWidth: 0 }}>
               <button
                 type="button"
-                onClick={() => handleSelectedSessionFileClick(file.path)}
+                onClick={() => handleSelectedSessionFileClick(file)}
                 title={file.path}
                 style={{
                   flex: 1,
@@ -10011,7 +10271,14 @@ export function App({ onGoHome }: AppProps) {
                 title="移除关联文件"
                 onClick={(event) => {
                   event.stopPropagation();
-                  void handleRemoveSessionRelatedFile(relatedSessionRootId, relatedSessionKey, file.path);
+                  void handleRemoveSessionRelatedFile(
+                    relatedSessionRootId,
+                    relatedSessionKey,
+                    file.path,
+                    file.head,
+                    file.repo_path,
+                    file.repo_kind,
+                  );
                 }}
                 style={{
                   width: "18px",
@@ -10031,6 +10298,9 @@ export function App({ onGoHome }: AppProps) {
               >
                 x
               </button>
+            </div>
+          );
+              })}
             </div>
           );
         })}
@@ -11045,11 +11315,14 @@ export function App({ onGoHome }: AppProps) {
                     suppressTreeExpand: true,
                   });
                 }}
-                onRemoveRelatedFile={(path) =>
+                onRemoveRelatedFile={(path, head, repoPath, repoKind) =>
                   void handleRemoveSessionRelatedFile(
                     currentRootId,
                     drawerSessionSnapshot?.key || drawerSessionSnapshot?.session_key,
                     path,
+                    head,
+                    repoPath,
+                    repoKind,
                   )
                 }
                 onAskUserAnswer={handleAskUserAnswer}

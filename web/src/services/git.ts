@@ -24,13 +24,16 @@ export type GitStatusPayload = {
 
 export type GitDiffPayload = CachedGitDiffPayload & {
   path: string;
+  display_path?: string;
   old_path?: string;
   status: GitStatusCode | string;
   additions: number;
   deletions: number;
   content: string;
   commit?: string;
-  source?: "worktree" | "commit";
+  base_head?: string;
+  target_head?: string;
+  source?: "worktree" | "commit" | "commit_range";
 };
 
 export type GitHistoryItem = {
@@ -548,6 +551,7 @@ export async function fetchGitDiff(
   const payload = await protectedJSON<any>(appURL("/api/git/diff", new URLSearchParams({ root: rootId, path })));
   const diff = {
     path: typeof payload?.path === "string" ? payload.path : path,
+    display_path: typeof payload?.display_path === "string" ? payload.display_path : undefined,
     old_path: typeof payload?.old_path === "string" ? payload.old_path : undefined,
     status: typeof payload?.status === "string" ? payload.status : "M",
     additions: Number(payload?.additions) || 0,
@@ -584,8 +588,9 @@ export async function fetchGitCommitDiff(
     appURL("/api/git/commit/diff", new URLSearchParams({ root: rootId, commit, path })),
   ).then((payload) => {
     const diff = {
-      path: typeof payload?.path === "string" ? payload.path : path,
-      old_path: typeof payload?.old_path === "string" ? payload.old_path : item.old_path,
+    path: typeof payload?.path === "string" ? payload.path : path,
+    display_path: typeof payload?.display_path === "string" ? payload.display_path : undefined,
+    old_path: typeof payload?.old_path === "string" ? payload.old_path : item.old_path,
       status: typeof payload?.status === "string" ? payload.status : item.status,
       additions: Number(payload?.additions) || Number(item.additions) || 0,
       deletions: Number(payload?.deletions) || Number(item.deletions) || 0,
@@ -602,4 +607,36 @@ export async function fetchGitCommitDiff(
   });
   gitCommitDiffInflight.set(key, promise);
   return promise;
+}
+
+export async function fetchGitRelatedFileDiff(
+  rootId: string,
+  file: { path: string; head?: string; repo_path?: string; repo_kind?: string },
+): Promise<GitDiffPayload> {
+  const path = file.path;
+  const head = file.head || "";
+  const params = new URLSearchParams({ root: rootId, path });
+  if (head) {
+    params.set("head", head);
+  }
+  if (file.repo_path) {
+    params.set("repo_path", file.repo_path);
+  }
+  if (file.repo_kind) {
+    params.set("repo_kind", file.repo_kind);
+  }
+  const payload = await protectedJSON<any>(appURL("/api/git/related-file/diff", params));
+  return {
+    path: typeof payload?.path === "string" ? payload.path : path,
+    display_path: typeof payload?.display_path === "string" ? payload.display_path : undefined,
+    old_path: typeof payload?.old_path === "string" ? payload.old_path : undefined,
+    status: typeof payload?.status === "string" ? payload.status : "M",
+    additions: Number(payload?.additions) || 0,
+    deletions: Number(payload?.deletions) || 0,
+    content: typeof payload?.content === "string" ? payload.content : "",
+    file_meta: Array.isArray(payload?.file_meta) ? payload.file_meta : [],
+    base_head: typeof payload?.base_head === "string" ? payload.base_head : head,
+    target_head: typeof payload?.target_head === "string" ? payload.target_head : undefined,
+    source: payload?.source === "commit_range" ? "commit_range" : "worktree",
+  };
 }

@@ -74,9 +74,9 @@ type SessionViewerProps = {
     string,
     { status: string; additions: number; deletions: number }
   >;
-  onFileClick?: (path: string) => void;
+  onFileClick?: (file: RelatedFile & { name?: string }) => void;
   onRootClick?: (rootId: string) => void;
-  onRemoveRelatedFile?: (path: string) => void;
+  onRemoveRelatedFile?: (path: string, head?: string, repoPath?: string, repoKind?: string) => void;
   onAskUserAnswer?: (input: {
     rootId: string;
     sessionKey: string;
@@ -1334,7 +1334,25 @@ if (useInnerScrollContainer && !container) {
         typeof f === "string" ? f : typeof f?.path === "string" ? f.path : "";
       const name =
         typeof f?.name === "string" ? f.name : path.split("/").pop() || path;
-      return { path, name };
+      const head =
+        typeof f !== "string" && typeof f?.head === "string" ? f.head : "";
+      const repoPath =
+        typeof f !== "string" && typeof f?.repo_path === "string"
+          ? f.repo_path
+          : "";
+      const repoName =
+        typeof f !== "string" && typeof f?.repo_name === "string"
+          ? f.repo_name
+          : repoPath.split(/[\\/]/).filter(Boolean).pop() || "";
+      const repoKind =
+        typeof f !== "string" && typeof f?.repo_kind === "string"
+          ? f.repo_kind
+          : "";
+      const rootID =
+        typeof f !== "string" && typeof f?.root_id === "string"
+          ? f.root_id
+          : "";
+      return { path, name, head, repo_path: repoPath, repo_name: repoName, repo_kind: repoKind, root_id: rootID };
     })
     .filter((f) => f.path);
   const activeAskUserCallId = (() => {
@@ -1397,6 +1415,65 @@ if (useInnerScrollContainer && !container) {
   }
 
   const displayFiles = showAllFiles ? relatedFiles : relatedFiles.slice(0, 10);
+  const displayFileGroups = (() => {
+    const currentRootPath = String(rootPath || "").replace(/[\\/]+$/, "");
+    const repoGroups = displayFiles.reduce<
+      Array<{
+        key: string;
+        repoPath: string;
+        repoName: string;
+        repoKind: string;
+        headGroups: Array<{ key: string; head: string; files: typeof displayFiles }>;
+      }>
+    >((groups, file) => {
+    const head = file.head || "";
+    const rawRepoPath = file.repo_path || "";
+    const normalizedRepoPath = String(rawRepoPath || "").replace(/[\\/]+$/, "");
+    const isCurrentRepoRecord =
+      !rawRepoPath ||
+      file.repo_name === "当前项目" ||
+      (!!currentRootPath && normalizedRepoPath === currentRootPath);
+    const repoPath = isCurrentRepoRecord ? "" : rawRepoPath;
+    const rawRepoKind = file.repo_kind || "";
+    const repoKind = isCurrentRepoRecord && rawRepoKind !== "plain" ? "" : rawRepoKind;
+    const repoKey = `${repoKind}\0${repoPath}`;
+    let repoGroup = groups.find((group) => group.key === repoKey);
+    if (!repoGroup) {
+      repoGroup = {
+        key: repoKey,
+        repoPath,
+        repoName: isCurrentRepoRecord
+          ? "当前项目"
+          : file.repo_name || repoPath.split(/[\\/]/).filter(Boolean).pop() || "当前项目",
+        repoKind,
+        headGroups: [],
+      };
+      groups.push(repoGroup);
+    }
+    const headKey = `${repoKey}\0${head}`;
+    const existing = repoGroup.headGroups.find((group) => group.key === headKey);
+    if (existing) {
+      existing.files.push(file);
+    } else {
+      repoGroup.headGroups.push({
+        key: headKey,
+        head,
+        files: [file],
+      });
+    }
+    return groups;
+    }, []);
+    return repoGroups.flatMap((repoGroup) =>
+      repoGroup.headGroups.map((headGroup) => ({
+        key: headGroup.key,
+        head: headGroup.head,
+        repoPath: repoGroup.repoPath,
+        repoName: repoGroup.repoName,
+        repoKind: repoGroup.repoKind,
+        files: headGroup.files,
+      })),
+    );
+  })();
   const hasMoreFiles = relatedFiles.length > 10;
   const displayName =
     session.name ||
@@ -1610,7 +1687,7 @@ if (useInnerScrollContainer && !container) {
                         key={attachment.path}
                         type="button"
                         onClick={() =>
-                          onFileClickRef.current?.(attachment.path)
+                          onFileClickRef.current?.({ path: attachment.path })
                         }
                         style={{
                           border: "none",
@@ -1860,7 +1937,7 @@ if (useInnerScrollContainer && !container) {
               <MarkdownViewer
                 content={item.content || ""}
                 root={rootId || undefined}
-                onFileClick={onFileClickRef.current}
+                onFileClick={(path) => onFileClickRef.current?.({ path })}
               />
             </div>
             {!hideAssistantMeta && (
@@ -2174,7 +2251,7 @@ if (useInnerScrollContainer && !container) {
             <MarkdownViewer
               content={content}
               root={rootId || undefined}
-              onFileClick={onFileClickRef.current}
+              onFileClick={(path) => onFileClickRef.current?.({ path })}
             />
           </div>
         ) : null}
@@ -2449,121 +2526,168 @@ if (useInnerScrollContainer && !container) {
                       gap: "4px",
                     }}
                   >
-                    {displayFiles.map((file, i) => (
-                      <div
-                        key={i}
-                        style={{
-                          display: "flex",
-                          alignItems: "center",
-                          gap: "6px",
-                        }}
-                      >
+                    {displayFileGroups.map((group) => {
+                      const normalizedRepoPath = String(group.repoPath || "").replace(/[\\/]+$/, "");
+                      const normalizedRootPath = String(rootPath || "").replace(/[\\/]+$/, "");
+                      const isCurrentRepo =
+                        !group.repoPath ||
+                        group.repoName === "当前项目" ||
+                        normalizedRepoPath === normalizedRootPath;
+                      const showGroupHeader = group.repoKind === "plain" || group.head || !isCurrentRepo;
+                      return (
                         <div
-                          onClick={() => onFileClickRef.current?.(file.path)}
+                          key={group.key}
                           style={{
                             display: "flex",
-                            alignItems: "center",
-                            gap: "8px",
-                            flex: 1,
-                            minWidth: 0,
-                            padding: "3px 6px",
-                            borderRadius: "6px",
-                            cursor: "pointer",
-                            transition: "background 0.15s",
-                          }}
-                          onMouseEnter={(e) => {
-                            e.currentTarget.style.background =
-                              "rgba(0,0,0,0.04)";
-                          }}
-                          onMouseLeave={(e) => {
-                            e.currentTarget.style.background = "transparent";
+                            flexDirection: "column",
+                            gap: "4px",
                           }}
                         >
-                          <svg
-                            xmlns="http://www.w3.org/2000/svg"
-                            width="13"
-                            height="13"
-                            viewBox="0 0 24 24"
-                            fill="none"
-                            stroke="#94a3b8"
-                            strokeWidth="2"
-                            strokeLinecap="round"
-                            strokeLinejoin="round"
-                            aria-hidden="true"
-                            style={{ flexShrink: 0 }}
-                          >
-                            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
-                            <polyline points="14 2 14 8 20 8" />
-                            <line x1="16" x2="8" y1="13" y2="13" />
-                            <line x1="16" x2="8" y1="17" y2="17" />
-                            <line x1="10" x2="8" y1="9" y2="9" />
-                          </svg>
-                          <div
-                            style={{
-                              flex: 1,
-                              minWidth: 0,
-                              fontSize: "12px",
-                              color: "var(--text-primary)",
-                              overflow: "hidden",
-                              textOverflow: "ellipsis",
-                              whiteSpace: "nowrap",
-                            }}
-                          >
-                            {file.name}
-                          </div>
-                          {gitFileStatsByPath[file.path] ? (
+                          {showGroupHeader ? (
                             <div
+                              title={[group.repoPath, group.head].filter(Boolean).join(" · ") || group.repoName || "当前项目"}
                               style={{
-                                display: "inline-flex",
-                                alignItems: "center",
-                                gap: "8px",
+                                padding: "2px 6px 0",
                                 fontSize: "11px",
                                 color: "var(--text-secondary)",
+                                fontFamily: group.head
+                                  ? "var(--mono-font, monospace)"
+                                  : undefined,
+                              }}
+                            >
+                              {group.repoKind === "plain"
+                                ? `${group.repoName || "当前项目"} · 非 Git`
+                                : group.head
+                                  ? isCurrentRepo
+                                    ? `HEAD ${group.head.slice(0, 8)}`
+                                    : `${group.repoName || "当前项目"} · HEAD ${group.head.slice(0, 8)}`
+                                  : group.repoName || "当前项目"}
+                            </div>
+                          ) : null}
+                          {group.files.map((file) => (
+                          <div
+                            key={`${file.head || "legacy"}:${file.path}`}
+                            style={{
+                              display: "flex",
+                              alignItems: "center",
+                              gap: "6px",
+                            }}
+                          >
+                            <div
+                              onClick={() => onFileClickRef.current?.(file)}
+                              style={{
+                                display: "flex",
+                                alignItems: "center",
+                                gap: "8px",
+                                flex: 1,
+                                minWidth: 0,
+                                padding: "3px 6px",
+                                borderRadius: "6px",
+                                cursor: "pointer",
+                                transition: "background 0.15s",
+                              }}
+                              onMouseEnter={(e) => {
+                                e.currentTarget.style.background =
+                                  "rgba(0,0,0,0.04)";
+                              }}
+                              onMouseLeave={(e) => {
+                                e.currentTarget.style.background =
+                                  "transparent";
+                              }}
+                            >
+                              <svg
+                                xmlns="http://www.w3.org/2000/svg"
+                                width="13"
+                                height="13"
+                                viewBox="0 0 24 24"
+                                fill="none"
+                                stroke="#94a3b8"
+                                strokeWidth="2"
+                                strokeLinecap="round"
+                                strokeLinejoin="round"
+                                aria-hidden="true"
+                                style={{ flexShrink: 0 }}
+                              >
+                                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                                <polyline points="14 2 14 8 20 8" />
+                                <line x1="16" x2="8" y1="13" y2="13" />
+                                <line x1="16" x2="8" y1="17" y2="17" />
+                                <line x1="10" x2="8" y1="9" y2="9" />
+                              </svg>
+                              <div
+                                style={{
+                                  flex: 1,
+                                  minWidth: 0,
+                                  fontSize: "12px",
+                                  color: "var(--text-primary)",
+                                  overflow: "hidden",
+                                  textOverflow: "ellipsis",
+                                  whiteSpace: "nowrap",
+                                }}
+                              >
+                                {file.name}
+                              </div>
+                              {gitFileStatsByPath[file.path] ? (
+                                <div
+                                  style={{
+                                    display: "inline-flex",
+                                    alignItems: "center",
+                                    gap: "8px",
+                                    fontSize: "11px",
+                                    color: "var(--text-secondary)",
+                                    flexShrink: 0,
+                                  }}
+                                >
+                                  <span
+                                    style={{
+                                      color: "#15803d",
+                                      fontVariantNumeric: "tabular-nums",
+                                    }}
+                                  >
+                                    +{gitFileStatsByPath[file.path].additions}
+                                  </span>
+                                  <span
+                                    style={{
+                                      color: "#b91c1c",
+                                      fontVariantNumeric: "tabular-nums",
+                                    }}
+                                  >
+                                    -{gitFileStatsByPath[file.path].deletions}
+                                  </span>
+                                </div>
+                              ) : null}
+                            </div>
+                            <button
+                              type="button"
+                              aria-label={`移除关联文件 ${file.name}`}
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                onRemoveRelatedFile?.(
+                                  file.path,
+                                  file.head,
+                                  file.repo_path,
+                                  file.repo_kind,
+                                );
+                              }}
+                              style={{
+                                border: "none",
+                                background: "transparent",
+                                color: "#dc2626",
+                                cursor: "pointer",
+                                fontSize: "14px",
+                                lineHeight: 1,
+                                padding: "2px 4px",
+                                borderRadius: "4px",
                                 flexShrink: 0,
                               }}
                             >
-                              <span
-                                style={{
-                                  color: "#15803d",
-                                  fontVariantNumeric: "tabular-nums",
-                                }}
-                              >
-                                +{gitFileStatsByPath[file.path].additions}
-                              </span>
-                              <span
-                                style={{
-                                  color: "#b91c1c",
-                                  fontVariantNumeric: "tabular-nums",
-                                }}
-                              >
-                                -{gitFileStatsByPath[file.path].deletions}
-                              </span>
-                            </div>
-                          ) : null}
+                              x
+                            </button>
+                          </div>
+                          ))}
                         </div>
-                        <button
-                          type="button"
-                          aria-label={`移除关联文件 ${file.name}`}
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            onRemoveRelatedFile?.(file.path);
-                          }}
-                          style={{
-                            border: "none",
-                            background: "transparent",
-                            color: "#dc2626",
-                            cursor: "pointer",
-                            fontSize: "14px",
-                            lineHeight: 1,
-                            padding: "2px 4px",
-                            borderRadius: "4px",
-                            flexShrink: 0,
-                          }}
-                        >
-                          x
-                        </button>
-                      </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 ) : null}
               </div>

@@ -1,6 +1,7 @@
 package fs
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -37,6 +38,64 @@ func TestRegistryUpsertRejectsSameNameDifferentPath(t *testing.T) {
 	_, err = registry.Upsert(second)
 	if !errors.Is(err, ErrRootNameConflict) {
 		t.Fatalf("different-path Upsert error = %v, want ErrRootNameConflict", err)
+	}
+}
+
+func TestSharedFileWatcherResolveRelatedFileRecordPlainRoot(t *testing.T) {
+	rootDir := t.TempDir()
+	root := NewRootInfo("root", "plain-root", rootDir)
+	watcher := &SharedFileWatcher{root: root}
+
+	record, ok := watcher.resolveRelatedFileRecord(context.Background(), filepath.Join(rootDir, "notes", "todo.txt"))
+	if !ok {
+		t.Fatal("resolveRelatedFileRecord returned false")
+	}
+	if record.repoKind != "plain" {
+		t.Fatalf("repoKind = %q, want plain", record.repoKind)
+	}
+	if record.repoPath != filepath.Clean(rootDir) {
+		t.Fatalf("repoPath = %q, want %q", record.repoPath, filepath.Clean(rootDir))
+	}
+	if record.repoName != "plain-root" {
+		t.Fatalf("repoName = %q, want plain-root", record.repoName)
+	}
+	if record.path != "notes/todo.txt" {
+		t.Fatalf("path = %q, want notes/todo.txt", record.path)
+	}
+}
+
+func TestSharedFileWatcherResolveRelatedFileRecordSiblingGitWorktree(t *testing.T) {
+	rootDir := t.TempDir()
+	worktreeDir := t.TempDir()
+	root := NewRootInfo("root", "main-root", rootDir)
+	watcher := &SharedFileWatcher{
+		root: root,
+		worktreeResolver: func(ctx context.Context, root RootInfo, filePath string) (RelatedWorktreeMatch, bool) {
+			return RelatedWorktreeMatch{
+				Path: worktreeDir,
+				Head: "abc123",
+			}, true
+		},
+	}
+
+	record, ok := watcher.resolveRelatedFileRecord(context.Background(), filepath.Join(worktreeDir, "src", "main.go"))
+	if !ok {
+		t.Fatal("resolveRelatedFileRecord returned false")
+	}
+	if record.repoKind != "git" {
+		t.Fatalf("repoKind = %q, want git", record.repoKind)
+	}
+	if record.repoPath != filepath.Clean(worktreeDir) {
+		t.Fatalf("repoPath = %q, want %q", record.repoPath, filepath.Clean(worktreeDir))
+	}
+	if record.repoName != filepath.Base(filepath.Clean(worktreeDir)) {
+		t.Fatalf("repoName = %q, want %q", record.repoName, filepath.Base(filepath.Clean(worktreeDir)))
+	}
+	if record.path != "src/main.go" {
+		t.Fatalf("path = %q, want src/main.go", record.path)
+	}
+	if record.head != "abc123" {
+		t.Fatalf("head = %q, want abc123", record.head)
 	}
 }
 

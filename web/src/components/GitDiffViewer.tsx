@@ -271,6 +271,7 @@ export function GitDiffViewer({ diff, root, sideBySide = false, onPathClick, onS
   const lines = React.useMemo(() => buildDiffLines(diff.content), [diff.content]);
   const sideBySideRows = React.useMemo(() => buildSideBySideRows(lines), [lines]);
   const relatedSessions = React.useMemo(() => normalizeRelatedSessions(diff.file_meta), [diff.file_meta]);
+  const displayPath = diff.display_path || diff.path;
   const contentRootRef = React.useRef<HTMLDivElement | null>(null);
   const [isMobile, setIsMobile] = React.useState(() => {
     if (typeof window === "undefined") return false;
@@ -347,7 +348,7 @@ export function GitDiffViewer({ diff, root, sideBySide = false, onPathClick, onS
     <div style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0 }}>
       <header style={{ height: "36px", padding: "0 16px", borderBottom: "1px solid var(--border-color)", display: "flex", alignItems: "center", gap: "10px", background: "var(--mindfs-topbar-bg, transparent)", boxSizing: "border-box", flexShrink: 0 }}>
         <div style={{ display: "flex", alignItems: "center", overflow: "hidden", flex: 1, minWidth: 0 }}>
-          <Breadcrumbs root={root} path={diff.path} onPathClick={onPathClick} />
+          <Breadcrumbs root={root} path={displayPath} onPathClick={onPathClick} />
 
           {relatedSessions.length > 0 ? (
             <div style={{ marginLeft: "16px", display: "flex", alignItems: "center", gap: "6px", minWidth: 0, flexShrink: 0 }}>

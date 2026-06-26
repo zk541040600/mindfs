@@ -60,7 +60,12 @@ function estimateCommandTerminalCols(): number | undefined {
 }
 
 export type RelatedFile = {
+  root_id?: string;
+  repo_path?: string;
+  repo_name?: string;
+  repo_kind?: "git" | "plain" | string;
   path: string;
+  head?: string;
   relation?: string;
   created_by_session?: boolean;
 };
@@ -1194,9 +1199,21 @@ class SessionService {
     rootId: string,
     sessionKey: string,
     path: string,
+    head = "",
+    repoPath = "",
+    repoKind = "",
   ): Promise<boolean> {
     try {
       const params = new URLSearchParams({ root: rootId, path });
+      if (head) {
+        params.set("head", head);
+      }
+      if (repoPath) {
+        params.set("repo_path", repoPath);
+      }
+      if (repoKind) {
+        params.set("repo_kind", repoKind);
+      }
       const res = await protectedFetch(
         appURL(
           `/api/sessions/${encodeURIComponent(sessionKey)}/related-files`,

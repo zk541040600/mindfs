@@ -16,6 +16,7 @@ export type ErrorCode =
   | "root.delete_failed"
   | "root.rename_failed"
   | "git.checkout_failed"
+  | "git.related_file_diff_failed"
   // Agent errors
   | "agent.unavailable"
   | "agent.timeout"
@@ -171,6 +172,11 @@ class ErrorService {
       "git.checkout_failed": {
         message: "切换分支失败",
         severity: "error",
+        recoverable: true,
+      },
+      "git.related_file_diff_failed": {
+        message: "关联文件 diff 不可用",
+        severity: "warning",
         recoverable: true,
       },
       "agent.unavailable": {

@@ -253,6 +253,18 @@ type GitCommitDiffOutput struct {
 	Diff gitview.DiffResult
 }
 
+type GitRelatedFileDiffInput struct {
+	RootID   string
+	RepoPath string
+	RepoKind string
+	Head     string
+	Path     string
+}
+
+type GitRelatedFileDiffOutput struct {
+	Diff gitview.RelatedFileDiffResult
+}
+
 func (s *Service) ReadFile(ctx context.Context, in ReadFileInput) (ReadFileOutput, error) {
 	if err := s.ensureRegistry(); err != nil {
 		return ReadFileOutput{}, err
@@ -397,6 +409,46 @@ func (s *Service) GetGitCommitDiff(ctx context.Context, in GitCommitDiffInput) (
 	}
 	diff.FileMeta = fillFileMetaSessionInfo(ctx, s, in.RootID, meta)
 	return GitCommitDiffOutput{Diff: diff}, nil
+}
+
+func (s *Service) GetGitRelatedFileDiff(ctx context.Context, in GitRelatedFileDiffInput) (GitRelatedFileDiffOutput, error) {
+	if err := s.ensureRegistry(); err != nil {
+		return GitRelatedFileDiffOutput{}, err
+	}
+	root, err := s.Registry.GetRoot(in.RootID)
+	if err != nil {
+		return GitRelatedFileDiffOutput{}, err
+	}
+	if strings.TrimSpace(in.Path) == "" {
+		return GitRelatedFileDiffOutput{}, errors.New("path required")
+	}
+	path := strings.TrimSpace(in.Path)
+	repoPath := strings.TrimSpace(in.RepoPath)
+	rootPath := root.RootPath
+	if repoPath != "" {
+		if !filepath.IsAbs(repoPath) {
+			return GitRelatedFileDiffOutput{}, errors.New("repo path must be absolute")
+		}
+		rootPath = filepath.Clean(repoPath)
+	} else {
+		var err error
+		path, err = root.NormalizePath(path)
+		if err != nil {
+			return GitRelatedFileDiffOutput{}, err
+		}
+	}
+	diff, err := gitview.ReadRelatedFileDiff(ctx, rootPath, in.Head, path)
+	if err != nil {
+		return GitRelatedFileDiffOutput{}, err
+	}
+	var meta []fs.FileMetaEntry
+	if repoPath == "" || sameManagedDirPath(repoPath, root.RootPath) {
+		if value, err := root.GetFileMeta(path); err == nil {
+			meta = value
+		}
+	}
+	diff.FileMeta = fillFileMetaSessionInfo(ctx, s, in.RootID, meta)
+	return GitRelatedFileDiffOutput{Diff: diff}, nil
 }
 
 func resolveUploadDir(root fs.RootInfo, dir string) (string, string, error) {

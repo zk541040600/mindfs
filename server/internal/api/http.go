@@ -274,6 +274,7 @@ func (h *HTTPHandler) Routes() http.Handler {
 	r.Get("/api/git/history", h.protectedEndpoint(h.handleGitHistory))
 	r.Get("/api/git/commit/files", h.protectedEndpoint(h.handleGitCommitFiles))
 	r.Get("/api/git/commit/diff", h.protectedEndpoint(h.handleGitCommitDiff))
+	r.Get("/api/git/related-file/diff", h.protectedEndpoint(h.handleGitRelatedFileDiff))
 	r.Get("/api/git/branches", h.protectedEndpoint(h.handleGitBranches))
 	r.Get("/api/git/worktrees", h.protectedEndpoint(h.handleGitWorktreeList))
 	r.Post("/api/git/checkout", h.protectedEndpoint(h.handleGitCheckout))
@@ -795,6 +796,9 @@ func (h *HTTPHandler) handleSessionRelatedFilesDelete(w http.ResponseWriter, r *
 	rootID := r.URL.Query().Get("root")
 	key := chi.URLParam(r, "key")
 	path := strings.TrimSpace(r.URL.Query().Get("path"))
+	head := strings.TrimSpace(r.URL.Query().Get("head"))
+	repoPath := strings.TrimSpace(r.URL.Query().Get("repo_path"))
+	repoKind := strings.TrimSpace(r.URL.Query().Get("repo_kind"))
 	if strings.TrimSpace(key) == "" {
 		respondError(w, http.StatusBadRequest, errInvalidRequest("session key required"))
 		return
@@ -805,9 +809,12 @@ func (h *HTTPHandler) handleSessionRelatedFilesDelete(w http.ResponseWriter, r *
 	}
 	uc := h.service()
 	if err := uc.RemoveSessionRelatedFile(r.Context(), usecase.RemoveSessionRelatedFileInput{
-		RootID: rootID,
-		Key:    key,
-		Path:   path,
+		RootID:   rootID,
+		Key:      key,
+		Path:     path,
+		Head:     head,
+		RepoPath: repoPath,
+		RepoKind: repoKind,
 	}); err != nil {
 		respondError(w, http.StatusNotFound, err)
 		return
@@ -1595,6 +1602,35 @@ func (h *HTTPHandler) handleGitCommitDiff(w http.ResponseWriter, r *http.Request
 		RootID: rootID,
 		Commit: commit,
 		Path:   path,
+	})
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err)
+		return
+	}
+	respondJSON(w, http.StatusOK, out.Diff)
+}
+
+func (h *HTTPHandler) handleGitRelatedFileDiff(w http.ResponseWriter, r *http.Request) {
+	rootID := strings.TrimSpace(r.URL.Query().Get("root"))
+	repoPath := strings.TrimSpace(r.URL.Query().Get("repo_path"))
+	repoKind := strings.TrimSpace(r.URL.Query().Get("repo_kind"))
+	head := strings.TrimSpace(r.URL.Query().Get("head"))
+	path := strings.TrimSpace(r.URL.Query().Get("path"))
+	if rootID == "" {
+		respondError(w, http.StatusBadRequest, errInvalidRequest("root required"))
+		return
+	}
+	if path == "" {
+		respondError(w, http.StatusBadRequest, errInvalidRequest("path required"))
+		return
+	}
+	uc := h.service()
+	out, err := uc.GetGitRelatedFileDiff(r.Context(), usecase.GitRelatedFileDiffInput{
+		RootID:   rootID,
+		RepoPath: repoPath,
+		RepoKind: repoKind,
+		Head:     head,
+		Path:     path,
 	})
 	if err != nil {
 		respondError(w, http.StatusBadRequest, err)
