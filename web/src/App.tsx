@@ -23,6 +23,7 @@ import {
   type ExtensionUIResponse,
   type AgentSDKStatus,
   type QueuedUserMessage,
+  type GoalState,
 } from "./services/session";
 import { buildClientContext } from "./services/context";
 import { e2eeService, type E2EEState } from "./services/e2ee";
@@ -516,6 +517,7 @@ type Exchange = {
   todoUpdate?: any;
   planUpdate?: any;
   compactNotice?: any;
+  goalState?: GoalState;
   pending_ack?: boolean;
 };
 type PendingSend = {
@@ -4264,6 +4266,47 @@ export function App({ onGoHome }: AppProps) {
         ...(base as any),
         exchanges: updateList(((base as any).exchanges || []) as Exchange[]),
         updated_at: new Date().toISOString(),
+      } as Session;
+      bumpCacheVersion();
+    },
+    [rootSessionKey, bumpCacheVersion],
+  );
+
+  const appendGoalStateForSession = useCallback(
+    (rootID: string, sessionKey: string, goalState: GoalState) => {
+      if (!goalState?.status) return;
+      const now = goalState.updatedAt || new Date().toISOString();
+      const cacheKey = rootSessionKey(rootID, sessionKey);
+      const updateList = (prevList: Exchange[]) => {
+        const list = [...(prevList || [])];
+        for (let i = list.length - 1; i >= 0; i -= 1) {
+          if (list[i]?.role !== "goal") continue;
+          list[i] = {
+            ...list[i],
+            timestamp: now,
+            goalState: { ...goalState },
+          };
+          return list;
+        }
+        list.push({ role: "goal", content: "", timestamp: now, goalState: { ...goalState } });
+        return list;
+      };
+      const cached = sessionCacheRef.current[cacheKey];
+      const base =
+        cached ||
+        ({
+          key: sessionKey,
+          type: "chat",
+          agent: "",
+          name: "",
+          created_at: now,
+          updated_at: now,
+          exchanges: [],
+        } as any);
+      sessionCacheRef.current[cacheKey] = {
+        ...(base as any),
+        exchanges: updateList(((base as any).exchanges || []) as Exchange[]),
+        updated_at: now,
       } as Session;
       bumpCacheVersion();
     },
@@ -9304,6 +9347,14 @@ export function App({ onGoHome }: AppProps) {
           );
           updateDrawerIfShowingStream();
           break;
+        case "goal_state":
+          appendGoalStateForSession(
+            activeRoot,
+            streamKey,
+            event.data || ({} as GoalState),
+          );
+          updateDrawerIfShowingStream();
+          break;
         case "message_done":
           attachContextWindowToLatestAssistant(
             activeRoot,
@@ -9895,20 +9946,27 @@ export function App({ onGoHome }: AppProps) {
           const pending = requestId
             ? pendingRequestRef.current[requestId]
             : null;
-          if (!requestId || !pending) {
-            console.warn("[session/ws] error_without_pending", { requestId, payloadSessionKey: typeof payload?.session_key === "string" ? payload.session_key : null });
+          const payloadSessionKey =
+            typeof payload?.session_key === "string" ? payload.session_key : "";
+          const failedKey = pending?.sessionKey || pending?.tempKey || payloadSessionKey;
+          const rootID =
+            pending?.rootId ||
+            (typeof payload?.root_id === "string" ? payload.root_id : "") ||
+            resolveRootForSessionKey(failedKey) ||
+            currentRootIdRef.current ||
+            "";
+          if (!rootID || !failedKey) {
+            console.warn("[session/ws] error_without_session", { requestId, payloadSessionKey: payloadSessionKey || null });
             break;
           }
-          console.warn("[session/ws] error", { requestId, rootId: pending.rootId, sessionKey: pending.sessionKey || null, tempKey: pending.tempKey || null });
-          delete pendingRequestRef.current[requestId];
-          const targetKey = pending.tempKey || "";
-          const failedKey = pending.sessionKey || targetKey;
-          const rootID = pending.rootId;
-          if (failedKey) {
-            setMultiProjectSessionPending(rootID, failedKey, false);
+          console.warn("[session/ws] error", { requestId: requestId || null, rootId: rootID, sessionKey: failedKey });
+          if (requestId && pending) {
+            delete pendingRequestRef.current[requestId];
           }
+          setMultiProjectSessionPending(rootID, failedKey, false);
+          const targetKey = pending?.tempKey || "";
           const latestDrawer = drawerSessionByRootRef.current[rootID];
-          if (targetKey && latestDrawer?.key === targetKey) {
+          if (pending && targetKey && latestDrawer?.key === targetKey) {
             const exchanges = Array.isArray((latestDrawer as any).exchanges)
               ? ((latestDrawer as any).exchanges as Exchange[]).map(
                   (exchange) =>
@@ -9925,6 +9983,16 @@ export function App({ onGoHome }: AppProps) {
               exchanges,
             } as Session);
           }
+          handleSessionStreamDone(rootID, failedKey, requestId);
+          reportError(
+            "session.resume_failed",
+            typeof payload?.error_message === "string"
+              ? payload.error_message
+              : "会话处理失败，请稍后重试",
+            {
+              details: { rootId: rootID, sessionKey: failedKey, requestId },
+            },
+          );
           break;
         }
         case "session.cancelled": {
@@ -10417,6 +10485,7 @@ export function App({ onGoHome }: AppProps) {
     clearPendingExtensionUIForSession,
     appendPlanUpdateForSession,
     appendCompactNoticeForSession,
+    appendGoalStateForSession,
     clearSessionStale,
     markSessionPending,
     markSessionTurnRunning,

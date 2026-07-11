@@ -88,6 +88,7 @@ export type ExchangeAux = {
   todo?: TodoUpdate | null;
   plan?: PlanUpdate | null;
   compact?: CompactNotice | null;
+  goal_state?: GoalState | null;
 };
 
 export type Session = {
@@ -234,6 +235,20 @@ export type CompactNotice = {
   summary?: string;
 };
 
+export type GoalState = {
+  objective?: string;
+  status: "active" | "paused" | "complete";
+  autoContinue?: boolean;
+  updatedAt?: string;
+  usage?: {
+    tokensUsed?: number;
+    activeSeconds?: number;
+  };
+  pauseReason?: string;
+  pauseSuggestedAction?: string;
+  stopReason?: string;
+};
+
 export type StreamEvent =
   | { type: "message_chunk"; data: { content: string } }
   | { type: "thought_chunk"; data: { id?: string; content: string } }
@@ -243,6 +258,7 @@ export type StreamEvent =
   | { type: "extension_ui"; data: ExtensionUIRequest }
   | { type: "plan_update"; data: PlanUpdate }
   | { type: "compact_notice"; data: CompactNotice }
+  | { type: "goal_state"; data: GoalState }
   | { type: "recovery"; data: { message: string } }
   | {
       type: "message_done";
@@ -697,9 +713,12 @@ class SessionService {
       }
     } else if (type === "session.done" && typeof msg.id === "string") {
       payload.request_id = msg.id;
-    } else if (type === "session.error" && typeof msg.id === "string") {
-      this.pendingMessages.delete(msg.id);
-      payload.request_id = msg.id;
+    } else if (type === "session.error") {
+      if (typeof msg.id === "string") {
+        this.pendingMessages.delete(msg.id);
+        payload.request_id = msg.id;
+      }
+      payload.error_message = msg.error?.message || "Unknown error";
     }
     this.emitDecrypted(type, sessionKey, payload, msg);
   }

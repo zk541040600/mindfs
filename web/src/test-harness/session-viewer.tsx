@@ -16,16 +16,34 @@ function SessionViewerHarness() {
     pending,
     exchanges: [
       {
+		seq: 1,
         role: "user",
         content: "hello",
         timestamp: "2026-06-12T00:00:00.000Z",
       },
       {
+		seq: 2,
         role: "assistant",
         content: "already answered",
         timestamp: "2026-06-12T00:00:01.000Z",
       },
     ],
+	exchange_aux: {
+		"2": [
+			{
+				seq: 2,
+				line: 1,
+				goal_state: {
+					objective: "repair web session history",
+					status: "paused" as const,
+					autoContinue: false,
+					pauseReason: "waiting for restart approval",
+					pauseSuggestedAction: "approve restart",
+					usage: { tokensUsed: 42, activeSeconds: 8 },
+				},
+			},
+		],
+	},
   };
 
   return (

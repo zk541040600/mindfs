@@ -58,6 +58,20 @@ type BindPollResult struct {
 	Credentials   RelayCredentials
 }
 
+type PublicAccessState string
+
+const (
+	PublicAccessAvailable    PublicAccessState = "available"
+	PublicAccessAuthRequired PublicAccessState = "auth_required"
+	PublicAccessUnavailable  PublicAccessState = "unavailable"
+)
+
+type PublicHealthResult struct {
+	State      PublicAccessState
+	StatusCode int
+	Diagnostic string
+}
+
 type SessionHooks struct {
 	OnConnected    func()
 	OnDisconnected func(error)
@@ -235,24 +249,35 @@ func buildBindPollURL(baseURL, pendingCode string) (string, error) {
 	}
 }
 
-func (s *Service) CheckPublicHealth(ctx context.Context, nodeURL string) error {
+func (s *Service) CheckPublicHealth(ctx context.Context, nodeURL string) PublicHealthResult {
 	healthURL := strings.TrimSuffix(strings.TrimSpace(nodeURL), "/") + "/health"
 	if healthURL == "/health" {
-		return errors.New("relay node URL required")
+		return PublicHealthResult{State: PublicAccessUnavailable, Diagnostic: "relay node URL required"}
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, healthURL, nil)
 	if err != nil {
-		return err
+		return PublicHealthResult{State: PublicAccessUnavailable, Diagnostic: err.Error()}
 	}
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return err
+		return PublicHealthResult{State: PublicAccessUnavailable, Diagnostic: err.Error()}
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("relay public health failed: %s", resp.Status)
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return PublicHealthResult{State: PublicAccessAvailable, StatusCode: resp.StatusCode}
 	}
-	return nil
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return PublicHealthResult{
+			State:      PublicAccessAuthRequired,
+			StatusCode: resp.StatusCode,
+			Diagnostic: "browser authentication required: " + resp.Status,
+		}
+	}
+	return PublicHealthResult{
+		State:      PublicAccessUnavailable,
+		StatusCode: resp.StatusCode,
+		Diagnostic: "relay public health returned " + resp.Status,
+	}
 }
 
 func (s *Service) runSession(ctx context.Context, creds RelayCredentials, hooks SessionHooks) (retErr error) {

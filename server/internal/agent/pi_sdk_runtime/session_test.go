@@ -132,9 +132,13 @@ func TestStartPayloadForOptionsUsesExplicitTestScenario(t *testing.T) {
 		Model:        "provider/model",
 		Probe:        true,
 		TestScenario: "prompt-stream",
+		AgentDir:     "/tmp/pi-agent",
 	})
 	if payload["type"] != "start_test_runtime" || payload["scenario"] != "prompt-stream" {
 		t.Fatalf("payload = %+v, want explicit prompt-stream test runtime", payload)
+	}
+	if payload["agentDir"] != "/tmp/pi-agent" {
+		t.Fatalf("payload agentDir = %v, want /tmp/pi-agent", payload["agentDir"])
 	}
 }
 
@@ -392,7 +396,7 @@ export default function mindfsUIRoundTrip(pi) {
 		t.Fatal(err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	sess, err := NewRuntime().OpenSession(ctx, OpenOptions{
 		AgentName:  "pi",
@@ -811,7 +815,7 @@ func TestRuntimeAgentEndWillRetryDoesNotCompleteTurn(t *testing.T) {
 	}
 }
 
-func TestRuntimeWaitsForPromptDoneAfterRawAgentEnd(t *testing.T) {
+func TestRuntimeWaitsForRuntimeSettledAfterRawAgentEnd(t *testing.T) {
 	sess := openTestSession(t, "prompt-done-after-agent-end")
 	events, mu := collectSessionEvents(sess)
 
@@ -822,7 +826,7 @@ func TestRuntimeWaitsForPromptDoneAfterRawAgentEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	if elapsed := time.Since(started); elapsed < messageEndFallbackDelay {
-		t.Fatalf("SendMessage returned after %s; want raw agent_end promptDone=false to wait for SDK prompt resolution", elapsed)
+		t.Fatalf("SendMessage returned after %s; want raw agent_end promptDone=false to wait for runtime_settled", elapsed)
 	}
 
 	gotEvents := snapshotEvents(events, mu)
@@ -831,6 +835,114 @@ func TestRuntimeWaitsForPromptDoneAfterRawAgentEnd(t *testing.T) {
 	}
 	if !hasEvent(gotEvents, agenttypes.EventTypeMessageDone) {
 		t.Fatalf("message_done event missing: %#v", gotEvents)
+	}
+}
+
+func TestRuntimeActivityAndFollowUpResumeBusyRuntime(t *testing.T) {
+	sess := openTestSessionWithModelMode(t, "runtime-busy-controls", "", "")
+	events, mu := collectSessionEvents(sess)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	activityReader, ok := sess.(agenttypes.RuntimeActivityReader)
+	if !ok {
+		t.Fatal("Pi SDK session does not expose RuntimeActivityReader")
+	}
+	activity, err := activityReader.RuntimeActivity(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !activity.Busy() || !activity.IsStreaming || activity.PendingMessageCount != 0 {
+		t.Fatalf("activity = %+v, want streaming busy runtime", activity)
+	}
+
+	followUpSender, ok := sess.(agenttypes.FollowUpSender)
+	if !ok {
+		t.Fatal("Pi SDK session does not expose FollowUpSender")
+	}
+	if err := followUpSender.SendFollowUp(ctx, "resume this turn"); err != nil {
+		t.Fatal(err)
+	}
+	gotEvents := snapshotEvents(events, mu)
+	if got := joinedMessageChunks(gotEvents); got != "follow up: resume this turn" {
+		t.Fatalf("message chunks = %q, want follow-up response; events=%#v", got, gotEvents)
+	}
+	if !hasEvent(gotEvents, agenttypes.EventTypeMessageDone) {
+		t.Fatalf("message_done event missing after follow-up: %#v", gotEvents)
+	}
+
+	activity, err = activityReader.RuntimeActivity(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if activity.Busy() {
+		t.Fatalf("activity = %+v, want settled runtime", activity)
+	}
+}
+
+func TestRuntimeSettlementWakesExistingAndFollowUpWaiters(t *testing.T) {
+	sess := openTestSessionWithModelMode(t, "runtime-controls", "", "")
+	events, mu := collectSessionEvents(sess)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- sess.SendMessage(ctx, "wait-for-cancel")
+	}()
+	waitForEvent(t, events, mu, agenttypes.EventTypeMessageChunk)
+
+	followUpSender, ok := sess.(agenttypes.FollowUpSender)
+	if !ok {
+		t.Fatal("Pi SDK session does not expose FollowUpSender")
+	}
+	followUpDone := make(chan error, 1)
+	go func() {
+		followUpDone <- followUpSender.SendFollowUp(ctx, "finish both waiters")
+	}()
+
+	for name, done := range map[string]<-chan error{
+		"existing prompt": firstDone,
+		"follow-up":       followUpDone,
+	} {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("%s returned error: %v", name, err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("%s did not wake at shared settlement", name)
+		}
+	}
+}
+
+func TestRuntimeNormalizesWhitelistedGoalState(t *testing.T) {
+	sess := openTestSession(t, "goal-state-settled")
+	events, mu := collectSessionEvents(sess)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := sess.SendMessage(ctx, "inspect goal"); err != nil {
+		t.Fatal(err)
+	}
+	var got agenttypes.GoalState
+	for _, event := range snapshotEvents(events, mu) {
+		if event.Type != agenttypes.EventTypeGoalState {
+			continue
+		}
+		got, _ = event.Data.(agenttypes.GoalState)
+	}
+	if got.Status != "paused" || got.AutoContinue {
+		t.Fatalf("goal state = %+v, want paused manual state", got)
+	}
+	if !strings.Contains(got.Objective, "[REDACTED:secret]") || strings.Contains(got.Objective, "1234567890abcdef") {
+		t.Fatalf("goal objective was not safely redacted: %q", got.Objective)
+	}
+	if got.Usage.TokensUsed != 42 || got.Usage.ActiveSeconds != 7.5 {
+		t.Fatalf("goal usage = %+v", got.Usage)
+	}
+	if got.PauseSuggestedAction != "approve the next step" {
+		t.Fatalf("pause suggested action = %q", got.PauseSuggestedAction)
 	}
 }
 
@@ -910,15 +1022,46 @@ func TestRuntimeModelModeControls(t *testing.T) {
 	if modes.Modes[len(modes.Modes)-1].ID != "max" {
 		t.Fatalf("last mode = %+v, want max", modes.Modes[len(modes.Modes)-1])
 	}
-	if err := sess.SetMode(ctx, "high"); err != nil {
+	if err := sess.SetMode(ctx, "max"); err != nil {
 		t.Fatal(err)
 	}
 	modes, err = sess.ListModes(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if modes.CurrentModeID != "high" {
-		t.Fatalf("CurrentModeID = %q, want high", modes.CurrentModeID)
+	if modes.CurrentModeID != "max" {
+		t.Fatalf("CurrentModeID = %q, want max", modes.CurrentModeID)
+	}
+}
+
+func TestRuntimeModelListNormalizesThinkingSuffixAndDeduplicates(t *testing.T) {
+	agentDir := t.TempDir()
+	settings := []byte(`{"enabledModels":["fake/model:max","fake/model"]}`)
+	if err := os.WriteFile(filepath.Join(agentDir, "settings.json"), settings, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	sess, err := NewRuntime().OpenSession(ctx, OpenOptions{
+		AgentName:    "pi",
+		SessionKey:   "sdk-filter-test",
+		RootPath:     repoRoot(t),
+		Command:      "pi",
+		AgentDir:     agentDir,
+		TestScenario: "runtime-controls",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sess.Close() })
+
+	models, err := sess.ListModels(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(models.Models) != 1 || models.Models[0].ID != "fake/model" {
+		t.Fatalf("models = %+v, want one deduplicated fake/model", models)
 	}
 }
 

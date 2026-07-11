@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -12,6 +14,8 @@ import (
 	"mindfs/server/internal/agent"
 	agenttypes "mindfs/server/internal/agent/types"
 	"mindfs/server/internal/e2ee"
+	rootfs "mindfs/server/internal/fs"
+	"mindfs/server/internal/session"
 
 	"github.com/gorilla/websocket"
 )
@@ -23,6 +27,19 @@ func TestSessionDoneResponseIncludesRequestIDPayload(t *testing.T) {
 	}
 	if got := resp.Payload["request_id"]; got != "msg-123" {
 		t.Fatalf("payload request_id = %#v, want msg-123", got)
+	}
+}
+
+func TestSessionErrorResponseIncludesRequestIDAndDoesNotMasqueradeAsDone(t *testing.T) {
+	resp := buildSessionErrorResponse("root", "session", "msg-123", "session.message_failed", "upstream unavailable", false)
+	if resp.Type != "session.error" || resp.ID != "msg-123" {
+		t.Fatalf("response = %#v, want request-scoped session.error", resp)
+	}
+	if got := resp.Payload["request_id"]; got != "msg-123" {
+		t.Fatalf("payload request_id = %#v, want msg-123", got)
+	}
+	if resp.Error == nil || resp.Error.Message != "upstream unavailable" {
+		t.Fatalf("response error = %#v", resp.Error)
 	}
 }
 
@@ -92,6 +109,147 @@ func TestAppendReplyEventResetsSummaryAfterAuxiliaryEvent(t *testing.T) {
 	}
 }
 
+func TestAppendReplyEventCoalescesGoalStateForReplay(t *testing.T) {
+	hub := NewStreamHub(nil)
+	hub.AppendReplyEvent("sess-1", StreamEvent{
+		Type: string(agenttypes.EventTypeGoalState),
+		Data: agenttypes.GoalState{Status: "active", Objective: "repair history"},
+	})
+	hub.AppendReplyEvent("sess-1", StreamEvent{
+		Type: string(agenttypes.EventTypeGoalState),
+		Data: agenttypes.GoalState{Status: "paused", Objective: "repair history", PauseReason: "approval required"},
+	})
+
+	hub.mu.RLock()
+	state := hub.pendingSessions["sess-1"]
+	events := append([]StreamEvent(nil), state.ReplyingList...)
+	hub.mu.RUnlock()
+	if len(events) != 1 {
+		t.Fatalf("goal replay events = %#v, want latest event only", events)
+	}
+	goal, ok := events[0].Data.(agenttypes.GoalState)
+	if !ok || goal.Status != "paused" {
+		t.Fatalf("latest goal replay event = %#v", events[0])
+	}
+}
+
+func TestStreamHubStoresErrorAsTerminalInsteadOfCompletion(t *testing.T) {
+	hub := NewStreamHub(nil)
+	hub.BroadcastSessionError("root", "session", "msg-123", "session.message_failed", "upstream unavailable")
+
+	hub.mu.RLock()
+	terminal := hub.completed["session"]
+	hub.mu.RUnlock()
+	if terminal == nil || terminal.RequestID != "msg-123" || terminal.ErrorMessage != "upstream unavailable" {
+		t.Fatalf("terminal state = %#v", terminal)
+	}
+}
+
+func TestRunSessionMessageFailureBroadcastsErrorWithoutDone(t *testing.T) {
+	rootDir := t.TempDir()
+	registry := rootfs.NewRegistry(filepath.Join(t.TempDir(), "registry.json"))
+	root, err := registry.Upsert(rootDir)
+	if err != nil {
+		t.Fatalf("registry.Upsert: %v", err)
+	}
+	pool := agent.NewPool(agent.Config{Agents: []agent.Definition{{
+		Name:     "pi",
+		Command:  writeFailingPiSDKForWSTest(t),
+		Protocol: agent.ProtocolPiSDK,
+	}}})
+	defer pool.CloseAll()
+	appContext := &AppContext{Dirs: registry, Agents: pool}
+	manager, err := appContext.GetSessionManager(root.ID)
+	if err != nil {
+		t.Fatalf("GetSessionManager: %v", err)
+	}
+	created, err := manager.Create(context.Background(), session.CreateInput{Type: session.TypeChat, Agent: "pi", Name: "failure test"})
+	if err != nil {
+		t.Fatalf("Create session: %v", err)
+	}
+
+	handler := &WSHandler{AppContext: appContext}
+	handler.runSessionMessage(sessionMessageJob{
+		RootID:      root.ID,
+		Key:         created.Key,
+		RequestID:   "request-failed",
+		SessionType: session.TypeChat,
+		SessionName: created.Name,
+		User: PendingUserMessage{
+			Agent:   "pi",
+			Content: "fail this turn",
+		},
+	})
+
+	hub := appContext.GetSessionStreamHub()
+	hub.mu.RLock()
+	terminal := hub.completed[created.Key]
+	hub.mu.RUnlock()
+	if terminal == nil || terminal.RequestID != "request-failed" || terminal.ErrorMessage == "" {
+		t.Fatalf("terminal state = %#v, want request-scoped error", terminal)
+	}
+	if hub.IsSessionReplying(created.Key) {
+		t.Fatal("failed session remained pending")
+	}
+	loaded, err := manager.Get(context.Background(), created.Key, 0)
+	if err != nil {
+		t.Fatalf("Get session: %v", err)
+	}
+	if len(loaded.Exchanges) != 1 || loaded.Exchanges[0].Role != "user" {
+		t.Fatalf("exchanges = %#v, want user-only failure persistence", loaded.Exchanges)
+	}
+}
+
+func TestStartNextQueuedSessionMessagePreservesRequestID(t *testing.T) {
+	rootDir := t.TempDir()
+	registry := rootfs.NewRegistry(filepath.Join(t.TempDir(), "registry.json"))
+	root, err := registry.Upsert(rootDir)
+	if err != nil {
+		t.Fatalf("registry.Upsert: %v", err)
+	}
+	pool := agent.NewPool(agent.Config{Agents: []agent.Definition{{
+		Name:     "pi",
+		Command:  writeSuccessfulPiSDKForWSTest(t),
+		Protocol: agent.ProtocolPiSDK,
+	}}})
+	defer pool.CloseAll()
+	appContext := &AppContext{Dirs: registry, Agents: pool}
+	manager, err := appContext.GetSessionManager(root.ID)
+	if err != nil {
+		t.Fatalf("GetSessionManager: %v", err)
+	}
+	created, err := manager.Create(context.Background(), session.CreateInput{Type: session.TypeChat, Agent: "pi", Name: "queue request test"})
+	if err != nil {
+		t.Fatalf("Create session: %v", err)
+	}
+
+	hub := appContext.GetSessionStreamHub()
+	hub.EnqueueSessionMessage(root.ID, created.Key, created.Name, QueuedUserMessage{
+		ID: "queued-request",
+		PendingUserMessage: PendingUserMessage{
+			Agent:     "pi",
+			Content:   "run queued turn",
+			Timestamp: time.Now().UTC(),
+		},
+	})
+	(&WSHandler{AppContext: appContext}).startNextQueuedSessionMessage(root.ID, created.Key)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		hub.mu.RLock()
+		terminal := hub.completed[created.Key]
+		hub.mu.RUnlock()
+		if terminal != nil {
+			if terminal.RequestID != "queued-request" || terminal.ErrorMessage != "" {
+				t.Fatalf("terminal state = %#v, want queued request completion", terminal)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("queued session did not complete")
+}
+
 func TestSessionMessageContextHasNoDeadlineWithoutAppContext(t *testing.T) {
 	handler := &WSHandler{}
 
@@ -117,6 +275,20 @@ func TestUpdateToEventMapsExtensionUI(t *testing.T) {
 	}
 	request, ok := event.Data.(agenttypes.ExtensionUIRequest)
 	if !ok || request.ID != "ui-1" || request.Method != "select" {
+		t.Fatalf("unexpected payload: %#v", event.Data)
+	}
+}
+
+func TestUpdateToEventMapsGoalState(t *testing.T) {
+	event := updateToEvent(agenttypes.Event{Type: agenttypes.EventTypeGoalState, Data: agenttypes.GoalState{
+		Status:    "paused",
+		Objective: "repair history",
+	}})
+	if event == nil || event.Type != "goal_state" {
+		t.Fatalf("unexpected event: %#v", event)
+	}
+	goal, ok := event.Data.(agenttypes.GoalState)
+	if !ok || goal.Status != "paused" {
 		t.Fatalf("unexpected payload: %#v", event.Data)
 	}
 }
@@ -366,4 +538,66 @@ func TestWSRejectsMessagesOverReadLimit(t *testing.T) {
 	if _, _, err := conn.ReadMessage(); err == nil {
 		t.Fatal("expected websocket read to fail after oversized message")
 	}
+}
+
+func writeFailingPiSDKForWSTest(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "fake-node")
+	script := `#!/usr/bin/env python3
+import json
+import sys
+
+def send(obj):
+    print(json.dumps(obj), flush=True)
+
+for line in sys.stdin:
+    req = json.loads(line)
+    req_id = req.get("id")
+    typ = req.get("type")
+    if typ == "start_sdk_runtime":
+        send({"id": req_id, "type": "response", "command": typ, "success": True, "data": {"sessionId": "ws-failing-pi"}})
+    elif typ == "get_state":
+        send({"id": req_id, "type": "response", "command": typ, "success": True, "data": {"sessionId": "ws-failing-pi", "isStreaming": False, "pendingMessageCount": 0}})
+    elif typ == "prompt":
+        send({"id": req_id, "type": "response", "command": typ, "success": False, "error": {"code": "E_UPSTREAM", "message": "upstream unavailable"}})
+    else:
+        send({"id": req_id, "type": "response", "command": typ, "success": True, "data": {}})
+`
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake pi sdk: %v", err)
+	}
+	return path
+}
+
+func writeSuccessfulPiSDKForWSTest(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "fake-node")
+	script := `#!/usr/bin/env python3
+import json
+import sys
+
+def send(obj):
+    print(json.dumps(obj), flush=True)
+
+for line in sys.stdin:
+    req = json.loads(line)
+    req_id = req.get("id")
+    typ = req.get("type")
+    if typ == "start_sdk_runtime":
+        send({"id": req_id, "type": "response", "command": typ, "success": True, "data": {"sessionId": "ws-successful-pi"}})
+    elif typ == "get_state":
+        send({"id": req_id, "type": "response", "command": typ, "success": True, "data": {"sessionId": "ws-successful-pi", "isStreaming": False, "pendingMessageCount": 0}})
+    elif typ == "prompt":
+        send({"id": req_id, "type": "response", "command": typ, "success": True, "data": {"runtime": "sdk"}})
+        send({"type": "message_start", "message": {"role": "assistant", "content": []}})
+        send({"type": "message_update", "message": {"role": "assistant", "content": [{"type": "text", "text": "queued response"}]}, "assistantMessageEvent": {"type": "text_delta", "delta": "queued response"}})
+        send({"type": "message_end", "message": {"role": "assistant", "stopReason": "end_turn", "content": [{"type": "text", "text": "queued response"}]}})
+        send({"type": "runtime_settled", "reason": "queued_request_test"})
+    else:
+        send({"id": req_id, "type": "response", "command": typ, "success": True, "data": {}})
+`
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake pi sdk: %v", err)
+	}
+	return path
 }

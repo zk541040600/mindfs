@@ -28,6 +28,21 @@ test("opens Pi model choices when the Pi row is clicked", async ({ page }) => {
   await expect(page.getByText("cch-responses/GPT 5.4 Mini")).toHaveCount(0);
 });
 
+test("selects GPT 5.6 with max thinking mode", async ({ page }) => {
+  await page.getByAltText("OpenCode").click();
+  await page.getByText("pi", { exact: true }).click();
+  await page.getByText("cch-responses/GPT 5.6 Sol").click();
+
+  await page.getByAltText("Pi").click();
+  await page.getByText("pi", { exact: true }).click();
+  await page.getByRole("button", { name: /模式/ }).click();
+  await page.getByText("Thinking: max").click();
+
+  await expect(page.getByTestId("selected-state")).toHaveText(
+    "pi:cch-responses/gpt-5.6-sol:max",
+  );
+});
+
 test("opens Pi model choices after a stale Pi row refreshes", async ({ page }) => {
   await page.goto("/agent-selector-harness.html?scenario=stale-pi");
 

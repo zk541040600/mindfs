@@ -103,7 +103,7 @@ func (r *Runtime) OpenSession(ctx context.Context, opts OpenOptions) (agenttypes
 		pending:            make(map[string]chan bridgeResponse),
 		pendingExtensionUI: make(map[string]string),
 		pendingQuestions:   make(map[string]struct{}),
-		turnDone:           make(chan error, 1),
+		settlementWaiters:  make(map[uint64]chan error),
 		closed:             make(chan struct{}),
 	}
 	r.register(s)
@@ -125,7 +125,11 @@ func (r *Runtime) OpenSession(ctx context.Context, opts OpenOptions) (agenttypes
 
 func startPayloadForOptions(opts OpenOptions) map[string]any {
 	if scenario := strings.TrimSpace(opts.TestScenario); scenario != "" {
-		return map[string]any{"type": "start_test_runtime", "scenario": scenario}
+		payload := map[string]any{"type": "start_test_runtime", "scenario": scenario}
+		if agentDir := strings.TrimSpace(opts.AgentDir); agentDir != "" {
+			payload["agentDir"] = agentDir
+		}
+		return payload
 	}
 	payload := map[string]any{"type": "start_sdk_runtime"}
 	if agentDir := strings.TrimSpace(opts.AgentDir); agentDir != "" {
@@ -267,8 +271,10 @@ type session struct {
 	lastTurnErr             string
 	turnComplete            bool
 	turn                    agenttypes.TurnCanceler
-	turnMu                  sync.Mutex
-	turnDone                chan error
+	settlementMu            sync.Mutex
+	settlementEpoch         uint64
+	settlementWaiterSeq     uint64
+	settlementWaiters       map[uint64]chan error
 
 	closeOnce sync.Once
 	closed    chan struct{}
@@ -566,10 +572,14 @@ func (s *session) handleEvent(raw []byte, eventType string) {
 		s.handleMessageUpdate(raw)
 	case "message_end":
 		s.handleMessageEnd(raw)
+	case "goal_state":
+		s.handleGoalState(raw)
 	case "context_window":
 		s.handleContextWindow(raw)
 	case "agent_end":
 		s.handleAgentEnd(raw)
+	case "runtime_settled":
+		s.handleRuntimeSettled(raw)
 	case "turn_end":
 		s.handleTurnEnd(raw)
 	case "thinking_level_changed", "thinking_level_select":
@@ -596,6 +606,13 @@ func (s *session) resetTurnState() {
 	s.seenThinking = false
 	s.messageTextSnapshot = ""
 	s.messageThinkingSnapshot = ""
+	s.lastTurnErr = ""
+	s.turnComplete = false
+	s.mu.Unlock()
+}
+
+func (s *session) prepareFollowUpSettlement() {
+	s.mu.Lock()
 	s.lastTurnErr = ""
 	s.turnComplete = false
 	s.mu.Unlock()
@@ -890,6 +907,53 @@ func (s *session) handleAgentEnd(raw []byte) {
 	s.completeTurn()
 }
 
+// handleRuntimeSettled completes the MindFS turn at the SDK's authoritative idle boundary.
+func (s *session) handleRuntimeSettled(raw []byte) {
+	var ev struct {
+		Error         string `json:"error"`
+		ErrorMessage  string `json:"errorMessage"`
+		FailureReason string `json:"failureReason"`
+	}
+	_ = json.Unmarshal(raw, &ev)
+	message := strings.TrimSpace(ev.ErrorMessage)
+	if message == "" {
+		message = strings.TrimSpace(ev.Error)
+	}
+	if message == "" {
+		message = strings.TrimSpace(ev.FailureReason)
+	}
+	if message != "" {
+		s.setLastTurnErr(message)
+		s.emit(agenttypes.Event{Type: agenttypes.EventTypeRecovery, SessionID: s.SessionID(), Data: agenttypes.RecoveryStatus{Message: message}})
+	}
+	s.completeTurn()
+}
+
+// handleGoalState forwards only the bounded goal-state contract accepted from the bridge.
+func (s *session) handleGoalState(raw []byte) {
+	var state agenttypes.GoalState
+	if err := json.Unmarshal(raw, &state); err != nil {
+		return
+	}
+	state.Status = strings.ToLower(strings.TrimSpace(state.Status))
+	switch state.Status {
+	case "active", "paused", "complete":
+	default:
+		return
+	}
+	state.Objective = truncateUTF8ByBytes(strings.TrimSpace(state.Objective), 4096)
+	state.PauseReason = truncateUTF8ByBytes(strings.TrimSpace(state.PauseReason), 2048)
+	state.PauseSuggestedAction = truncateUTF8ByBytes(strings.TrimSpace(state.PauseSuggestedAction), 2048)
+	state.StopReason = truncateUTF8ByBytes(strings.TrimSpace(state.StopReason), 2048)
+	if state.Usage.TokensUsed < 0 {
+		state.Usage.TokensUsed = 0
+	}
+	if state.Usage.ActiveSeconds < 0 {
+		state.Usage.ActiveSeconds = 0
+	}
+	s.emit(agenttypes.Event{Type: agenttypes.EventTypeGoalState, SessionID: s.SessionID(), Data: state})
+}
+
 func (s *session) handleTurnEnd(raw []byte) {
 	var ev struct {
 		WillRetry     bool   `json:"willRetry"`
@@ -965,37 +1029,19 @@ func terminalErrorMessage(stopReason, errorMessage, errText, abortReason, failur
 }
 
 func (s *session) completeTurn() {
-	s.completeTurnFor(nil)
-}
-
-func (s *session) completeTurnFor(ch chan error) {
-	completed := false
-	if ch == nil {
-		completed = s.markTurnComplete()
-	} else {
-		completed = s.markTurnCompleteFor(ch)
-	}
-	if !completed {
+	if !s.markTurnComplete() {
 		return
 	}
-	contextWindow := s.cachedContextWindow()
-	s.emit(agenttypes.Event{Type: agenttypes.EventTypeMessageDone, SessionID: s.SessionID(), Data: agenttypes.MessageDone{ContextWindow: contextWindow}})
 	s.mu.RLock()
 	lastErr := strings.TrimSpace(s.lastTurnErr)
 	s.mu.RUnlock()
 	if lastErr != "" {
-		if ch == nil {
-			s.signalTurnDone(errors.New(lastErr))
-		} else {
-			s.signalTurnDoneTo(ch, errors.New(lastErr))
-		}
+		s.signalSettlement(errors.New(lastErr))
 		return
 	}
-	if ch == nil {
-		s.signalTurnDone(nil)
-	} else {
-		s.signalTurnDoneTo(ch, nil)
-	}
+	contextWindow := s.cachedContextWindow()
+	s.emit(agenttypes.Event{Type: agenttypes.EventTypeMessageDone, SessionID: s.SessionID(), Data: agenttypes.MessageDone{ContextWindow: contextWindow}})
+	s.signalSettlement(nil)
 }
 
 func (s *session) markTurnComplete() bool {
@@ -1006,16 +1052,6 @@ func (s *session) markTurnComplete() bool {
 	}
 	s.turnComplete = true
 	return true
-}
-
-func (s *session) markTurnCompleteFor(ch chan error) bool {
-	s.turnMu.Lock()
-	current := s.turnDone
-	s.turnMu.Unlock()
-	if ch != nil && current != ch {
-		return false
-	}
-	return s.markTurnComplete()
 }
 
 func (s *session) handleToolExecutionStart(raw []byte) {
@@ -1188,28 +1224,35 @@ func (s *session) setLastTurnErr(message string) {
 	s.mu.Unlock()
 }
 
-func (s *session) signalTurnDone(err error) {
-	s.turnMu.Lock()
-	ch := s.turnDone
-	s.turnMu.Unlock()
-	s.signalTurnDoneTo(ch, err)
+func (s *session) registerSettlementWaiter() (uint64, <-chan error) {
+	s.settlementMu.Lock()
+	defer s.settlementMu.Unlock()
+	if s.settlementWaiters == nil {
+		s.settlementWaiters = make(map[uint64]chan error)
+	}
+	s.settlementWaiterSeq++
+	waiterID := s.settlementWaiterSeq
+	waiter := make(chan error, 1)
+	s.settlementWaiters[waiterID] = waiter
+	return waiterID, waiter
 }
 
-func (s *session) signalTurnDoneTo(ch chan error, err error) {
-	if ch == nil {
-		return
-	}
-	select {
-	case ch <- err:
-	default:
-	}
+func (s *session) unregisterSettlementWaiter(waiterID uint64) {
+	s.settlementMu.Lock()
+	delete(s.settlementWaiters, waiterID)
+	s.settlementMu.Unlock()
 }
 
-func (s *session) resetTurnDone() chan error {
-	s.turnMu.Lock()
-	defer s.turnMu.Unlock()
-	s.turnDone = make(chan error, 1)
-	return s.turnDone
+func (s *session) signalSettlement(err error) {
+	s.settlementMu.Lock()
+	s.settlementEpoch++
+	waiters := s.settlementWaiters
+	s.settlementWaiters = make(map[uint64]chan error)
+	s.settlementMu.Unlock()
+	for _, waiter := range waiters {
+		waiter <- err
+		close(waiter)
+	}
 }
 
 // emit forwards runtime events to the registered subscriber, buffering startup events until the UI attaches.
@@ -1261,23 +1304,48 @@ func (s *session) SendMessage(ctx context.Context, content string) error {
 	}
 	turnCtx, turnID := s.turn.Begin(ctx)
 	defer s.turn.End(turnID)
-	turnDone := s.resetTurnDone()
+	waiterID, settlement := s.registerSettlementWaiter()
 	s.resetTurnState()
 	if _, err := s.request(turnCtx, "prompt", map[string]any{"type": "prompt", "message": content}); err != nil {
+		s.unregisterSettlementWaiter(waiterID)
 		return err
 	}
 	if content == "/ui-demo" {
+		s.unregisterSettlementWaiter(waiterID)
 		s.emit(agenttypes.Event{Type: agenttypes.EventTypeMessageDone, SessionID: s.SessionID(), Data: agenttypes.MessageDone{ContextWindow: s.cachedContextWindow()}})
 		return nil
 	}
+	return s.waitForTurn(turnCtx, waiterID, settlement)
+}
+
+// SendFollowUp queues content behind the active Pi run and waits for the next settled boundary.
+func (s *session) SendFollowUp(ctx context.Context, content string) error {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return nil
+	}
+	turnCtx, turnID := s.turn.Begin(ctx)
+	defer s.turn.End(turnID)
+	waiterID, settlement := s.registerSettlementWaiter()
+	s.prepareFollowUpSettlement()
+	if _, err := s.request(turnCtx, "follow-up", map[string]any{"type": "follow_up", "message": content}); err != nil {
+		s.unregisterSettlementWaiter(waiterID)
+		return err
+	}
+	return s.waitForTurn(turnCtx, waiterID, settlement)
+}
+
+// waitForTurn waits for one normalized terminal signal without coupling it to the bridge request response.
+func (s *session) waitForTurn(ctx context.Context, waiterID uint64, settlement <-chan error) error {
+	defer s.unregisterSettlementWaiter(waiterID)
 	select {
-	case err := <-turnDone:
+	case err := <-settlement:
 		if err != nil && !errors.Is(err, io.EOF) {
 			return err
 		}
 		return nil
-	case <-turnCtx.Done():
-		return turnCtx.Err()
+	case <-ctx.Done():
+		return ctx.Err()
 	case <-s.closed:
 		return errors.New("pi sdk runtime session closed")
 	}
@@ -1496,7 +1564,7 @@ func (s *session) CancelCurrentTurn() error {
 	abortID := s.nextID("abort")
 	err := s.writeJSON(map[string]any{"type": "abort", "id": abortID})
 	s.turn.Cancel()
-	s.signalTurnDone(context.Canceled)
+	s.signalSettlement(context.Canceled)
 	if err != nil && !strings.Contains(err.Error(), "closed") {
 		return err
 	}
@@ -1545,17 +1613,25 @@ func (s *session) cachedContextWindow() agenttypes.ContextWindow {
 }
 
 func (s *session) refreshState(ctx context.Context) error {
+	_, err := s.RuntimeActivity(ctx)
+	return err
+}
+
+// RuntimeActivity reads the SDK state and refreshes the cached model/session metadata.
+func (s *session) RuntimeActivity(ctx context.Context) (agenttypes.RuntimeActivity, error) {
 	resp, err := s.requestWithDefaultTimeout(ctx, "state", map[string]any{"type": "get_state"})
 	if err != nil {
-		return err
+		return agenttypes.RuntimeActivity{}, err
 	}
 	var data struct {
-		SessionID     string          `json:"sessionId"`
-		ThinkingLevel string          `json:"thinkingLevel"`
-		Model         json.RawMessage `json:"model"`
+		SessionID           string          `json:"sessionId"`
+		ThinkingLevel       string          `json:"thinkingLevel"`
+		Model               json.RawMessage `json:"model"`
+		IsStreaming         bool            `json:"isStreaming"`
+		PendingMessageCount int             `json:"pendingMessageCount"`
 	}
 	if err := json.Unmarshal(resp.Data, &data); err != nil {
-		return err
+		return agenttypes.RuntimeActivity{}, err
 	}
 	s.mu.Lock()
 	if strings.TrimSpace(data.SessionID) != "" {
@@ -1568,7 +1644,10 @@ func (s *session) refreshState(ctx context.Context) error {
 		s.model = model
 	}
 	s.mu.Unlock()
-	return nil
+	return agenttypes.RuntimeActivity{
+		IsStreaming:         data.IsStreaming,
+		PendingMessageCount: data.PendingMessageCount,
+	}, nil
 }
 
 func (s *session) requestWithDefaultTimeout(ctx context.Context, prefix string, payload map[string]any) (bridgeResponse, error) {

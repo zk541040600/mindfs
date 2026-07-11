@@ -3,6 +3,7 @@ import { e2eeService, type E2EEState } from "./e2ee";
 
 export type RelayStatusPayload = {
   relay_bound?: boolean;
+  relay_connected?: boolean;
   no_relayer?: boolean;
   pending_code?: string;
   node_name?: string;
@@ -11,6 +12,11 @@ export type RelayStatusPayload = {
   relay_base_url?: string;
   node_url?: string;
   last_error?: string;
+  reconnect_count?: number;
+  relay_health_failures?: number;
+  public_access?: "available" | "auth_required" | "unavailable";
+  public_access_checked_at?: string;
+  public_access_diagnostic?: string;
   e2ee_required?: boolean;
 };
 

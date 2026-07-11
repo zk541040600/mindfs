@@ -7,7 +7,7 @@ import { AgentIcon } from "./AgentIcon";
 import { InlineTokenText } from "./InlineTokenText";
 import { MarkdownViewer } from "./MarkdownViewer";
 import { fetchProofProtectedBlob } from "../services/file";
-import type { ExchangeAux, RelatedFile, ToolCall } from "../services/session";
+import type { ExchangeAux, GoalState, RelatedFile, ToolCall } from "../services/session";
 import { savePrompt } from "../services/prompts";
 import { reportError } from "../services/error";
 import { rootBadgeButtonStyle } from "./rootBadgeStyle";
@@ -404,7 +404,8 @@ function isAuxiliaryTimelineItem(item: TimelineItem | null): boolean {
     item?.type === "thought" ||
     item?.type === "todo" ||
     item?.type === "plan" ||
-    item?.type === "compact"
+    item?.type === "compact" ||
+    item?.type === "goal"
   );
 }
 
@@ -467,6 +468,55 @@ function CompactNoticeCard({
     >
       <div style={{ fontWeight: 600, color: "var(--text-primary)" }}>{label}</div>
       {summary ? <div style={{ marginTop: "6px" }}>{summary}</div> : null}
+    </div>
+  );
+}
+
+function GoalStateCard({ goalState }: { goalState: GoalState }) {
+  const status = `${goalState?.status || ""}`.toLowerCase();
+  const appearance =
+    status === "complete"
+      ? { label: "目标已完成", color: "#059669", background: "rgba(16, 185, 129, 0.08)" }
+      : status === "paused"
+        ? { label: "目标已暂停", color: "#d97706", background: "rgba(245, 158, 11, 0.09)" }
+        : { label: "目标执行中", color: "#2563eb", background: "rgba(37, 99, 235, 0.08)" };
+  const tokens = Math.max(0, Number(goalState?.usage?.tokensUsed || 0));
+  const activeSeconds = Math.max(0, Number(goalState?.usage?.activeSeconds || 0));
+  return (
+    <div
+      style={{
+        width: "100%",
+        minWidth: 0,
+        borderRadius: "10px",
+        border: `1px solid ${appearance.color}33`,
+        background: appearance.background,
+        padding: "10px 12px",
+        color: "var(--text-secondary)",
+        fontSize: "13px",
+      }}
+    >
+      <div style={{ color: appearance.color, fontWeight: 700 }}>{appearance.label}</div>
+      {goalState.objective ? (
+        <div style={{ marginTop: "6px", color: "var(--text-primary)", lineHeight: 1.5 }}>
+          {goalState.objective}
+        </div>
+      ) : null}
+      {goalState.pauseReason ? (
+        <div style={{ marginTop: "6px" }}>原因：{goalState.pauseReason}</div>
+      ) : null}
+      {goalState.pauseSuggestedAction ? (
+        <div style={{ marginTop: "4px" }}>建议：{goalState.pauseSuggestedAction}</div>
+      ) : null}
+      {goalState.stopReason && status === "complete" ? (
+        <div style={{ marginTop: "4px" }}>结果：{goalState.stopReason}</div>
+      ) : null}
+      {tokens > 0 || activeSeconds > 0 ? (
+        <div style={{ marginTop: "7px", fontSize: "12px", opacity: 0.78 }}>
+          {tokens > 0 ? `${Math.round(tokens).toLocaleString()} tokens` : ""}
+          {tokens > 0 && activeSeconds > 0 ? " · " : ""}
+          {activeSeconds > 0 ? `${Math.round(activeSeconds)} 秒活跃时间` : ""}
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -1601,6 +1651,13 @@ function SessionViewerInner({
         </div>
       );
     }
+    if (item.type === "goal") {
+      return (
+        <div key={timelineItemKey} style={{ marginTop: spacing }}>
+          <GoalStateCard goalState={item.goalState} />
+        </div>
+      );
+    }
     const isUser = item.type === "user_text";
     const userMessageIndex = isUser
       ? timeline.slice(0, idx + 1).filter((timelineItem) => timelineItem.type === "user_text").length
@@ -2398,7 +2455,7 @@ function SessionViewerInner({
               ),
             )}
             {renderSlashCommandResult()}
-            {(isAwaiting || isStreaming) && (
+            {isAwaiting && (
               <div
                 style={{
                   marginTop: "16px",

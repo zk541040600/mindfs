@@ -566,7 +566,8 @@ test("allows a resumed stream after cancel tombstone timeout without a terminal 
     }),
   );
 
-  await expect(page.getByText("已发送，等待响应...")).toBeVisible();
+  await expect(page.getByText("resumed after reconnect")).toBeVisible();
+  await expect(page.getByText("正在生成...")).toBeVisible();
 });
 
 test("keeps pending when replying-sessions drops before terminal event", async ({ page }) => {
@@ -629,4 +630,82 @@ test("keeps pending when replying-sessions drops before terminal event", async (
 
   await expect(page.getByText("已发送，等待响应...")).toHaveCount(0);
   await expect(page.getByText("左滑蓝环开始新会话...")).toBeVisible();
+});
+
+test("upserts the latest Pi goal state into one live progress card", async ({ page }) => {
+  const replying = { current: true };
+  const app = await openPendingApp(page, replying);
+
+  app.socket?.send(
+    JSON.stringify({
+      type: "session.stream",
+      payload: {
+        root_id: rootId,
+        session_key: sessionKey,
+        event: {
+          type: "goal_state",
+          data: {
+            objective: "repair browser history",
+            status: "active",
+            autoContinue: true,
+            usage: { tokensUsed: 10, activeSeconds: 2 },
+          },
+        },
+      },
+    }),
+  );
+  await expect(page.getByText("目标执行中")).toBeVisible();
+
+  app.socket?.send(
+    JSON.stringify({
+      type: "session.stream",
+      payload: {
+        root_id: rootId,
+        session_key: sessionKey,
+        event: {
+          type: "goal_state",
+          data: {
+            objective: "repair browser history",
+            status: "paused",
+            autoContinue: false,
+            pauseReason: "restart approval required",
+            pauseSuggestedAction: "approve restart",
+            usage: { tokensUsed: 20, activeSeconds: 4 },
+          },
+        },
+      },
+    }),
+  );
+
+  await expect(page.getByText("目标已暂停")).toBeVisible();
+  await expect(page.getByText("目标执行中")).toHaveCount(0);
+  await expect(page.getByText("repair browser history")).toHaveCount(1);
+  await expect(page.getByText("原因：restart approval required")).toBeVisible();
+});
+
+test("treats top-level session.error as terminal for reconnecting clients", async ({ page }) => {
+  const replying = { current: true };
+  const app = await openPendingApp(page, replying);
+  await expect(page.getByText("已发送，等待响应...")).toBeVisible();
+
+  replying.current = false;
+  app.socket?.send(
+    JSON.stringify({
+      id: "request-failed",
+      type: "session.error",
+      payload: {
+        root_id: rootId,
+        session_key: sessionKey,
+        request_id: "request-failed",
+      },
+      error: {
+        code: "session.message_failed",
+        message: "upstream unavailable",
+      },
+    }),
+  );
+
+  await expect(page.getByText("已发送，等待响应...")).toHaveCount(0);
+  await expect(page.getByText("左滑蓝环开始新会话...")).toBeVisible();
+  await expect(page.getByText("upstream unavailable")).toBeVisible();
 });

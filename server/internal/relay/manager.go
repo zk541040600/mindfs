@@ -16,29 +16,30 @@ import (
 const defaultRelayBaseURL = "http://localhost:7331"
 
 const (
-	relayHealthCheckInterval     = time.Minute
-	relayHealthCheckTimeout      = 10 * time.Second
-	relayHealthFailureThreshold  = 3
-	relayHealthReconnectCooldown = 10 * time.Minute
+	relayHealthCheckInterval = time.Minute
+	relayHealthCheckTimeout  = 10 * time.Second
 )
 
 type Status struct {
-	Bound              bool   `json:"relay_bound"`
-	NoRelayer          bool   `json:"no_relayer"`
-	Connected          bool   `json:"relay_connected"`
-	PendingCode        string `json:"pending_code"`
-	NodeName           string `json:"node_name"`
-	NodeID             string `json:"node_id"`
-	E2EENodeID         string `json:"e2ee_node_id,omitempty"`
-	RelayBaseURL       string `json:"relay_base_url"`
-	NodeURL            string `json:"node_url"`
-	LastError          string `json:"last_error,omitempty"`
-	LastConnectedAt    string `json:"last_connected_at,omitempty"`
-	LastDisconnectedAt string `json:"last_disconnected_at,omitempty"`
-	LastReconnectAt    string `json:"last_reconnect_at,omitempty"`
-	ReconnectCount     int64  `json:"reconnect_count"`
-	HealthFailures     int    `json:"relay_health_failures,omitempty"`
-	E2EERequired       bool   `json:"e2ee_required"`
+	Bound                  bool              `json:"relay_bound"`
+	NoRelayer              bool              `json:"no_relayer"`
+	Connected              bool              `json:"relay_connected"`
+	PendingCode            string            `json:"pending_code"`
+	NodeName               string            `json:"node_name"`
+	NodeID                 string            `json:"node_id"`
+	E2EENodeID             string            `json:"e2ee_node_id,omitempty"`
+	RelayBaseURL           string            `json:"relay_base_url"`
+	NodeURL                string            `json:"node_url"`
+	LastError              string            `json:"last_error,omitempty"`
+	LastConnectedAt        string            `json:"last_connected_at,omitempty"`
+	LastDisconnectedAt     string            `json:"last_disconnected_at,omitempty"`
+	LastReconnectAt        string            `json:"last_reconnect_at,omitempty"`
+	ReconnectCount         int64             `json:"reconnect_count"`
+	HealthFailures         int               `json:"relay_health_failures,omitempty"`
+	PublicAccess           PublicAccessState `json:"public_access,omitempty"`
+	PublicAccessCheckedAt  string            `json:"public_access_checked_at,omitempty"`
+	PublicAccessDiagnostic string            `json:"public_access_diagnostic,omitempty"`
+	E2EERequired           bool              `json:"e2ee_required"`
 }
 
 type Manager struct {
@@ -56,14 +57,17 @@ type Manager struct {
 	nodeName     string
 	lastError    string
 
-	relayGeneration      int64
-	connected            bool
-	lastConnectedAt      time.Time
-	lastDisconnectedAt   time.Time
-	lastReconnectAt      time.Time
-	reconnectCount       int64
-	healthFailures       int
-	healthMonitorStarted bool
+	relayGeneration        int64
+	connected              bool
+	lastConnectedAt        time.Time
+	lastDisconnectedAt     time.Time
+	lastReconnectAt        time.Time
+	reconnectCount         int64
+	healthFailures         int
+	publicAccess           PublicAccessState
+	publicAccessCheckedAt  time.Time
+	publicAccessDiagnostic string
+	healthMonitorStarted   bool
 }
 
 func NewManager(localAddr string, noRelayer bool, relayBaseURL string, useTLS bool) (*Manager, error) {
@@ -158,13 +162,18 @@ func (m *Manager) StartBinding() (Status, error) {
 
 func (m *Manager) statusLocked() Status {
 	status := Status{
-		NoRelayer:      m.noRelayer,
-		PendingCode:    m.pendingCode,
-		NodeName:       m.nodeName,
-		RelayBaseURL:   m.resolveRelayBaseLocked(),
-		LastError:      m.lastError,
-		ReconnectCount: m.reconnectCount,
-		HealthFailures: m.healthFailures,
+		NoRelayer:              m.noRelayer,
+		PendingCode:            m.pendingCode,
+		NodeName:               m.nodeName,
+		RelayBaseURL:           m.resolveRelayBaseLocked(),
+		LastError:              m.lastError,
+		ReconnectCount:         m.reconnectCount,
+		HealthFailures:         m.healthFailures,
+		PublicAccess:           m.publicAccess,
+		PublicAccessDiagnostic: m.publicAccessDiagnostic,
+	}
+	if !m.publicAccessCheckedAt.IsZero() {
+		status.PublicAccessCheckedAt = m.publicAccessCheckedAt.Format(time.RFC3339Nano)
 	}
 	if !m.lastConnectedAt.IsZero() {
 		status.LastConnectedAt = m.lastConnectedAt.Format(time.RFC3339Nano)
@@ -412,36 +421,51 @@ func (m *Manager) healthMonitorLoop(parent context.Context) {
 func (m *Manager) checkRelayPublicHealth(parent context.Context) {
 	status := m.Status()
 	if !status.Bound || strings.TrimSpace(status.NodeURL) == "" {
-		m.resetHealthFailures()
+		m.clearPublicHealth()
 		return
 	}
 	ctx, cancel := context.WithTimeout(parent, relayHealthCheckTimeout)
-	err := m.service.CheckPublicHealth(ctx, status.NodeURL)
+	result := m.service.CheckPublicHealth(ctx, status.NodeURL)
 	cancel()
-	if err == nil {
-		m.resetHealthFailures()
-		return
-	}
 
 	m.mu.Lock()
-	m.healthFailures++
-	failures := m.healthFailures
-	cooldownReady := m.lastReconnectAt.IsZero() || time.Since(m.lastReconnectAt) >= relayHealthReconnectCooldown
-	m.lastError = err.Error()
-	if failures >= relayHealthFailureThreshold && cooldownReady && m.ctx != nil {
-		log.Printf("[relay] public_health.failed count=%d threshold=%d cooldown_ready=%t node=%s url=%s err=%v", failures, relayHealthFailureThreshold, cooldownReady, status.NodeID, status.NodeURL, err)
-		m.reconnectLocked("public_health_failed")
-		m.healthFailures = 0
+	m.publicAccess = result.State
+	m.publicAccessCheckedAt = time.Now().UTC()
+	m.publicAccessDiagnostic = truncatePublicAccessDiagnostic(result.Diagnostic)
+	if result.State == PublicAccessUnavailable {
+		m.healthFailures++
 	} else {
-		log.Printf("[relay] public_health.failed count=%d threshold=%d cooldown_ready=%t node=%s url=%s err=%v", failures, relayHealthFailureThreshold, cooldownReady, status.NodeID, status.NodeURL, err)
+		m.healthFailures = 0
 	}
+	failures := m.healthFailures
+	diagnostic := m.publicAccessDiagnostic
 	m.mu.Unlock()
+
+	switch result.State {
+	case PublicAccessAuthRequired:
+		log.Printf("[relay] public_health.auth_required node=%s status=%d", status.NodeID, result.StatusCode)
+	case PublicAccessUnavailable:
+		log.Printf("[relay] public_health.unavailable node=%s status=%d count=%d diagnostic=%q", status.NodeID, result.StatusCode, failures, diagnostic)
+	}
 }
 
-func (m *Manager) resetHealthFailures() {
+func (m *Manager) clearPublicHealth() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.healthFailures = 0
+	m.publicAccess = ""
+	m.publicAccessCheckedAt = time.Time{}
+	m.publicAccessDiagnostic = ""
+}
+
+func truncatePublicAccessDiagnostic(value string) string {
+	const maxRunes = 512
+	value = strings.TrimSpace(value)
+	runes := []rune(value)
+	if len(runes) <= maxRunes {
+		return value
+	}
+	return string(runes[:maxRunes]) + "..."
 }
 
 func (m *Manager) ensurePendingLocked() {

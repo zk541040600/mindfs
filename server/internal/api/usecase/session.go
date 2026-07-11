@@ -2111,6 +2111,7 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 	var responseText string
 	sawAssistantChunk := false
 	var recoveryText string
+	var latestGoalState *agenttypes.GoalState
 	plannedAssistantSeq := len(current.Exchanges) + 2
 	auxBuffer := make([]session.ExchangeAux, 0, 8)
 	defer manager.ClearPendingExchangeAux(context.Background(), current.Key)
@@ -2163,7 +2164,7 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 					update.Data = chunk
 					thoughtBuffer.WriteString(chunk.Content)
 				}
-			case agenttypes.EventTypeToolCall, agenttypes.EventTypeToolUpdate, agenttypes.EventTypeTodoUpdate, agenttypes.EventTypePlanUpdate, agenttypes.EventTypeCompact, agenttypes.EventTypeMessageChunk, agenttypes.EventTypeMessageDone:
+			case agenttypes.EventTypeToolCall, agenttypes.EventTypeToolUpdate, agenttypes.EventTypeTodoUpdate, agenttypes.EventTypePlanUpdate, agenttypes.EventTypeCompact, agenttypes.EventTypeGoalState, agenttypes.EventTypeMessageChunk, agenttypes.EventTypeMessageDone:
 				flushThought()
 			}
 			clientUpdate := compactAgentUpdate(update)
@@ -2239,6 +2240,12 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 					})
 				}
 			}
+			if update.Type == agenttypes.EventTypeGoalState {
+				if goalState, ok := update.Data.(agenttypes.GoalState); ok {
+					goalStateCopy := goalState
+					latestGoalState = &goalStateCopy
+				}
+			}
 			if update.Type == agenttypes.EventTypeMessageChunk {
 				if chunk, ok := update.Data.(agenttypes.MessageChunk); ok {
 					sawAssistantChunk = true
@@ -2251,7 +2258,10 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 				}
 			} else if update.Type == agenttypes.EventTypeMessageDone {
 				if !sawAssistantChunk && strings.TrimSpace(responseText) == "" {
-					responseText = emptyAssistantFallbackMessage(in.Agent, lastResponseUpdateType, recoveryText)
+					responseText = goalStateFallbackMessage(in.Agent, latestGoalState)
+					if responseText == "" {
+						responseText = emptyAssistantFallbackMessage(in.Agent, lastResponseUpdateType, recoveryText)
+					}
 					sawAssistantChunk = true
 					lastResponseUpdateType = string(agenttypes.EventTypeMessageChunk)
 					if in.OnUpdate != nil {
@@ -2267,7 +2277,8 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 				update.Type == agenttypes.EventTypeToolUpdate ||
 				update.Type == agenttypes.EventTypeTodoUpdate ||
 				update.Type == agenttypes.EventTypePlanUpdate ||
-				update.Type == agenttypes.EventTypeCompact {
+				update.Type == agenttypes.EventTypeCompact ||
+				update.Type == agenttypes.EventTypeGoalState {
 				lastResponseUpdateType = string(update.Type)
 			}
 			if watcher != nil {
@@ -2282,7 +2293,38 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 		attachSessionUpdates(runtime)
 		return runtime.SendMessage(turnCtx, content)
 	}
-	sendErr := sendWithAttachedUpdates(sess, prompt)
+	sendFollowUpWithAttachedUpdates := func(runtime agenttypes.Session, content string) (bool, error) {
+		followUpSender, ok := runtime.(agenttypes.FollowUpSender)
+		if !ok {
+			return false, nil
+		}
+		attachSessionUpdates(runtime)
+		return true, followUpSender.SendFollowUp(turnCtx, content)
+	}
+	usedFollowUp := false
+	var sendErr error
+	if activityReader, ok := sess.(agenttypes.RuntimeActivityReader); ok {
+		activity, activityErr := activityReader.RuntimeActivity(turnCtx)
+		if activityErr != nil {
+			log.Printf("[session] turn.activity.error root=%s session=%s agent=%s err=%v action=send_prompt", in.RootID, current.Key, in.Agent, activityErr)
+		} else if activity.Busy() {
+			usedFollowUp, sendErr = sendFollowUpWithAttachedUpdates(sess, prompt)
+			if usedFollowUp {
+				log.Printf("[session] turn.activity.busy root=%s session=%s agent=%s streaming=%t pending=%d action=follow_up", in.RootID, current.Key, in.Agent, activity.IsStreaming, activity.PendingMessageCount)
+			}
+		}
+	}
+	if !usedFollowUp {
+		sendErr = sendWithAttachedUpdates(sess, prompt)
+	}
+	if sendErr != nil && !isCanceledTurnError(sendErr) && !sawAssistantChunk && !usedFollowUp && isAgentAlreadyProcessingError(sendErr) {
+		followedUp, followUpErr := sendFollowUpWithAttachedUpdates(sess, prompt)
+		if followedUp {
+			usedFollowUp = true
+			sendErr = followUpErr
+			log.Printf("[session] turn.send.busy root=%s session=%s agent=%s action=follow_up", in.RootID, current.Key, in.Agent)
+		}
+	}
 	if sendErr != nil && !isCanceledTurnError(sendErr) && !sawAssistantChunk && isStaleAgentSessionError(sendErr) {
 		log.Printf("[session] turn.send.stale_runtime root=%s session=%s agent=%s err=%v action=reopen_runtime_session", in.RootID, current.Key, in.Agent, sendErr)
 		agentPool.Close(agentPoolSessionKey(current.Key, in.Agent))
@@ -2292,6 +2334,7 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 		} else {
 			sess = reopenedSess
 			agentCtxSeq = reopenedAgentCtxSeq
+			usedFollowUp = false
 			setActiveTurnSession(in.RootID, current.Key, sess)
 			prompt = s.BuildPrompt(BuildPromptInput{
 				Session:       current,
@@ -2368,15 +2411,27 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 		log.Printf("[session] persist.user.error root=%s session=%s agent=%s err=%v", in.RootID, current.Key, in.Agent, err)
 		return err
 	}
-	if err := manager.AddExchangeForAgent(exchangeCtx, current, "agent", responseText, in.Agent, resolvedMode, resolvedEffort, resolvedFastService); err != nil {
-		log.Printf("[session] persist.agent.error root=%s session=%s agent=%s err=%v", in.RootID, current.Key, in.Agent, err)
-		return err
-	}
-	for _, aux := range dedupeExchangeAuxBuffer(auxBuffer) {
-		aux = hydratePendingToolCallAux(ctx, manager, current.Key, aux)
-		if err := manager.AddExchangeAux(ctx, current.Key, aux); err != nil {
+	if strings.TrimSpace(responseText) != "" {
+		if err := manager.AddExchangeForAgent(exchangeCtx, current, "agent", responseText, in.Agent, resolvedMode, resolvedEffort, resolvedFastService); err != nil {
+			log.Printf("[session] persist.agent.error root=%s session=%s agent=%s err=%v", in.RootID, current.Key, in.Agent, err)
 			return err
 		}
+		if latestGoalState != nil {
+			goalStateCopy := *latestGoalState
+			auxBuffer = append(auxBuffer, session.ExchangeAux{
+				Seq:       plannedAssistantSeq,
+				Line:      currentAssistantLine(responseText),
+				GoalState: &goalStateCopy,
+			})
+		}
+		for _, aux := range dedupeExchangeAuxBuffer(auxBuffer) {
+			aux = hydratePendingToolCallAux(ctx, manager, current.Key, aux)
+			if err := manager.AddExchangeAux(ctx, current.Key, aux); err != nil {
+				return err
+			}
+		}
+	} else {
+		log.Printf("[session] persist.agent.skip_empty root=%s session=%s agent=%s send_err=%t", in.RootID, current.Key, in.Agent, sendErr != nil)
 	}
 	if err := manager.UpdateAgentState(ctx, current, in.Agent, contextLineCount(current.Exchanges), sess.SessionID()); err != nil {
 		return err
@@ -3687,6 +3742,37 @@ func emptyAssistantFallbackMessage(agentName, lastResponseUpdateType, recoveryTe
 		return fmt.Sprintf("%s 本轮只有思考内容，没有返回可见文本。请重试或继续。", agentName)
 	default:
 		return fmt.Sprintf("%s 本轮没有返回可见文本。请重试或继续。", agentName)
+	}
+}
+
+func goalStateFallbackMessage(agentName string, state *agenttypes.GoalState) string {
+	if state == nil {
+		return ""
+	}
+	agentName = strings.TrimSpace(agentName)
+	if agentName == "" {
+		agentName = "agent"
+	}
+	objective := truncateRunes(strings.TrimSpace(state.Objective), 240)
+	if objective == "" {
+		objective = "当前目标"
+	}
+	switch strings.ToLower(strings.TrimSpace(state.Status)) {
+	case "complete":
+		return fmt.Sprintf("%s 已完成目标：%s", agentName, objective)
+	case "paused":
+		message := fmt.Sprintf("%s 已暂停目标：%s", agentName, objective)
+		if reason := truncateRunes(strings.TrimSpace(state.PauseReason), 240); reason != "" {
+			message += "。原因：" + reason
+		}
+		if action := truncateRunes(strings.TrimSpace(state.PauseSuggestedAction), 240); action != "" {
+			message += "。建议：" + action
+		}
+		return message
+	case "active":
+		return fmt.Sprintf("%s 已记录目标进度：%s", agentName, objective)
+	default:
+		return ""
 	}
 }
 

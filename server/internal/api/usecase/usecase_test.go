@@ -2237,6 +2237,138 @@ func TestSendMessageSynthesizesFallbackWhenAgentReturnsOnlyToolEvents(t *testing
 	}
 }
 
+func TestSendMessageUsesFollowUpForBusyPiRuntime(t *testing.T) {
+	ctx := context.Background()
+	rootDir := t.TempDir()
+	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
+	manager := session.NewManager(root)
+	created, err := manager.Create(ctx, session.CreateInput{Type: session.TypeChat, Agent: "pi", Name: "chat"})
+	if err != nil {
+		t.Fatalf("create chat session: %v", err)
+	}
+
+	pool := agent.NewPool(agent.Config{Agents: []agent.Definition{{
+		Name:     "pi",
+		Command:  writeFakeBusyPiSDKForUsecase(t),
+		Protocol: agent.ProtocolPiSDK,
+	}}})
+	defer pool.CloseAll()
+	service := Service{Registry: &chatAgentTestRegistry{
+		commandTestRegistry: &commandTestRegistry{root: root, manager: manager},
+		pool:                pool,
+	}}
+
+	if err := service.SendMessage(ctx, SendMessageInput{
+		RootID:  root.ID,
+		Key:     created.Key,
+		Agent:   "pi",
+		Content: "keep going",
+	}); err != nil {
+		t.Fatalf("SendMessage returned error: %v", err)
+	}
+
+	loaded, err := manager.Get(ctx, created.Key, 0)
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	if len(loaded.Exchanges) != 2 {
+		t.Fatalf("exchanges = %#v, want one user and one agent exchange", loaded.Exchanges)
+	}
+	if got := loaded.Exchanges[1].Content; got != "queued follow-up response" {
+		t.Fatalf("agent content = %q, want queued follow-up response", got)
+	}
+}
+
+func TestSendMessagePersistsLatestGoalStateWithNonEmptySummary(t *testing.T) {
+	ctx := context.Background()
+	rootDir := t.TempDir()
+	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
+	manager := session.NewManager(root)
+	created, err := manager.Create(ctx, session.CreateInput{Type: session.TypeChat, Agent: "pi", Name: "chat"})
+	if err != nil {
+		t.Fatalf("create chat session: %v", err)
+	}
+
+	pool := agent.NewPool(agent.Config{Agents: []agent.Definition{{
+		Name:     "pi",
+		Command:  writeFakeGoalStatePiSDKForUsecase(t),
+		Protocol: agent.ProtocolPiSDK,
+	}}})
+	defer pool.CloseAll()
+	service := Service{Registry: &chatAgentTestRegistry{
+		commandTestRegistry: &commandTestRegistry{root: root, manager: manager},
+		pool:                pool,
+	}}
+
+	if err := service.SendMessage(ctx, SendMessageInput{
+		RootID:  root.ID,
+		Key:     created.Key,
+		Agent:   "pi",
+		Content: "run the goal",
+	}); err != nil {
+		t.Fatalf("SendMessage returned error: %v", err)
+	}
+
+	loaded, err := manager.Get(ctx, created.Key, 0)
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	if len(loaded.Exchanges) != 2 || !strings.Contains(loaded.Exchanges[1].Content, "已暂停目标") {
+		t.Fatalf("exchanges = %#v, want non-empty paused goal summary", loaded.Exchanges)
+	}
+	aux, err := manager.GetExchangeAux(ctx, created.Key, 0)
+	if err != nil {
+		t.Fatalf("get aux: %v", err)
+	}
+	items := aux[2]
+	if len(items) != 1 || items[0].GoalState == nil {
+		t.Fatalf("aux[2] = %#v, want one latest goal state", items)
+	}
+	if items[0].GoalState.Status != "paused" || items[0].GoalState.PauseReason != "waiting for approval" {
+		t.Fatalf("goal state = %+v", items[0].GoalState)
+	}
+}
+
+func TestSendMessageDoesNotPersistEmptyAgentExchangeOnFailure(t *testing.T) {
+	ctx := context.Background()
+	rootDir := t.TempDir()
+	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
+	manager := session.NewManager(root)
+	created, err := manager.Create(ctx, session.CreateInput{Type: session.TypeChat, Agent: "pi", Name: "chat"})
+	if err != nil {
+		t.Fatalf("create chat session: %v", err)
+	}
+
+	pool := agent.NewPool(agent.Config{Agents: []agent.Definition{{
+		Name:     "pi",
+		Command:  writeFakeFailingPiSDKForUsecase(t),
+		Protocol: agent.ProtocolPiSDK,
+	}}})
+	defer pool.CloseAll()
+	service := Service{Registry: &chatAgentTestRegistry{
+		commandTestRegistry: &commandTestRegistry{root: root, manager: manager},
+		pool:                pool,
+	}}
+
+	err = service.SendMessage(ctx, SendMessageInput{
+		RootID:  root.ID,
+		Key:     created.Key,
+		Agent:   "pi",
+		Content: "this will fail",
+	})
+	if err == nil || !strings.Contains(err.Error(), "upstream unavailable") {
+		t.Fatalf("SendMessage error = %v, want upstream unavailable", err)
+	}
+
+	loaded, err := manager.Get(ctx, created.Key, 0)
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	if len(loaded.Exchanges) != 1 || loaded.Exchanges[0].Role != "user" {
+		t.Fatalf("exchanges = %#v, want only the user exchange", loaded.Exchanges)
+	}
+}
+
 func TestStaleAgentSessionErrorDetection(t *testing.T) {
 	cases := []struct {
 		name string
@@ -2551,6 +2683,102 @@ for line in sys.stdin:
 `
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
 		t.Fatalf("write fake pi sdk: %v", err)
+	}
+	return path
+}
+
+func writeFakeBusyPiSDKForUsecase(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "fake-node")
+	script := `#!/usr/bin/env python3
+import json
+import sys
+
+def send(obj):
+    print(json.dumps(obj, ensure_ascii=False), flush=True)
+
+for line in sys.stdin:
+    req = json.loads(line)
+    req_id = req.get("id")
+    typ = req.get("type")
+    if typ == "start_sdk_runtime":
+        send({"id": req_id, "type": "response", "command": typ, "success": True, "data": {"sessionId": "busy-pi-sdk-session"}})
+    elif typ == "get_state":
+        send({"id": req_id, "type": "response", "command": typ, "success": True, "data": {"sessionId": "busy-pi-sdk-session", "isStreaming": True, "pendingMessageCount": 0}})
+    elif typ == "prompt":
+        send({"id": req_id, "type": "response", "command": typ, "success": False, "error": {"code": "E_TEST", "message": "prompt must not be used for a busy runtime"}})
+    elif typ == "follow_up":
+        send({"id": req_id, "type": "response", "command": typ, "success": True, "data": {"pendingMessageCount": 1}})
+        send({"type": "message_start", "message": {"role": "assistant", "content": []}})
+        send({"type": "message_update", "message": {"role": "assistant", "content": [{"type": "text", "text": "queued follow-up response"}]}, "assistantMessageEvent": {"type": "text_delta", "delta": "queued follow-up response"}})
+        send({"type": "message_end", "message": {"role": "assistant", "stopReason": "end_turn", "content": [{"type": "text", "text": "queued follow-up response"}]}})
+        send({"type": "runtime_settled", "reason": "test_follow_up_settled"})
+    else:
+        send({"id": req_id, "type": "response", "command": typ, "success": True, "data": {}})
+`
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake busy pi sdk: %v", err)
+	}
+	return path
+}
+
+func writeFakeGoalStatePiSDKForUsecase(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "fake-node")
+	script := `#!/usr/bin/env python3
+import json
+import sys
+
+def send(obj):
+    print(json.dumps(obj, ensure_ascii=False), flush=True)
+
+for line in sys.stdin:
+    req = json.loads(line)
+    req_id = req.get("id")
+    typ = req.get("type")
+    if typ == "start_sdk_runtime":
+        send({"id": req_id, "type": "response", "command": typ, "success": True, "data": {"sessionId": "goal-pi-sdk-session"}})
+    elif typ == "get_state":
+        send({"id": req_id, "type": "response", "command": typ, "success": True, "data": {"sessionId": "goal-pi-sdk-session", "isStreaming": False, "pendingMessageCount": 0}})
+    elif typ == "prompt":
+        send({"id": req_id, "type": "response", "command": typ, "success": True, "data": {"runtime": "sdk"}})
+        send({"type": "goal_state", "objective": "repair web history", "status": "active", "autoContinue": True, "updatedAt": "2026-07-11T12:00:00Z", "usage": {"tokensUsed": 10, "activeSeconds": 2}})
+        send({"type": "goal_state", "objective": "repair web history", "status": "paused", "autoContinue": False, "updatedAt": "2026-07-11T12:00:01Z", "usage": {"tokensUsed": 20, "activeSeconds": 4}, "pauseReason": "waiting for approval", "pauseSuggestedAction": "approve restart"})
+        send({"type": "runtime_settled", "reason": "test_goal_state_settled"})
+    else:
+        send({"id": req_id, "type": "response", "command": typ, "success": True, "data": {}})
+`
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake goal-state pi sdk: %v", err)
+	}
+	return path
+}
+
+func writeFakeFailingPiSDKForUsecase(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "fake-node")
+	script := `#!/usr/bin/env python3
+import json
+import sys
+
+def send(obj):
+    print(json.dumps(obj, ensure_ascii=False), flush=True)
+
+for line in sys.stdin:
+    req = json.loads(line)
+    req_id = req.get("id")
+    typ = req.get("type")
+    if typ == "start_sdk_runtime":
+        send({"id": req_id, "type": "response", "command": typ, "success": True, "data": {"sessionId": "failing-pi-sdk-session"}})
+    elif typ == "get_state":
+        send({"id": req_id, "type": "response", "command": typ, "success": True, "data": {"sessionId": "failing-pi-sdk-session", "isStreaming": False, "pendingMessageCount": 0}})
+    elif typ == "prompt":
+        send({"id": req_id, "type": "response", "command": typ, "success": False, "error": {"code": "E_UPSTREAM", "message": "upstream unavailable"}})
+    else:
+        send({"id": req_id, "type": "response", "command": typ, "success": True, "data": {}})
+`
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake failing pi sdk: %v", err)
 	}
 	return path
 }

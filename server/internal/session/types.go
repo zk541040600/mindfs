@@ -55,6 +55,7 @@ type ExchangeAux struct {
 	Todo      *agenttypes.TodoUpdate    `json:"todo,omitempty"`
 	Plan      *agenttypes.PlanUpdate    `json:"plan,omitempty"`
 	Compact   *agenttypes.CompactNotice `json:"compact,omitempty"`
+	GoalState *agenttypes.GoalState     `json:"goal_state,omitempty"`
 }
 
 func CompactExchangeAux(aux ExchangeAux) (ExchangeAux, bool) {
@@ -62,7 +63,7 @@ func CompactExchangeAux(aux ExchangeAux) (ExchangeAux, bool) {
 		if strings.TrimSpace(aux.Thought) != "" {
 			return aux, true
 		}
-		if aux.Todo != nil || aux.Plan != nil || aux.Compact != nil {
+		if aux.Todo != nil || aux.Plan != nil || aux.Compact != nil || aux.GoalState != nil {
 			return aux, true
 		}
 		return ExchangeAux{}, false

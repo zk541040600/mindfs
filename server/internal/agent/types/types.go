@@ -135,6 +135,27 @@ type ThreadEventSubscriber interface {
 	SubscribeThreadEvents(ctx context.Context) error
 }
 
+// RuntimeActivity is the current execution state reported by a stateful agent runtime.
+type RuntimeActivity struct {
+	IsStreaming         bool `json:"is_streaming"`
+	PendingMessageCount int  `json:"pending_message_count"`
+}
+
+// Busy reports whether the runtime is executing or has queued input.
+func (a RuntimeActivity) Busy() bool {
+	return a.IsStreaming || a.PendingMessageCount > 0
+}
+
+// RuntimeActivityReader is an optional capability for runtimes that expose execution state.
+type RuntimeActivityReader interface {
+	RuntimeActivity(ctx context.Context) (RuntimeActivity, error)
+}
+
+// FollowUpSender is an optional capability for queueing input behind an active runtime turn.
+type FollowUpSender interface {
+	SendFollowUp(ctx context.Context, content string) error
+}
+
 type ExternalSessionSummary struct {
 	Agent          string    `json:"agent"`
 	AgentSessionID string    `json:"agent_session_id"`
@@ -238,6 +259,7 @@ const (
 	EventTypeTodoUpdate   EventType = "todo_update"
 	EventTypePlanUpdate   EventType = "plan_update"
 	EventTypeCompact      EventType = "compact_notice"
+	EventTypeGoalState    EventType = "goal_state"
 	EventTypeLogin        EventType = "login_notice"
 	EventTypeMessageDone  EventType = "message_done"
 	EventTypeRecovery     EventType = "recovery"
@@ -314,6 +336,24 @@ type CompactNotice struct {
 	ID      string `json:"id,omitempty"`
 	Status  string `json:"status,omitempty"`
 	Summary string `json:"summary,omitempty"`
+}
+
+// GoalUsage is the bounded usage summary exposed by a Pi goal state entry.
+type GoalUsage struct {
+	TokensUsed    int64   `json:"tokensUsed,omitempty"`
+	ActiveSeconds float64 `json:"activeSeconds,omitempty"`
+}
+
+// GoalState is the safe, normalized subset of a Pi goal lifecycle entry.
+type GoalState struct {
+	Objective            string    `json:"objective,omitempty"`
+	Status               string    `json:"status"`
+	AutoContinue         bool      `json:"autoContinue"`
+	UpdatedAt            string    `json:"updatedAt,omitempty"`
+	Usage                GoalUsage `json:"usage,omitempty"`
+	PauseReason          string    `json:"pauseReason,omitempty"`
+	PauseSuggestedAction string    `json:"pauseSuggestedAction,omitempty"`
+	StopReason           string    `json:"stopReason,omitempty"`
 }
 
 type LoginNotice struct {

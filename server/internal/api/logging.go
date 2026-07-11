@@ -68,7 +68,7 @@ func LoggingMiddleware(next http.Handler) http.Handler {
 func CORSMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := strings.TrimSpace(r.Header.Get("Origin"))
-		allowedOrigin := allowedCORSOrigin(origin)
+		allowedOrigin := allowedCORSOrigin(origin, r.Host)
 		if origin != "" && allowedOrigin == "" {
 			http.Error(w, "cors origin not allowed", http.StatusForbidden)
 			return
@@ -100,7 +100,7 @@ func CORSMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-func allowedCORSOrigin(origin string) string {
+func allowedCORSOrigin(origin, requestHost string) string {
 	origin = strings.TrimSpace(origin)
 	if origin == "" || strings.EqualFold(origin, "null") {
 		return ""
@@ -112,7 +112,7 @@ func allowedCORSOrigin(origin string) string {
 	host := strings.ToLower(strings.TrimSpace(parsed.Hostname()))
 	switch strings.ToLower(parsed.Scheme) {
 	case "http", "https":
-		if isLoopbackOrMindFSHost(host) {
+		if strings.EqualFold(parsed.Host, strings.TrimSpace(requestHost)) || isLoopbackOrMindFSHost(host) {
 			return origin
 		}
 	case "capacitor", "ionic":

@@ -3,6 +3,7 @@ import {
   sessionService,
   type CompactNotice,
   type ExchangeAux,
+  type GoalState,
   type PlanUpdate,
   type TodoUpdate,
   type ToolCall,
@@ -27,6 +28,7 @@ type ExchangeLike = {
   todoUpdate?: TodoUpdate;
   planUpdate?: PlanUpdate;
   compactNotice?: CompactNotice;
+  goalState?: GoalState;
   pending_ack?: boolean;
 };
 
@@ -54,7 +56,8 @@ export type TimelineItem =
   | { id: string; type: "tool"; toolCall: ToolCall }
   | { id: string; type: "todo"; todoUpdate: TodoUpdate; timestamp?: string }
   | { id: string; type: "plan"; planUpdate: PlanUpdate; timestamp?: string }
-  | { id: string; type: "compact"; compactNotice: CompactNotice; timestamp?: string };
+  | { id: string; type: "compact"; compactNotice: CompactNotice; timestamp?: string }
+  | { id: string; type: "goal"; goalState: GoalState; timestamp?: string };
 
 type UseSessionStreamResult = {
   timeline: TimelineItem[];
@@ -269,6 +272,20 @@ function buildAssistantTimeline(
         timestamp: ex.timestamp,
       });
       segmentIndex += 1;
+    } else if (aux.goal_state) {
+      out.push({
+        id: stableTimelineID(
+          "goal",
+          index * 1000 + segmentIndex,
+          JSON.stringify(aux.goal_state),
+          ex.timestamp,
+          ex.agent,
+        ),
+        type: "goal",
+        goalState: aux.goal_state,
+        timestamp: aux.goal_state.updatedAt || ex.timestamp,
+      });
+      segmentIndex += 1;
     } else if (aux.toolcall) {
       const normalizedTool = normalizeToolCall(aux.toolcall);
       out.push({
@@ -410,6 +427,22 @@ function buildBaseTimeline(
         type: "compact",
         compactNotice: ex.compactNotice,
         timestamp: ex.timestamp,
+      });
+      continue;
+    }
+    if (role === "goal") {
+      if (!ex.goalState) continue;
+      out.push({
+        id: stableTimelineID(
+          "goal",
+          index,
+          JSON.stringify(ex.goalState),
+          ex.timestamp,
+          ex.agent,
+        ),
+        type: "goal",
+        goalState: ex.goalState,
+        timestamp: ex.goalState.updatedAt || ex.timestamp,
       });
     }
   }

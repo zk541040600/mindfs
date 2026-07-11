@@ -307,12 +307,13 @@ func (s *AppContext) RunAgentStage(ctx context.Context, exec kanban.AgentStageEx
 	})
 	if err != nil {
 		s.BroadcastSessionError(exec.RootID, sessionKey, err.Error())
+		return err
 	}
 	if ok := updateTracker.WaitIdle(ctx, sessionDoneSettleWindow, sessionDoneMaxWait); !ok {
 		log.Printf("[kanban] session.done.wait_timeout root=%s session=%s task=%s", exec.RootID, sessionKey, exec.Task.ID)
 	}
 	s.BroadcastSessionDone(exec.RootID, sessionKey, "")
-	return err
+	return nil
 }
 
 func (s *AppContext) TaskUpdated(rootID string, detail kanban.TaskDetail) {
@@ -708,11 +709,15 @@ func (s *AppContext) BroadcastSessionUpdate(rootID, sessionKey string, update ag
 }
 
 func (s *AppContext) BroadcastSessionError(rootID, sessionKey, message string) {
-	s.UpdateTaskSessionErrorForSession(rootID, sessionKey, message)
-	s.GetSessionStreamHub().BroadcastSessionStream(rootID, sessionKey, &StreamEvent{
-		Type: "error",
-		Data: map[string]string{"message": normalizeAgentErrorMessage(errors.New(message))},
-	})
+	s.BroadcastSessionErrorForRequest(rootID, sessionKey, "", message)
+}
+
+func (s *AppContext) BroadcastSessionErrorForRequest(rootID, sessionKey, requestID, message string) {
+	errorMessage := normalizeAgentErrorMessage(errors.New(message))
+	s.UpdateTaskSessionErrorForSession(rootID, sessionKey, errorMessage)
+	hub := s.GetSessionStreamHub()
+	hub.ClearSessionPending(sessionKey)
+	hub.BroadcastSessionError(rootID, sessionKey, requestID, "session.message_failed", errorMessage)
 }
 
 func (s *AppContext) ClearTaskAuxFlagsForSession(rootID, sessionKey string) {

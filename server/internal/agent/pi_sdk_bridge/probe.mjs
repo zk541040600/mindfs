@@ -37,7 +37,11 @@ const DEFAULT_IMPORT_MAX_BYTES = 256 * 1024;
 const SDK_PROMPT_IDLE_POLL_MS = 250;
 const SDK_PROMPT_IDLE_FALLBACK_MS = 1500;
 const SDK_PROMPT_HARD_IDLE_TIMEOUT_MS = 120000;
+const SDK_AGENT_SETTLED_DRAIN_MS = 150;
 const SDK_JSONL_EOF_PROMPT_GRACE_MS = 120000;
+const MAX_GOAL_OBJECTIVE_BYTES = 4096;
+const MAX_GOAL_DETAIL_BYTES = 2048;
+const GOAL_STATE_STATUSES = new Set(["active", "paused", "complete"]);
 
 const protocolStdoutWrite = process.stdout.write.bind(process.stdout);
 const protocolStderrWrite = process.stderr.write.bind(process.stderr);
@@ -502,12 +506,16 @@ function sanitizeModel(model) {
   };
 }
 
+const PI_THINKING_LEVEL_SUFFIX = /:(?:off|minimal|low|medium|high|xhigh|max)$/;
+
 async function readPiEnabledModelIDs(agentDir) {
   const settingsPath = join(agentDir || DEFAULT_AGENT_DIR, "settings.json");
   try {
     const settings = JSON.parse(await readFile(settingsPath, "utf8"));
     const enabledModels = Array.isArray(settings?.enabledModels) ? settings.enabledModels : [];
-    return enabledModels.map((item) => String(item || "").trim()).filter(Boolean);
+    return Array.from(new Set(enabledModels
+      .map((item) => String(item || "").trim().replace(PI_THINKING_LEVEL_SUFFIX, ""))
+      .filter(Boolean)));
   } catch (error) {
     console.warn(`[mindfs/pi] failed to read enabledModels from ${settingsPath}: ${error instanceof Error ? error.message : String(error)}`);
     return [];
@@ -728,6 +736,64 @@ function sanitizeTranscriptText(text) {
   replace(/\b[A-Za-z0-9+\/_-]{48,}={0,2}\b/g, "[REDACTED:token]");
 
   return { text: value.trim(), redactions, binaryLike: false };
+}
+
+function truncateUTF8Text(value, maxBytes) {
+  if (maxBytes <= 0 || !value) {
+    return "";
+  }
+  if (Buffer.byteLength(value, "utf8") <= maxBytes) {
+    return value;
+  }
+  let result = "";
+  let bytes = 0;
+  for (const character of value) {
+    const nextBytes = Buffer.byteLength(character, "utf8");
+    if (bytes + nextBytes > maxBytes) {
+      break;
+    }
+    result += character;
+    bytes += nextBytes;
+  }
+  return result;
+}
+
+function sanitizeGoalText(value, maxBytes) {
+  const sanitized = sanitizeTranscriptText(typeof value === "string" ? value : "");
+  if (sanitized.binaryLike) {
+    return "";
+  }
+  return truncateUTF8Text(sanitized.text, maxBytes);
+}
+
+function normalizeGoalMetric(value) {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+    ? Math.min(value, Number.MAX_SAFE_INTEGER)
+    : 0;
+}
+
+function normalizeGoalStateEntry(entry) {
+  if (entry?.type !== "custom" || entry.customType !== "pi-goal-state") {
+    return undefined;
+  }
+  const goal = entry.data?.goal;
+  const status = typeof goal?.status === "string" ? goal.status.trim().toLowerCase() : "";
+  if (!goal || !GOAL_STATE_STATUSES.has(status)) {
+    return undefined;
+  }
+  return {
+    objective: sanitizeGoalText(goal.objective, MAX_GOAL_OBJECTIVE_BYTES),
+    status,
+    autoContinue: goal.autoContinue === true,
+    updatedAt: normalizeTimestamp(goal.updatedAt ?? entry.timestamp) ?? "",
+    usage: {
+      tokensUsed: normalizeGoalMetric(goal.usage?.tokensUsed),
+      activeSeconds: normalizeGoalMetric(goal.usage?.activeSeconds),
+    },
+    pauseReason: sanitizeGoalText(goal.pauseReason, MAX_GOAL_DETAIL_BYTES),
+    pauseSuggestedAction: sanitizeGoalText(goal.pauseSuggestedAction, MAX_GOAL_DETAIL_BYTES),
+    stopReason: sanitizeGoalText(goal.stopReason, MAX_GOAL_DETAIL_BYTES),
+  };
 }
 
 function normalizeTimestamp(timestamp) {
@@ -1246,7 +1312,7 @@ async function runJsonl(argv) {
       try {
         if (request.type === "start_test_runtime") {
           await runtime?.dispose?.();
-          runtime = createJsonlTestRuntime(request.scenario);
+          runtime = createJsonlTestRuntime(request.scenario, resolve(request.agentDir ?? baseOptions.agentDir));
           writeJsonl({ id: request.id, type: "response", command: "start_test_runtime", success: true, data: { scenario: request.scenario } });
         } else if (request.type === "start_sdk_runtime") {
           await runtime?.dispose?.();
@@ -1342,7 +1408,7 @@ async function dispatchJsonlRuntimeControl(runtime, request) {
   return true;
 }
 
-function createJsonlTestRuntime(scenario) {
+function createJsonlTestRuntime(scenario, agentDir) {
   if (scenario === "extension-ui") {
     return createJsonlUIRuntime();
   }
@@ -1370,6 +1436,9 @@ function createJsonlTestRuntime(scenario) {
   if (scenario === "prompt-done-after-agent-end") {
     return createJsonlPromptDoneAfterAgentEndRuntime();
   }
+  if (scenario === "goal-state-settled") {
+    return createJsonlGoalStateRuntime();
+  }
   if (scenario === "turn-end-only") {
     return createJsonlTurnEndOnlyRuntime();
   }
@@ -1377,7 +1446,10 @@ function createJsonlTestRuntime(scenario) {
     return createJsonlSlashRuntime();
   }
   if (scenario === "runtime-controls") {
-    return createJsonlControlsRuntime();
+    return createJsonlControlsRuntime(agentDir);
+  }
+  if (scenario === "runtime-busy-controls") {
+    return createJsonlControlsRuntime(agentDir, true);
   }
   if (scenario === "abort-hangs") {
     return createJsonlAbortHangsRuntime();
@@ -1842,7 +1914,42 @@ function createJsonlPromptDoneAfterAgentEndRuntime() {
         willRetry: false,
       });
       writeJsonl({ type: "context_window", totalTokens: 40, modelContextWindow: 100 });
-      writeJsonl({ type: "agent_end", willRetry: false, promptDone: true, synthetic: true, reason: "sdk_prompt_resolved" });
+      writeJsonl({ type: "runtime_settled", reason: "test_runtime_settled" });
+    },
+    answerExtensionUI: async function (request) {
+      throw new ProbeError("E_PARAM", `unknown extension UI request id: ${request.id}`);
+    },
+    dispose: async function () {},
+  };
+}
+
+function createJsonlGoalStateRuntime() {
+  return {
+    kind: "goal-state-settled",
+    prompt: async function (request) {
+      writeJsonl(successResponse("prompt", { scenario: "goal-state-settled" }, request.id));
+      const goalState = normalizeGoalStateEntry({
+        type: "custom",
+        customType: "pi-goal-state",
+        timestamp: "2026-07-11T12:00:00Z",
+        data: {
+          goal: {
+            objective: "repair session token=1234567890abcdef",
+            status: "paused",
+            autoContinue: false,
+            updatedAt: "2026-07-11T12:00:00Z",
+            usage: { tokensUsed: 42, activeSeconds: 7.5 },
+            pauseReason: "waiting for approval password=1234567890abcdef",
+            pauseSuggestedAction: "approve the next step",
+            activePath: "/private/path/that/must/not/leave/the/bridge",
+          },
+          arbitraryPayload: { secret: "must-not-leak" },
+        },
+      });
+      if (goalState) {
+        writeJsonl({ type: "goal_state", ...goalState });
+      }
+      writeJsonl({ type: "runtime_settled", reason: "test_goal_state_settled" });
     },
     answerExtensionUI: async function (request) {
       throw new ProbeError("E_PARAM", `unknown extension UI request id: ${request.id}`);
@@ -1913,7 +2020,7 @@ function createJsonlSlashRuntime() {
   };
 }
 
-function createJsonlControlsRuntime() {
+function createJsonlControlsRuntime(agentDir, initiallyBusy = false) {
   const models = [
     { id: "model", name: "Fake Model", provider: "fake", reasoning: true, thinkingLevelMap: { off: "off", high: "high" } },
     { id: "plain", name: "Plain Model", provider: "fake", reasoning: false },
@@ -1926,7 +2033,7 @@ function createJsonlControlsRuntime() {
     sessionId: "sdk-test",
     model: { provider: "fake", id: "model" },
     thinkingLevel: "off",
-    isStreaming: false,
+    isStreaming: initiallyBusy,
     steering: [],
     followUp: [],
     steeringMode: "all",
@@ -1978,7 +2085,8 @@ function createJsonlControlsRuntime() {
       writeJsonl(successResponse("get_state", { ...state, pendingMessageCount: state.steering.length + state.followUp.length }, request.id));
     },
     getAvailableModels: async function (request) {
-      writeJsonl(successResponse("get_available_models", { models }, request.id));
+      const enabledModels = await filterModelsByPiEnabledModels(models, agentDir);
+      writeJsonl(successResponse("get_available_models", { models: enabledModels }, request.id));
     },
     setModel: async function (request) {
       const model = models.find((item) => item.provider === request.provider && item.id === request.modelId);
@@ -2005,9 +2113,32 @@ function createJsonlControlsRuntime() {
       writeJsonl(successResponse("steer", deterministicQueueState(), request.id));
     },
     followUp: async function (request) {
-      state.followUp.push(jsonlRequestText(request, "follow_up"));
+      const message = jsonlRequestText(request, "follow_up");
+      state.followUp.push(message);
       emitQueueUpdate();
       writeJsonl(successResponse("follow_up", deterministicQueueState(), request.id));
+      await delay(50);
+      state.isStreaming = true;
+      writeJsonl({ type: "agent_start" });
+      writeJsonl({ type: "message_start", message: { role: "assistant", content: [] } });
+      writeJsonl({
+        type: "message_update",
+        message: { role: "assistant", content: [{ type: "text", text: `follow up: ${message}` }] },
+        assistantMessageEvent: { type: "text_delta", delta: `follow up: ${message}` },
+      });
+      writeJsonl({
+        type: "message_end",
+        message: {
+          role: "assistant",
+          stopReason: "end_turn",
+          content: [{ type: "text", text: `follow up: ${message}` }],
+          usage: { input: 1, output: 2, totalTokens: 3 },
+        },
+      });
+      state.followUp.shift();
+      state.isStreaming = false;
+      emitQueueUpdate();
+      writeJsonl({ type: "runtime_settled", reason: "test_follow_up_settled" });
     },
     compact: async function (request) {
       state.compactCount += 1;
@@ -2354,6 +2485,10 @@ async function createJsonlSDKRuntime(options) {
       clearInterval(state.timer);
       state.timer = undefined;
     }
+    if (state?.settleTimer) {
+      clearTimeout(state.settleTimer);
+      state.settleTimer = undefined;
+    }
     if (activePrompt === state) {
       activePrompt = undefined;
     }
@@ -2366,6 +2501,53 @@ async function createJsonlSDKRuntime(options) {
       return session.state.messages;
     }
     return [];
+  };
+  const createPromptState = (requestId, preflightSucceeded = false) => ({
+    requestId,
+    startedAt: Date.now(),
+    lastActivityAt: Date.now(),
+    baselineMessageCount: messagesForSession().length,
+    sawAssistantActivity: false,
+    seenMessageEnd: false,
+    seenAgentEnd: false,
+    preflightSucceeded,
+    pendingToolCalls: new Set(),
+    done: false,
+    promptResolved: false,
+    timer: undefined,
+    settleTimer: undefined,
+    settleReason: "",
+  });
+  const finishRuntimeSettled = (state, reason) => {
+    if (!state || state.done) {
+      return;
+    }
+    writeJsonl(contextWindowEnvelope(session));
+    writeJsonl({ type: "runtime_settled", reason });
+    state.done = true;
+    clearPromptWatchdog(state);
+  };
+  const scheduleRuntimeSettled = (state, reason = "") => {
+    if (!state || state.done) {
+      return;
+    }
+    if (reason) {
+      state.settleReason = reason;
+    }
+    if (state.settleTimer) {
+      clearTimeout(state.settleTimer);
+    }
+    state.settleTimer = setTimeout(() => {
+      state.settleTimer = undefined;
+      finishRuntimeSettled(state, state.settleReason || "sdk_agent_settled");
+    }, SDK_AGENT_SETTLED_DRAIN_MS);
+  };
+  const cancelScheduledSettlement = (state) => {
+    if (!state?.settleTimer) {
+      return;
+    }
+    clearTimeout(state.settleTimer);
+    state.settleTimer = undefined;
   };
   const startPromptWatchdog = (state) => {
     state.timer = setInterval(() => {
@@ -2389,20 +2571,27 @@ async function createJsonlSDKRuntime(options) {
       }
       if (!state.preflightSucceeded) {
         writeJsonl(errorResponse("prompt", error, state.requestId));
+        state.done = true;
+        clearPromptWatchdog(state);
       } else {
         writeJsonl({ type: "recovery", message: error.message });
-        writeJsonl(contextWindowEnvelope(session));
-        writeJsonl({ type: "agent_end", willRetry: false, promptDone: true, synthetic: true, reason: "sdk_prompt_idle_timeout" });
+        finishRuntimeSettled(state, "sdk_prompt_idle_timeout");
       }
-      state.done = true;
-      state.seenAgentEnd = true;
-      clearPromptWatchdog(state);
     }, SDK_PROMPT_IDLE_POLL_MS);
   };
   let unsubscribe = session.subscribe((event) => {
     const state = activePrompt;
     if (state && !state.done) {
       state.lastActivityAt = Date.now();
+      if (event.type === "agent_settled") {
+        scheduleRuntimeSettled(state, "sdk_agent_settled");
+        return;
+      }
+      if (event.type === "entry_appended" && state.settleTimer) {
+        scheduleRuntimeSettled(state);
+      } else if (["agent_start", "turn_start", "message_start", "tool_execution_start"].includes(event.type)) {
+        cancelScheduledSettlement(state);
+      }
       if (event.type === "message_update") {
         state.sawAssistantActivity = true;
       } else if (event.type === "message_end") {
@@ -2425,6 +2614,17 @@ async function createJsonlSDKRuntime(options) {
     if (event.type === "agent_end") {
       writeJsonl(contextWindowEnvelope(session));
       writeJsonl({ ...event, promptDone: false });
+      return;
+    }
+    if (event.type === "entry_appended") {
+      const goalState = normalizeGoalStateEntry(event.entry);
+      if (goalState) {
+        writeJsonl({ type: "goal_state", ...goalState });
+      }
+      return;
+    }
+    if (event.type === "agent_settled") {
+      writeJsonl({ type: "runtime_settled", reason: "sdk_agent_settled" });
       return;
     }
     writeJsonl(event);
@@ -2459,19 +2659,11 @@ async function createJsonlSDKRuntime(options) {
     },
     prompt: async function (request) {
       await bindingsReady;
-      const state = {
-        requestId: request.id,
-        startedAt: Date.now(),
-        lastActivityAt: Date.now(),
-        baselineMessageCount: messagesForSession().length,
-        sawAssistantActivity: false,
-        seenMessageEnd: false,
-        seenAgentEnd: false,
-        preflightSucceeded: false,
-        pendingToolCalls: new Set(),
-        done: false,
-        timer: undefined,
-      };
+      if (activePrompt && !activePrompt.done) {
+        writeJsonl(errorResponse("prompt", new ProbeError("E_BUSY", "Agent is already processing. Use followUp to queue the message."), request.id));
+        return;
+      }
+      const state = createPromptState(request.id);
       activePrompt = state;
       startPromptWatchdog(state);
       void session
@@ -2492,28 +2684,25 @@ async function createJsonlSDKRuntime(options) {
             state.preflightSucceeded = true;
             writeJsonl(successResponse("prompt", { runtime: "sdk" }, request.id));
           }
-          writeJsonl(contextWindowEnvelope(session));
-          writeJsonl({ type: "agent_end", willRetry: false, promptDone: true, synthetic: true, reason: "sdk_prompt_resolved" });
-          state.done = true;
-          state.seenAgentEnd = true;
-          clearPromptWatchdog(state);
+          state.promptResolved = true;
+          state.lastActivityAt = Date.now();
+          if (String(request.message ?? "").trim().startsWith("/")) {
+            scheduleRuntimeSettled(state, "sdk_slash_command_resolved");
+          }
         })
         .catch((error) => {
           if (state.done) {
             return;
           }
-          clearPromptWatchdog(state);
           if (!state.preflightSucceeded) {
             state.done = true;
             state.seenAgentEnd = true;
             writeJsonl(errorResponse("prompt", error, request.id));
+            clearPromptWatchdog(state);
             return;
           }
           writeJsonl({ type: "recovery", message: error instanceof Error ? error.message : String(error) });
-          writeJsonl(contextWindowEnvelope(session));
-          writeJsonl({ type: "agent_end", willRetry: false, promptDone: true, synthetic: true, reason: "sdk_prompt_error" });
-          state.done = true;
-          state.seenAgentEnd = true;
+          finishRuntimeSettled(state, "sdk_prompt_error");
         });
     },
     answerQuestion: async function (request) {
@@ -2616,6 +2805,10 @@ async function createJsonlSDKRuntime(options) {
     },
     followUp: async function (request) {
       await bindingsReady;
+      if (!activePrompt || activePrompt.done) {
+        activePrompt = createPromptState("", true);
+        startPromptWatchdog(activePrompt);
+      }
       await session.followUp(jsonlRequestText(request, "follow_up"));
       writeJsonl(successResponse("follow_up", queueState(session), request.id));
     },

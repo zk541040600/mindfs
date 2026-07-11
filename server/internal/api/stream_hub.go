@@ -69,8 +69,10 @@ type ClientReplayState struct {
 }
 
 type CompletedSessionState struct {
-	RequestID string
-	Completed time.Time
+	RequestID    string
+	ErrorCode    string
+	ErrorMessage string
+	Completed    time.Time
 }
 
 type ReplyingSessionState struct {
@@ -162,6 +164,28 @@ func buildSessionDoneResponse(rootID, sessionKey, requestID string, replay bool)
 		ID:      requestID,
 		Type:    "session.done",
 		Payload: payload,
+	}
+}
+
+func buildSessionErrorResponse(rootID, sessionKey, requestID, code, message string, replay bool) WSResponse {
+	payload := map[string]any{
+		"root_id":     rootID,
+		"session_key": sessionKey,
+	}
+	if strings.TrimSpace(requestID) != "" {
+		payload["request_id"] = requestID
+	}
+	if replay {
+		payload["replay"] = true
+	}
+	return WSResponse{
+		ID:      requestID,
+		Type:    "session.error",
+		Payload: payload,
+		Error: &WSResponseError{
+			Code:    code,
+			Message: message,
+		},
 	}
 }
 
@@ -608,6 +632,10 @@ func (h *StreamHub) AppendReplyEvent(sessionKey string, event StreamEvent) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	state := h.ensurePendingSessionLocked(sessionKey)
+	if coalesceGoalStateStreamEvent(state, event) {
+		state.UpdatedAt = time.Now().UTC()
+		return
+	}
 	if coalesceUserShellStreamEvent(state, event) {
 		state.UpdatedAt = time.Now().UTC()
 		return
@@ -630,11 +658,26 @@ func isAuxiliarySummaryBoundary(eventType string) bool {
 		agenttypes.EventTypeToolUpdate,
 		agenttypes.EventTypeTodoUpdate,
 		agenttypes.EventTypePlanUpdate,
-		agenttypes.EventTypeCompact:
+		agenttypes.EventTypeCompact,
+		agenttypes.EventTypeGoalState:
 		return true
 	default:
 		return false
 	}
+}
+
+func coalesceGoalStateStreamEvent(state *SessionPendingState, event StreamEvent) bool {
+	if state == nil || event.Type != string(agenttypes.EventTypeGoalState) {
+		return false
+	}
+	for i := len(state.ReplyingList) - 1; i >= 0; i-- {
+		if state.ReplyingList[i].Type != event.Type {
+			continue
+		}
+		state.ReplyingList[i] = cloneEvent(event)
+		return true
+	}
+	return false
 }
 
 const maxReplayUserShellStreamBytes = 256 * 1024
@@ -809,6 +852,21 @@ func (h *StreamHub) BroadcastSessionDone(rootID, sessionKey, requestID string) {
 	}
 }
 
+func (h *StreamHub) BroadcastSessionError(rootID, sessionKey, requestID, code, message string) {
+	h.mu.Lock()
+	h.completed[sessionKey] = &CompletedSessionState{
+		RequestID:    requestID,
+		ErrorCode:    code,
+		ErrorMessage: message,
+		Completed:    time.Now().UTC(),
+	}
+	h.mu.Unlock()
+	resp := buildSessionErrorResponse(rootID, sessionKey, requestID, code, message, false)
+	for _, clientID := range h.GetSessionClientIDs(sessionKey, false) {
+		h.SendToClient(clientID, resp)
+	}
+}
+
 func (h *StreamHub) BroadcastSessionUserMessage(
 	rootID string,
 	sessionKey string,
@@ -954,7 +1012,13 @@ func (h *StreamHub) replayCompletionToClient(rootID, clientID, sessionKey string
 		return
 	}
 	requestID := completed.RequestID
+	errorCode := completed.ErrorCode
+	errorMessage := completed.ErrorMessage
 	h.mu.Unlock()
+	if strings.TrimSpace(errorMessage) != "" {
+		h.SendToClient(clientID, buildSessionErrorResponse(rootID, sessionKey, requestID, errorCode, errorMessage, true))
+		return
+	}
 	h.SendToClient(clientID, buildSessionDoneResponse(rootID, sessionKey, requestID, true))
 }
 

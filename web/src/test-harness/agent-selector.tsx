@@ -26,6 +26,10 @@ const healthyPi: AgentStatus = {
   default_model_id: "cch-responses/gpt-5.5",
   models: [
     {
+      id: "cch-responses/gpt-5.6-sol",
+      name: "cch-responses/GPT 5.6 Sol",
+    },
+    {
       id: "cch-responses/gpt-5.5",
       name: "cch-responses/GPT 5.5",
     },
@@ -39,6 +43,10 @@ const healthyPi: AgentStatus = {
     {
       id: "xhigh",
       name: "Thinking: xhigh",
+    },
+    {
+      id: "max",
+      name: "Thinking: max",
     },
   ],
 };

@@ -38,8 +38,8 @@ func NewCredentialsStore() (*CredentialsStore, error) {
 }
 
 func (s *CredentialsStore) Load() (Credentials, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	var creds Credentials
 	payload, err := os.ReadFile(s.filePath)
@@ -48,6 +48,9 @@ func (s *CredentialsStore) Load() (Credentials, error) {
 			return creds, nil
 		}
 		return creds, err
+	}
+	if err := os.Chmod(s.filePath, 0o600); err != nil {
+		return Credentials{}, err
 	}
 	if err := json.Unmarshal(payload, &creds); err != nil {
 		return Credentials{}, err

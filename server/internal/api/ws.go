@@ -36,7 +36,12 @@ const (
 )
 
 var (
-	upgrader         = websocket.Upgrader{}
+	upgrader = websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool {
+			origin := strings.TrimSpace(r.Header.Get("Origin"))
+			return origin == "" || allowedCORSOrigin(origin, r.Host) != ""
+		},
+	}
 	wsReadLimitBytes = int64(maxUploadRequestBytes)
 )
 
@@ -945,19 +950,15 @@ func (h *WSHandler) runSessionMessage(job sessionMessageJob) {
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			log.Printf("[ws] session.message.cancelled root=%s session=%s request=%s", rootID, key, requestID)
-		} else {
-			log.Printf("[ws] session.message.error root=%s session=%s request=%s err=%v", rootID, key, requestID, err)
-			errorMessage := normalizeAgentErrorMessage(err)
-			event := &StreamEvent{
-				Type: "error",
-				Data: map[string]string{
-					"message":    errorMessage,
-					"request_id": requestID,
-				},
-			}
-			streamHub.BroadcastSessionStream(rootID, key, event)
-			h.AppContext.BroadcastSessionError(rootID, key, errorMessage)
+			return
 		}
+		if ok := updateTracker.WaitIdle(msgCtx, sessionDoneSettleWindow, sessionDoneMaxWait); !ok {
+			log.Printf("[ws] session.error.wait_timeout root=%s session=%s request=%s", rootID, key, requestID)
+		}
+		log.Printf("[ws] session.message.error root=%s session=%s request=%s err=%v", rootID, key, requestID, err)
+		h.AppContext.BroadcastSessionErrorForRequest(rootID, key, requestID, normalizeAgentErrorMessage(err))
+		h.startNextQueuedSessionMessage(rootID, key)
+		return
 	}
 	if ok := updateTracker.WaitIdle(msgCtx, sessionDoneSettleWindow, sessionDoneMaxWait); !ok {
 		log.Printf("[ws] session.done.wait_timeout root=%s session=%s request=%s", rootID, key, requestID)
@@ -989,6 +990,7 @@ func (h *WSHandler) startNextQueuedSessionMessage(rootID, key string) {
 	go h.runSessionMessage(sessionMessageJob{
 		RootID:      rootID,
 		Key:         key,
+		RequestID:   item.ID,
 		SessionType: sessionType,
 		SessionName: sessionName,
 		Shell:       shell,
@@ -1256,6 +1258,10 @@ func updateToEvent(update agenttypes.Event) *StreamEvent {
 	case agenttypes.EventTypeCompact:
 		if compact, ok := update.Data.(agenttypes.CompactNotice); ok {
 			return &StreamEvent{Type: "compact_notice", Data: compact}
+		}
+	case agenttypes.EventTypeGoalState:
+		if goalState, ok := update.Data.(agenttypes.GoalState); ok {
+			return &StreamEvent{Type: "goal_state", Data: goalState}
 		}
 	case agenttypes.EventTypeLogin:
 		if login, ok := update.Data.(agenttypes.LoginNotice); ok {

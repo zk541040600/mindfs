@@ -3,6 +3,7 @@ package relay
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -92,6 +93,46 @@ func TestCredentialsStoreSaveLoad(t *testing.T) {
 	}
 	if len(temps) != 0 {
 		t.Fatalf("credential temp files left behind: %#v", temps)
+	}
+}
+
+func TestCredentialsStoreLoadRepairsLegacyPermissionsWithoutRewritingContent(t *testing.T) {
+	configRoot := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", configRoot)
+	t.Setenv("HOME", configRoot)
+
+	store, err := NewCredentialsStore()
+	if err != nil {
+		t.Fatalf("NewCredentialsStore() error = %v", err)
+	}
+	payload := []byte("{\n  \"relay\": {\"device_token\": \"dev_legacy\", \"node_id\": \"node_legacy\", \"endpoint\": \"wss://relay.example.com/ws/connector\"}\n}\n")
+	if err := os.WriteFile(store.filePath, payload, 0o644); err != nil {
+		t.Fatalf("WriteFile setup error = %v", err)
+	}
+	if err := os.Chmod(store.filePath, 0o644); err != nil {
+		t.Fatalf("Chmod setup error = %v", err)
+	}
+
+	creds, err := store.Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if creds.Relay.DeviceToken != "dev_legacy" || creds.Relay.NodeID != "node_legacy" {
+		t.Fatalf("Load() credentials = %+v", creds.Relay)
+	}
+	after, err := os.ReadFile(store.filePath)
+	if err != nil {
+		t.Fatalf("ReadFile after Load() error = %v", err)
+	}
+	if string(after) != string(payload) {
+		t.Fatal("Load() rewrote legacy credential content")
+	}
+	info, err := os.Stat(store.filePath)
+	if err != nil {
+		t.Fatalf("Stat credentials error = %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("credentials file mode = %o, want 0600", got)
 	}
 }
 
@@ -469,22 +510,112 @@ func TestServiceCheckPublicHealth(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewService() error = %v", err)
 	}
-	svc.client = &http.Client{
-		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-			if req.URL.String() != "https://relay.example.com/n/node_live/health" {
-				t.Fatalf("unexpected health URL: %s", req.URL.String())
-			}
-			return &http.Response{
-				StatusCode: http.StatusOK,
-				Status:     "200 OK",
-				Header:     http.Header{},
-				Body:       io.NopCloser(strings.NewReader("ok")),
-			}, nil
-		}),
+	tests := []struct {
+		name       string
+		statusCode int
+		transport  error
+		want       PublicAccessState
+	}{
+		{name: "available", statusCode: http.StatusOK, want: PublicAccessAvailable},
+		{name: "unauthorized", statusCode: http.StatusUnauthorized, want: PublicAccessAuthRequired},
+		{name: "forbidden", statusCode: http.StatusForbidden, want: PublicAccessAuthRequired},
+		{name: "server error", statusCode: http.StatusBadGateway, want: PublicAccessUnavailable},
+		{name: "transport error", transport: errors.New("network unavailable"), want: PublicAccessUnavailable},
 	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc.client = &http.Client{
+				Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+					if req.URL.String() != "https://relay.example.com/n/node_live/health" {
+						t.Fatalf("unexpected health URL: %s", req.URL.String())
+					}
+					if tt.transport != nil {
+						return nil, tt.transport
+					}
+					return &http.Response{
+						StatusCode: tt.statusCode,
+						Status:     fmt.Sprintf("%d status", tt.statusCode),
+						Header:     http.Header{},
+						Body:       io.NopCloser(strings.NewReader("result")),
+					}, nil
+				}),
+			}
 
-	if err := svc.CheckPublicHealth(context.Background(), "https://relay.example.com/n/node_live/"); err != nil {
-		t.Fatalf("CheckPublicHealth() error = %v", err)
+			result := svc.CheckPublicHealth(context.Background(), "https://relay.example.com/n/node_live/")
+			if result.State != tt.want {
+				t.Fatalf("CheckPublicHealth() = %+v, want state %q", result, tt.want)
+			}
+		})
+	}
+}
+
+func TestManagerPublicHealthIsDiagnosticOnly(t *testing.T) {
+	tests := []struct {
+		name         string
+		statusCode   int
+		transportErr error
+		wantState    PublicAccessState
+		wantFailures int
+	}{
+		{name: "available", statusCode: http.StatusOK, wantState: PublicAccessAvailable},
+		{name: "unauthorized browser gate", statusCode: http.StatusUnauthorized, wantState: PublicAccessAuthRequired},
+		{name: "forbidden browser gate", statusCode: http.StatusForbidden, wantState: PublicAccessAuthRequired},
+		{name: "server unavailable", statusCode: http.StatusBadGateway, wantState: PublicAccessUnavailable, wantFailures: 4},
+		{name: "transport unavailable", transportErr: errors.New("network unavailable"), wantState: PublicAccessUnavailable, wantFailures: 4},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			configRoot := t.TempDir()
+			t.Setenv("XDG_CONFIG_HOME", configRoot)
+			t.Setenv("HOME", configRoot)
+			manager, err := NewManager(":7331", false, "https://relay.example.com", false)
+			if err != nil {
+				t.Fatalf("NewManager() error = %v", err)
+			}
+			if err := manager.service.store.Save(Credentials{Relay: RelayCredentials{
+				DeviceToken: "dev_live",
+				NodeID:      "node_live",
+				Endpoint:    "wss://relay.example.com/ws/connector",
+			}}); err != nil {
+				t.Fatalf("Save() error = %v", err)
+			}
+			manager.mu.Lock()
+			manager.connected = true
+			manager.lastError = "connector diagnostic"
+			manager.mu.Unlock()
+			manager.service.client = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+				if tt.transportErr != nil {
+					return nil, tt.transportErr
+				}
+				return &http.Response{
+					StatusCode: tt.statusCode,
+					Status:     fmt.Sprintf("%d status", tt.statusCode),
+					Header:     http.Header{},
+					Body:       io.NopCloser(strings.NewReader("result")),
+				}, nil
+			})}
+
+			repeats := 1
+			if tt.wantState == PublicAccessUnavailable {
+				repeats = 4
+			}
+			for i := 0; i < repeats; i++ {
+				manager.checkRelayPublicHealth(context.Background())
+			}
+			status := manager.Status()
+			if status.PublicAccess != tt.wantState || status.HealthFailures != tt.wantFailures {
+				t.Fatalf("status = %+v, want public access %q and failures %d", status, tt.wantState, tt.wantFailures)
+			}
+			if !status.Connected || status.ReconnectCount != 0 {
+				t.Fatalf("public health changed connector liveness: %+v", status)
+			}
+			if status.LastError != "connector diagnostic" {
+				t.Fatalf("public health overwrote connector error: %q", status.LastError)
+			}
+			if status.PublicAccessCheckedAt == "" {
+				t.Fatal("public access checked timestamp missing")
+			}
+		})
 	}
 }
 
