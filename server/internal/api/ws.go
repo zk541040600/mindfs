@@ -647,11 +647,12 @@ func (h *WSHandler) handleSessionMessage(ctx context.Context, conn *websocket.Co
 		key = created.Key
 		h.broadcastSessionMetaUpdated(rootID, created)
 		if sessionType != session.TypeCommand {
-			go func(rootID, sessionKey, agentName, firstMessage string) {
+			go func(rootID, sessionKey, agentName, model, firstMessage string) {
 				updated, err := uc.SuggestSessionName(context.Background(), usecase.SuggestSessionNameInput{
 					RootID:       rootID,
 					SessionKey:   sessionKey,
 					Agent:        agentName,
+					Model:        model,
 					FirstMessage: firstMessage,
 				})
 				if err != nil {
@@ -666,7 +667,7 @@ func (h *WSHandler) handleSessionMessage(ctx context.Context, conn *websocket.Co
 				}
 				log.Printf("[session-name] async.broadcast root=%s session=%s name=%q", rootID, sessionKey, updated.Name)
 				h.broadcastSessionMetaUpdated(rootID, updated)
-			}(rootID, key, agentName, content)
+			}(rootID, key, agentName, created.Model, content)
 		}
 	} else if current, err := uc.GetSession(ctx, usecase.GetSessionInput{RootID: rootID, Key: key}); err == nil && current != nil {
 		sessionName = current.Name
@@ -1035,6 +1036,7 @@ func (h *WSHandler) handleSessionCancel(ctx context.Context, conn *websocket.Con
 	log.Printf("[ws] session.cancel root=%s session=%s request=%s", rootID, key, req.ID)
 
 	streamHub := h.AppContext.GetSessionStreamHub()
+	streamHub.BindSessionClient(key, clientID)
 	if queue, ok := streamHub.FreezeQueuedSessionMessages(key); ok {
 		log.Printf("[ws] session.queue.freeze root=%s session=%s request=%s", rootID, key, req.ID)
 		streamHub.BroadcastSessionQueueUpdated(rootID, key, queue)
@@ -1060,16 +1062,11 @@ func (h *WSHandler) handleSessionCancel(ctx context.Context, conn *websocket.Con
 		h.sendWSError(conn, clientID, req.ID, "session.cancel_failed", err.Error())
 		return
 	}
-	h.sendWSCancelled(conn, clientID, req.ID, rootID, key, turnRequestID)
-	if h.AppContext != nil {
-		streamHub := h.AppContext.GetSessionStreamHub()
-		doneRequestID := turnRequestID
-		if strings.TrimSpace(doneRequestID) == "" {
-			doneRequestID = req.ID
-		}
-		streamHub.BroadcastSessionDone(rootID, key, doneRequestID)
-		streamHub.ClearSessionPending(key)
+	cancelledRequestID := turnRequestID
+	if strings.TrimSpace(cancelledRequestID) == "" {
+		cancelledRequestID = req.ID
 	}
+	streamHub.BroadcastSessionCancelled(rootID, key, req.ID, cancelledRequestID)
 }
 
 func (h *WSHandler) acknowledgeStaleSessionCancel(conn *websocket.Conn, clientID, responseID, rootID, key, turnRequestID string, streamHub *StreamHub) {
@@ -1171,18 +1168,7 @@ func (h *WSHandler) sendWSCancelled(conn *websocket.Conn, clientID, id, rootID, 
 	if conn == nil {
 		return
 	}
-	payload := map[string]any{
-		"root_id":     rootID,
-		"session_key": sessionKey,
-	}
-	if strings.TrimSpace(requestID) != "" {
-		payload["request_id"] = requestID
-	}
-	resp := WSResponse{
-		ID:      id,
-		Type:    "session.cancelled",
-		Payload: payload,
-	}
+	resp := buildSessionCancelledResponse(id, rootID, sessionKey, requestID, false)
 	_ = h.writeWSJSON(clientID, conn, resp)
 }
 

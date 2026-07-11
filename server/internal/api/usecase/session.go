@@ -1108,6 +1108,7 @@ type SuggestSessionNameInput struct {
 	RootID       string
 	SessionKey   string
 	Agent        string
+	Model        string
 	FirstMessage string
 }
 
@@ -1300,6 +1301,7 @@ func sessionNameRunner(ctx context.Context, pool *agent.Pool, rootAbs string, in
 	sess, err := pool.GetOrCreate(ctx, agenttypes.OpenSessionInput{
 		SessionKey: sessionKey,
 		AgentName:  agentName,
+		Model:      strings.TrimSpace(in.Model),
 		RootPath:   tmpRoot,
 	})
 	if err != nil {
@@ -2386,9 +2388,10 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 			}
 		}
 	}
+	turnCanceled := isCanceledTurnError(sendErr)
 	flushThought()
 	claudeSubagents.FinishAll()
-	if sendErr != nil && !isCanceledTurnError(sendErr) {
+	if sendErr != nil && !turnCanceled {
 		log.Printf("[session] turn.send.error root=%s session=%s agent=%s err=%v", in.RootID, current.Key, in.Agent, sendErr)
 	}
 	resolvedModel := resolveRuntimeModel(current, sess, in.Model)
@@ -2438,12 +2441,16 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 	}
 
 	prober := s.Registry.GetProber()
-	if sendErr != nil && !isCanceledTurnError(sendErr) {
+	if turnCanceled {
+		return context.Canceled
+	}
+	if sendErr != nil {
 		if prober != nil {
 			prober.ReportRuntimeFailure(in.Agent, sendErr)
 		}
 		return sendErr
-	} else if prober != nil {
+	}
+	if prober != nil {
 		prober.ReportSuccess(in.Agent)
 	}
 	return nil

@@ -30,6 +30,19 @@ func TestSessionDoneResponseIncludesRequestIDPayload(t *testing.T) {
 	}
 }
 
+func TestSessionCancelledResponseIncludesRequestIDAndReplay(t *testing.T) {
+	resp := buildSessionCancelledResponse("cancel-123", "root", "session", "msg-123", true)
+	if resp.Type != "session.cancelled" || resp.ID != "cancel-123" {
+		t.Fatalf("response = %#v, want request-scoped session.cancelled", resp)
+	}
+	if got := resp.Payload["request_id"]; got != "msg-123" {
+		t.Fatalf("payload request_id = %#v, want msg-123", got)
+	}
+	if got := resp.Payload["replay"]; got != true {
+		t.Fatalf("payload replay = %#v, want true", got)
+	}
+}
+
 func TestSessionErrorResponseIncludesRequestIDAndDoesNotMasqueradeAsDone(t *testing.T) {
 	resp := buildSessionErrorResponse("root", "session", "msg-123", "session.message_failed", "upstream unavailable", false)
 	if resp.Type != "session.error" || resp.ID != "msg-123" {
@@ -142,6 +155,32 @@ func TestStreamHubStoresErrorAsTerminalInsteadOfCompletion(t *testing.T) {
 	hub.mu.RUnlock()
 	if terminal == nil || terminal.RequestID != "msg-123" || terminal.ErrorMessage != "upstream unavailable" {
 		t.Fatalf("terminal state = %#v", terminal)
+	}
+}
+
+func TestStreamHubCancellationDropsLateStreamAndCannotBecomeDone(t *testing.T) {
+	hub := NewStreamHub(nil)
+	hub.SetPendingUser("root", "session", "title", "pi", "model", "", "", "", false, "cancel me")
+	hub.BroadcastSessionCancelled("root", "session", "cancel-123", "msg-123")
+
+	if accepted := hub.AppendReplyEvent("session", StreamEvent{
+		Type: "message_chunk",
+		Data: agenttypes.MessageChunk{Content: "late after cancel"},
+	}); accepted {
+		t.Fatal("late stream event was accepted after cancellation")
+	}
+	hub.BroadcastSessionDone("root", "session", "msg-123")
+	hub.BroadcastSessionError("root", "session", "msg-123", "session.message_failed", "late failure")
+
+	hub.mu.RLock()
+	terminal := hub.completed["session"]
+	_, pending := hub.pendingSessions["session"]
+	hub.mu.RUnlock()
+	if terminal == nil || !terminal.Cancelled || terminal.RequestID != "msg-123" || terminal.ErrorMessage != "" {
+		t.Fatalf("terminal state = %#v, want request-scoped cancellation", terminal)
+	}
+	if pending {
+		t.Fatal("cancelled session was recreated as pending by a late event")
 	}
 }
 

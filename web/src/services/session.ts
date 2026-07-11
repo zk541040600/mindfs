@@ -819,7 +819,7 @@ class SessionService {
     sessionKey: string,
     payload: Record<string, unknown>,
   ) {
-    if (type === "session.done" || type === "session.error") {
+    if (isSessionTerminalEvent(type)) {
       this.activeStreams.delete(sessionKey);
       return;
     }

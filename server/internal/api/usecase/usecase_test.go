@@ -1547,6 +1547,30 @@ func TestSessionNameRunnerRealAgent(t *testing.T) {
 	}
 }
 
+func TestSessionNameRunnerPassesRequestedModel(t *testing.T) {
+	const expectedModel = "provider/compatible-model"
+	pool := agent.NewPool(agent.Config{Agents: []agent.Definition{{
+		Name:     "pi",
+		Command:  writeFakeSessionNamePiSDKForUsecase(t),
+		Protocol: agent.ProtocolPiSDK,
+		Env:      map[string]string{"MINDFS_TEST_EXPECTED_MODEL": expectedModel},
+	}}})
+	defer pool.CloseAll()
+
+	got, err := sessionNameRunner(context.Background(), pool, t.TempDir(), SuggestSessionNameInput{
+		SessionKey:   "model-title-test",
+		Agent:        "pi",
+		Model:        expectedModel,
+		FirstMessage: "investigate the blank Pi session",
+	})
+	if err != nil {
+		t.Fatalf("sessionNameRunner returned error: %v", err)
+	}
+	if got != "model aware title" {
+		t.Fatalf("sessionNameRunner title = %q, want model aware title", got)
+	}
+}
+
 func TestSessionNameRunnerSkipsWithoutAgentOrPool(t *testing.T) {
 	testCases := []struct {
 		name  string
@@ -1917,6 +1941,77 @@ func TestCancelSessionTurnCancelsTransientActiveTurn(t *testing.T) {
 	}
 	if fakeSession.cancelCalls != 1 {
 		t.Fatalf("CancelCurrentTurn calls = %d, want 1", fakeSession.cancelCalls)
+	}
+}
+
+func TestSendMessagePropagatesPiCancellationAfterPersistingUser(t *testing.T) {
+	ctx := context.Background()
+	rootDir := t.TempDir()
+	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
+	manager := session.NewManager(root)
+	created, err := manager.Create(ctx, session.CreateInput{Type: session.TypeChat, Agent: "pi", Name: "cancel test"})
+	if err != nil {
+		t.Fatalf("create chat session: %v", err)
+	}
+
+	promptMarker := filepath.Join(t.TempDir(), "prompt-started")
+	pool := agent.NewPool(agent.Config{Agents: []agent.Definition{{
+		Name:     "pi",
+		Command:  writeFakeBlockingPiSDKForUsecase(t),
+		Protocol: agent.ProtocolPiSDK,
+		Env:      map[string]string{"MINDFS_TEST_PROMPT_MARKER": promptMarker},
+	}}})
+	defer pool.CloseAll()
+	service := Service{Registry: &chatAgentTestRegistry{
+		commandTestRegistry: &commandTestRegistry{root: root, manager: manager},
+		pool:                pool,
+	}}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- service.SendMessage(ctx, SendMessageInput{
+			RootID:    root.ID,
+			Key:       created.Key,
+			RequestID: "request-cancelled",
+			Agent:     "pi",
+			Content:   "keep this user input",
+		})
+	}()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, statErr := os.Stat(promptMarker); statErr == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("Pi prompt did not start before timeout")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if err := service.CancelSessionTurn(ctx, CancelSessionTurnInput{
+		RootID:    root.ID,
+		Key:       created.Key,
+		RequestID: "request-cancelled",
+	}); err != nil {
+		t.Fatalf("CancelSessionTurn returned error: %v", err)
+	}
+
+	select {
+	case sendErr := <-errCh:
+		if !errors.Is(sendErr, context.Canceled) {
+			t.Fatalf("SendMessage error = %v, want context.Canceled", sendErr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("SendMessage did not settle after cancellation")
+	}
+
+	loaded, err := manager.Get(ctx, created.Key, 0)
+	if err != nil {
+		t.Fatalf("get cancelled session: %v", err)
+	}
+	if len(loaded.Exchanges) != 1 || loaded.Exchanges[0].Role != "user" || loaded.Exchanges[0].Content != "keep this user input" {
+		t.Fatalf("cancelled exchanges = %#v, want persisted user input only", loaded.Exchanges)
 	}
 }
 
@@ -2683,6 +2778,76 @@ for line in sys.stdin:
 `
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
 		t.Fatalf("write fake pi sdk: %v", err)
+	}
+	return path
+}
+
+func writeFakeBlockingPiSDKForUsecase(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "fake-node")
+	script := `#!/usr/bin/env python3
+import json
+import os
+import sys
+
+def send(obj):
+    print(json.dumps(obj, ensure_ascii=False), flush=True)
+
+for line in sys.stdin:
+    req = json.loads(line)
+    req_id = req.get("id")
+    typ = req.get("type")
+    if typ == "start_sdk_runtime":
+        send({"id": req_id, "type": "response", "command": typ, "success": True, "data": {"sessionId": "blocking-pi-sdk-session"}})
+    elif typ == "get_state":
+        send({"id": req_id, "type": "response", "command": typ, "success": True, "data": {"sessionId": "blocking-pi-sdk-session", "isStreaming": False, "pendingMessageCount": 0}})
+    elif typ == "prompt":
+        marker = os.environ.get("MINDFS_TEST_PROMPT_MARKER", "")
+        if marker:
+            open(marker, "w", encoding="utf-8").close()
+        send({"id": req_id, "type": "response", "command": typ, "success": True, "data": {"runtime": "sdk"}})
+        send({"type": "agent_start"})
+    else:
+        send({"id": req_id, "type": "response", "command": typ, "success": True, "data": {}})
+`
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake blocking pi sdk: %v", err)
+	}
+	return path
+}
+
+func writeFakeSessionNamePiSDKForUsecase(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "fake-node")
+	script := `#!/usr/bin/env python3
+import json
+import os
+import sys
+
+def send(obj):
+    print(json.dumps(obj, ensure_ascii=False), flush=True)
+
+for line in sys.stdin:
+    req = json.loads(line)
+    req_id = req.get("id")
+    typ = req.get("type")
+    if typ == "start_sdk_runtime":
+        expected = os.environ.get("MINDFS_TEST_EXPECTED_MODEL", "")
+        if req.get("model") != expected:
+            send({"id": req_id, "type": "response", "command": typ, "success": False, "error": {"code": "E_MODEL", "message": "title runtime did not inherit requested model"}})
+        else:
+            send({"id": req_id, "type": "response", "command": typ, "success": True, "data": {"sessionId": "title-model-pi-sdk-session"}})
+    elif typ == "prompt":
+        send({"id": req_id, "type": "response", "command": typ, "success": True, "data": {"runtime": "sdk"}})
+        send({"type": "message_start", "message": {"role": "assistant", "content": []}})
+        send({"type": "message_update", "message": {"role": "assistant", "content": [{"type": "text", "text": "model aware title"}]}, "assistantMessageEvent": {"type": "text_delta", "delta": "model aware title"}})
+        send({"type": "message_end", "message": {"role": "assistant", "stopReason": "end_turn", "content": [{"type": "text", "text": "model aware title"}]}})
+        send({"type": "runtime_settled", "reason": "title_model_test"})
+    else:
+        send({"id": req_id, "type": "response", "command": typ, "success": True, "data": {}})
+`
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake session-name pi sdk: %v", err)
 	}
 	return path
 }

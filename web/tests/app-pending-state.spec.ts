@@ -292,10 +292,51 @@ test("ignores late stream events after cancelling a pending turn", async ({ page
   });
 
   await expect(page.getByText("已发送，等待响应...")).toBeVisible();
+  app.socket?.send(
+    JSON.stringify({
+      type: "session.stream",
+      payload: {
+        root_id: rootId,
+        session_key: sessionKey,
+        event: {
+          type: "message_chunk",
+          data: { content: "running before cancel" },
+        },
+      },
+    }),
+  );
+  await expect
+    .poll(() =>
+      page.evaluate(async (key) => {
+        const { sessionService } = await import("/src/services/session.ts");
+        return sessionService.isSessionStreaming(key);
+      }, sessionKey),
+    )
+    .toBe(true);
   await page.keyboard.press("Escape");
   await expect.poll(() => cancelSeen).toBe(true);
   await expect(page.getByText("已发送，等待响应...")).toHaveCount(0);
   await expect(page.getByText("左滑蓝环开始新会话...")).toBeVisible();
+
+  app.socket?.send(
+    JSON.stringify({
+      id: "cancelled-turn",
+      type: "session.cancelled",
+      payload: {
+        root_id: rootId,
+        session_key: sessionKey,
+        request_id: "cancelled-turn",
+      },
+    }),
+  );
+  await expect
+    .poll(() =>
+      page.evaluate(async (key) => {
+        const { sessionService } = await import("/src/services/session.ts");
+        return sessionService.isSessionStreaming(key);
+      }, sessionKey),
+    )
+    .toBe(false);
 
   app.socket?.send(
     JSON.stringify({
@@ -632,9 +673,24 @@ test("keeps pending when replying-sessions drops before terminal event", async (
   await expect(page.getByText("左滑蓝环开始新会话...")).toBeVisible();
 });
 
-test("upserts the latest Pi goal state into one live progress card", async ({ page }) => {
+test("keeps the latest Pi stream and goal state across background refresh", async ({ page }) => {
   const replying = { current: true };
   const app = await openPendingApp(page, replying);
+
+  app.socket?.send(
+    JSON.stringify({
+      type: "session.stream",
+      payload: {
+        root_id: rootId,
+        session_key: sessionKey,
+        event: {
+          type: "message_chunk",
+          data: { content: "live Pi answer survives refresh" },
+        },
+      },
+    }),
+  );
+  await expect(page.getByText("live Pi answer survives refresh")).toBeVisible();
 
   app.socket?.send(
     JSON.stringify({
@@ -678,9 +734,11 @@ test("upserts the latest Pi goal state into one live progress card", async ({ pa
   );
 
   await expect(page.getByText("目标已暂停")).toBeVisible();
+  await page.waitForTimeout(5200);
   await expect(page.getByText("目标执行中")).toHaveCount(0);
   await expect(page.getByText("repair browser history")).toHaveCount(1);
   await expect(page.getByText("原因：restart approval required")).toBeVisible();
+  await expect(page.getByText("live Pi answer survives refresh")).toBeVisible();
 });
 
 test("treats top-level session.error as terminal for reconnecting clients", async ({ page }) => {

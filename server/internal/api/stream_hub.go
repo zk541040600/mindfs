@@ -72,6 +72,7 @@ type CompletedSessionState struct {
 	RequestID    string
 	ErrorCode    string
 	ErrorMessage string
+	Cancelled    bool
 	Completed    time.Time
 }
 
@@ -163,6 +164,24 @@ func buildSessionDoneResponse(rootID, sessionKey, requestID string, replay bool)
 	return WSResponse{
 		ID:      requestID,
 		Type:    "session.done",
+		Payload: payload,
+	}
+}
+
+func buildSessionCancelledResponse(responseID, rootID, sessionKey, requestID string, replay bool) WSResponse {
+	payload := map[string]any{
+		"root_id":     rootID,
+		"session_key": sessionKey,
+	}
+	if strings.TrimSpace(requestID) != "" {
+		payload["request_id"] = requestID
+	}
+	if replay {
+		payload["replay"] = true
+	}
+	return WSResponse{
+		ID:      responseID,
+		Type:    "session.cancelled",
 		Payload: payload,
 	}
 }
@@ -628,17 +647,20 @@ func (h *StreamHub) PendingSessionSnapshot(sessionKey string) PendingSessionSnap
 	}
 }
 
-func (h *StreamHub) AppendReplyEvent(sessionKey string, event StreamEvent) {
+func (h *StreamHub) AppendReplyEvent(sessionKey string, event StreamEvent) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if h.completed[sessionKey] != nil {
+		return false
+	}
 	state := h.ensurePendingSessionLocked(sessionKey)
 	if coalesceGoalStateStreamEvent(state, event) {
 		state.UpdatedAt = time.Now().UTC()
-		return
+		return true
 	}
 	if coalesceUserShellStreamEvent(state, event) {
 		state.UpdatedAt = time.Now().UTC()
-		return
+		return true
 	}
 	state.ReplyingList = append(state.ReplyingList, cloneEvent(event))
 	state.UpdatedAt = time.Now().UTC()
@@ -649,6 +671,7 @@ func (h *StreamHub) AppendReplyEvent(sessionKey string, event StreamEvent) {
 	} else if isAuxiliarySummaryBoundary(event.Type) {
 		state.Summary = ""
 	}
+	return true
 }
 
 func isAuxiliarySummaryBoundary(eventType string) bool {
@@ -832,7 +855,9 @@ func (h *StreamHub) BroadcastSessionStream(rootID, sessionKey string, event *Str
 	if event == nil {
 		return
 	}
-	h.AppendReplyEvent(sessionKey, *event)
+	if !h.AppendReplyEvent(sessionKey, *event) {
+		return
+	}
 	for _, clientID := range h.GetSessionClientIDs(sessionKey, true) {
 		resp := buildSessionStreamResponse(rootID, sessionKey, event)
 		h.SendToClient(clientID, resp)
@@ -841,6 +866,10 @@ func (h *StreamHub) BroadcastSessionStream(rootID, sessionKey string, event *Str
 
 func (h *StreamHub) BroadcastSessionDone(rootID, sessionKey, requestID string) {
 	h.mu.Lock()
+	if h.terminalAlreadyRecordedLocked(sessionKey, requestID) {
+		h.mu.Unlock()
+		return
+	}
 	h.completed[sessionKey] = &CompletedSessionState{
 		RequestID: requestID,
 		Completed: time.Now().UTC(),
@@ -852,8 +881,31 @@ func (h *StreamHub) BroadcastSessionDone(rootID, sessionKey, requestID string) {
 	}
 }
 
+func (h *StreamHub) BroadcastSessionCancelled(rootID, sessionKey, responseID, requestID string) {
+	h.mu.Lock()
+	if h.terminalAlreadyRecordedLocked(sessionKey, requestID) {
+		h.mu.Unlock()
+		return
+	}
+	h.completed[sessionKey] = &CompletedSessionState{
+		RequestID: requestID,
+		Cancelled: true,
+		Completed: time.Now().UTC(),
+	}
+	h.mu.Unlock()
+	h.ClearSessionPending(sessionKey)
+	resp := buildSessionCancelledResponse(responseID, rootID, sessionKey, requestID, false)
+	for _, clientID := range h.GetSessionClientIDs(sessionKey, false) {
+		h.SendToClient(clientID, resp)
+	}
+}
+
 func (h *StreamHub) BroadcastSessionError(rootID, sessionKey, requestID, code, message string) {
 	h.mu.Lock()
+	if h.terminalAlreadyRecordedLocked(sessionKey, requestID) {
+		h.mu.Unlock()
+		return
+	}
 	h.completed[sessionKey] = &CompletedSessionState{
 		RequestID:    requestID,
 		ErrorCode:    code,
@@ -865,6 +917,14 @@ func (h *StreamHub) BroadcastSessionError(rootID, sessionKey, requestID, code, m
 	for _, clientID := range h.GetSessionClientIDs(sessionKey, false) {
 		h.SendToClient(clientID, resp)
 	}
+}
+
+func (h *StreamHub) terminalAlreadyRecordedLocked(sessionKey, requestID string) bool {
+	completed := h.completed[sessionKey]
+	if completed == nil {
+		return false
+	}
+	return strings.TrimSpace(completed.RequestID) == strings.TrimSpace(requestID)
 }
 
 func (h *StreamHub) BroadcastSessionUserMessage(
@@ -1014,9 +1074,14 @@ func (h *StreamHub) replayCompletionToClient(rootID, clientID, sessionKey string
 	requestID := completed.RequestID
 	errorCode := completed.ErrorCode
 	errorMessage := completed.ErrorMessage
+	cancelled := completed.Cancelled
 	h.mu.Unlock()
 	if strings.TrimSpace(errorMessage) != "" {
 		h.SendToClient(clientID, buildSessionErrorResponse(rootID, sessionKey, requestID, errorCode, errorMessage, true))
+		return
+	}
+	if cancelled {
+		h.SendToClient(clientID, buildSessionCancelledResponse(requestID, rootID, sessionKey, requestID, true))
 		return
 	}
 	h.SendToClient(clientID, buildSessionDoneResponse(rootID, sessionKey, requestID, true))

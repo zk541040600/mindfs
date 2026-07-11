@@ -1421,7 +1421,8 @@ export function App({ onGoHome }: AppProps) {
   const queueFrozenBySessionRef = useRef<Record<string, boolean>>({});
   const optimisticDequeuedIdsRef = useRef<Record<string, Set<string>>>({});
   const runningTurnBySessionRef = useRef<Record<string, RunningSessionTurn>>({});
-  const cancelRequestedBySessionRef = useRef<Record<string, boolean>>({});
+  const cancelRequestedBySessionRef = useRef<Record<string, number>>({});
+  const cancelRequestTombstoneVersionRef = useRef(0);
   const sessionCacheRef = useRef<Record<string, Session>>({});
   const loadedSessionRef = useRef<Record<string, boolean>>({});
   const loadingSessionRef = useRef<Partial<Record<string, Promise<SyncSessionResult>>>>({});
@@ -3387,25 +3388,31 @@ export function App({ onGoHome }: AppProps) {
         typeof (fullSession as any)?.pending === "boolean"
           ? !!(fullSession as any).pending
           : undefined;
-      if (serverPending === false) {
+      const liveSession = sessionCacheRef.current[cacheKey];
+      const hasLiveStream = sessionService.isSessionStreaming(resolvedKey);
+      if (serverPending === false && !hasLiveStream) {
         clearLocalPendingForSession(resolvedRoot, resolvedKey);
       }
-      const pending =
-        serverPending === undefined
+      const pending = hasLiveStream
+        ? true
+        : serverPending === undefined
           ? resolvePendingForSession(resolvedRoot, resolvedKey, false)
           : resolveFreshSessionPending(resolvedRoot, resolvedKey, serverPending);
-      sessionCacheRef.current[cacheKey] = {
+      const restoredSession = {
         ...(fullSession as any),
         key: resolvedKey,
         pending,
+        ...(hasLiveStream && hasSessionExchanges(liveSession)
+          ? {
+              exchanges: [...(liveSession?.exchanges || [])],
+              updated_at: liveSession?.updated_at || fullSession.updated_at,
+            }
+          : {}),
       } as Session;
+      sessionCacheRef.current[cacheKey] = restoredSession;
       bumpCacheVersion();
       await sessionService.markSessionReady(resolvedRoot, resolvedKey);
-      return {
-        ...(fullSession as any),
-        key: resolvedKey,
-        pending,
-      } as Session;
+      return restoredSession;
     },
     [bumpCacheVersion, clearLocalPendingForSession, resolveFreshSessionPending, resolvePendingForSession, rootSessionKey],
   );
@@ -6608,6 +6615,17 @@ export function App({ onGoHome }: AppProps) {
     [pendingExtensionUI],
   );
 
+  const holdCancelRequestTombstone = useCallback((cacheKey: string) => {
+    const version = ++cancelRequestTombstoneVersionRef.current;
+    cancelRequestedBySessionRef.current[cacheKey] = version;
+    window.setTimeout(() => {
+      if (cancelRequestedBySessionRef.current[cacheKey] === version) {
+        delete cancelRequestedBySessionRef.current[cacheKey];
+      }
+    }, cancelRequestTombstoneTTL());
+    return version;
+  }, []);
+
   const handleCancelCurrentTurn = useCallback(
     async (sessionKey: string) => {
       const activeRoot = currentRootIdRef.current;
@@ -6617,30 +6635,24 @@ export function App({ onGoHome }: AppProps) {
         runningTurnBySessionRef.current[cacheKey]?.requestId ||
         pendingBySessionRef.current[cacheKey]?.requestId ||
         "";
-      cancelRequestedBySessionRef.current[cacheKey] = true;
+      const tombstoneVersion = holdCancelRequestTombstone(cacheKey);
       await cancelPendingExtensionUIForSession(activeRoot, sessionKey);
       const sent = await sessionService.cancelMessage(activeRoot, sessionKey, requestId);
       if (!sent) {
-        delete cancelRequestedBySessionRef.current[cacheKey];
-        return;
-      }
-      window.setTimeout(() => {
-        if (!cancelRequestedBySessionRef.current[cacheKey]) {
-          return;
-        }
-        const pendingRequestId = pendingBySessionRef.current[cacheKey]?.requestId || "";
-        const runningRequestId = runningTurnBySessionRef.current[cacheKey]?.requestId || "";
-        if (
-          !requestId ||
-          (pendingRequestId !== requestId && runningRequestId !== requestId)
-        ) {
+        if (cancelRequestedBySessionRef.current[cacheKey] === tombstoneVersion) {
           delete cancelRequestedBySessionRef.current[cacheKey];
         }
-      }, cancelRequestTombstoneTTL());
+        return;
+      }
       clearLocalPendingForSession(activeRoot, sessionKey);
       clearPendingExtensionUIForSession(activeRoot, sessionKey);
     },
-    [cancelPendingExtensionUIForSession, clearPendingExtensionUIForSession, rootSessionKey],
+    [
+      cancelPendingExtensionUIForSession,
+      clearPendingExtensionUIForSession,
+      holdCancelRequestTombstone,
+      rootSessionKey,
+    ],
   );
 
   const markSessionPending = useCallback(
@@ -9021,6 +9033,7 @@ export function App({ onGoHome }: AppProps) {
       rootID: string,
       sessionKey: string,
       requestId?: string,
+      terminalType: "done" | "cancelled" = "done",
     ) => {
       const cacheKey = rootSessionKey(rootID, sessionKey);
       const pending = pendingBySessionRef.current[cacheKey];
@@ -9047,9 +9060,11 @@ export function App({ onGoHome }: AppProps) {
         });
         return;
       }
+      if (terminalType === "cancelled") {
+        holdCancelRequestTombstone(cacheKey);
+      }
       const wasCanceled = !!cancelRequestedBySessionRef.current[cacheKey];
       forgetSessionTurnRunning(rootID, sessionKey);
-      delete cancelRequestedBySessionRef.current[cacheKey];
       clearPendingExtensionUIForSession(rootID, sessionKey);
       const queued = queuedMessagesBySessionRef.current[cacheKey] || [];
       const queueFrozen = !!queueFrozenBySessionRef.current[cacheKey];
@@ -10022,7 +10037,7 @@ export function App({ onGoHome }: AppProps) {
               break;
             }
             setMultiProjectSessionPending(rootID, sessionKey, false);
-            handleSessionStreamDone(rootID, sessionKey, requestId);
+            handleSessionStreamDone(rootID, sessionKey, requestId, "cancelled");
           }
           break;
         }
@@ -10489,6 +10504,7 @@ export function App({ onGoHome }: AppProps) {
     clearSessionStale,
     markSessionPending,
     markSessionTurnRunning,
+    holdCancelRequestTombstone,
     markSessionStale,
     resolvePendingForSession,
     setSelectedPendingByKey,
