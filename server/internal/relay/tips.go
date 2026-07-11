@@ -12,7 +12,10 @@ import (
 	"time"
 )
 
-const relayTipsRefreshInterval = 30 * time.Minute
+const (
+	relayTipsRefreshInterval = 30 * time.Minute
+	relayTipsMaxPayloadBytes = 64 << 10
+)
 
 type Tip struct {
 	ID          string `json:"id"`
@@ -128,7 +131,7 @@ func (s *TipsService) fetch(ctx context.Context) ([]Tip, error) {
 		return nil, fmt.Errorf("relay tips failed: %s %s", resp.Status, strings.TrimSpace(string(payload)))
 	}
 	var payload json.RawMessage
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, relayTipsMaxPayloadBytes)).Decode(&payload); err != nil {
 		return nil, err
 	}
 
@@ -153,12 +156,33 @@ func (s *TipsService) fetch(ctx context.Context) ([]Tip, error) {
 		if strings.TrimSpace(tip.ID) == "" || strings.TrimSpace(tip.Title) == "" {
 			continue
 		}
+		tip.Href = sanitizeTipHref(tip.Href)
+		if tip.Target != "_self" {
+			tip.Target = "_blank"
+		}
 		filtered = append(filtered, tip)
 	}
 	if len(filtered) == 0 {
 		return nil, nil
 	}
 	return filtered, nil
+}
+
+func sanitizeTipHref(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return ""
+	}
+	u, err := url.Parse(trimmed)
+	if err != nil {
+		return ""
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http", "https", "mailto", "tel":
+		return trimmed
+	default:
+		return ""
+	}
 }
 
 func buildTipsURL(baseURL, nodeID string) (string, error) {

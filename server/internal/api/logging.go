@@ -6,6 +6,8 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 )
 
@@ -65,16 +67,29 @@ func LoggingMiddleware(next http.Handler) http.Handler {
 // from origins like https://localhost or http://localhost to the MindFS API server.
 func CORSMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		origin := r.Header.Get("Origin")
-		if origin == "" {
-			origin = "*"
+		origin := strings.TrimSpace(r.Header.Get("Origin"))
+		allowedOrigin := allowedCORSOrigin(origin)
+		if origin != "" && allowedOrigin == "" {
+			http.Error(w, "cors origin not allowed", http.StatusForbidden)
+			return
 		}
-		w.Header().Set("Access-Control-Allow-Origin", origin)
-		w.Header().Set("Access-Control-Allow-Credentials", "true")
+		if allowedOrigin != "" {
+			w.Header().Set("Access-Control-Allow-Origin", allowedOrigin)
+			w.Header().Set("Access-Control-Allow-Credentials", "true")
+			w.Header().Add("Vary", "Origin")
+			// Private Network Access header: allows WebView (secure context) to reach local network resources.
+			w.Header().Set("Access-Control-Allow-Private-Network", "true")
+		}
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, PATCH")
-		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Requested-With")
-		// Private Network Access header: allows WebView (secure context) to reach local network resources
-		w.Header().Set("Access-Control-Allow-Private-Network", "true")
+		w.Header().Set("Access-Control-Allow-Headers", strings.Join([]string{
+			"Authorization",
+			"Content-Type",
+			"X-Requested-With",
+			e2eeHeaderName,
+			clientIDHeaderName,
+			e2eeProofHeaderName,
+			e2eeTSHeaderName,
+		}, ", "))
 
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
@@ -83,4 +98,35 @@ func CORSMiddleware(next http.Handler) http.Handler {
 
 		next.ServeHTTP(w, r)
 	})
+}
+
+func allowedCORSOrigin(origin string) string {
+	origin = strings.TrimSpace(origin)
+	if origin == "" || strings.EqualFold(origin, "null") {
+		return ""
+	}
+	parsed, err := url.Parse(origin)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" || parsed.User != nil || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return ""
+	}
+	host := strings.ToLower(strings.TrimSpace(parsed.Hostname()))
+	switch strings.ToLower(parsed.Scheme) {
+	case "http", "https":
+		if isLoopbackOrMindFSHost(host) {
+			return origin
+		}
+	case "capacitor", "ionic":
+		if host == "localhost" || host == "mindfs.local" {
+			return origin
+		}
+	}
+	return ""
+}
+
+func isLoopbackOrMindFSHost(host string) bool {
+	if host == "localhost" || host == "mindfs.local" {
+		return true
+	}
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	return ip != nil && ip.IsLoopback()
 }

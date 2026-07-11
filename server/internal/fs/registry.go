@@ -104,7 +104,38 @@ func (r *Registry) saveLocked() error {
 	if err != nil {
 		return err
 	}
-	return apperr.Wrap("write", r.path, os.WriteFile(r.path, payload, 0o644))
+	return writeRegistryFileAtomic(r.path, payload)
+}
+
+func writeRegistryFileAtomic(path string, payload []byte) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return apperr.Wrap("create", dir, err)
+	}
+	tmpName := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if _, err := tmp.Write(payload); err != nil {
+		_ = tmp.Close()
+		return apperr.Wrap("write", tmpName, err)
+	}
+	if err := tmp.Chmod(0o644); err != nil {
+		_ = tmp.Close()
+		return apperr.Wrap("write", tmpName, err)
+	}
+	if err := tmp.Close(); err != nil {
+		return apperr.Wrap("write", tmpName, err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return apperr.Wrap("rename", path, err)
+	}
+	cleanup = false
+	return nil
 }
 
 func (r *Registry) List() []RootInfo {

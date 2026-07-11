@@ -1,5 +1,5 @@
 import { appURL } from "./base";
-import { e2eeService } from "./e2ee";
+import { E2EE_HEADER, e2eeService, type CipherEnvelope } from "./e2ee";
 
 export type UploadedFile = {
   path: string;
@@ -12,28 +12,63 @@ type UploadResponse = {
   files?: UploadedFile[];
 };
 
+type ProtectedUploadFile = {
+  name: string;
+  content_type: string;
+  envelope: CipherEnvelope;
+};
+
+type ProtectedUploadRequest = {
+  dir?: string;
+  files: ProtectedUploadFile[];
+};
+
+async function buildProtectedUploadRequest(params: {
+  files: File[];
+  dir?: string;
+}): Promise<ProtectedUploadRequest> {
+  const files = await Promise.all(
+    params.files.map(async (file) => ({
+      name: file.name,
+      content_type: file.type || "application/octet-stream",
+      envelope: await e2eeService.encryptEnvelopeBytes(new Uint8Array(await file.arrayBuffer())),
+    })),
+  );
+  return {
+    dir: params.dir || "",
+    files,
+  };
+}
+
 export async function uploadFiles(params: {
   rootId: string;
   files: File[];
   dir?: string;
 }): Promise<UploadedFile[]> {
-  const formData = new FormData();
-  params.files.forEach((file) => {
-    formData.append("files", file);
-  });
-  if (params.dir) {
-    formData.append("dir", params.dir);
-  }
-
   const query = new URLSearchParams({ root: params.rootId });
   const requestURL = appURL("/api/upload", query);
-  const headers = e2eeService.isRequired()
-    ? await e2eeService.fileProofHeaders("POST", requestURL)
-    : undefined;
+  let headers: HeadersInit | undefined;
+  let body: BodyInit;
+  if (e2eeService.isRequired()) {
+    headers = await e2eeService.fileProofHeaders("POST", requestURL, {
+      "Content-Type": "application/json",
+      [E2EE_HEADER]: "1",
+    });
+    body = JSON.stringify(await buildProtectedUploadRequest(params));
+  } else {
+    const formData = new FormData();
+    params.files.forEach((file) => {
+      formData.append("files", file);
+    });
+    if (params.dir) {
+      formData.append("dir", params.dir);
+    }
+    body = formData;
+  }
   const response = await fetch(requestURL, {
     method: "POST",
     headers,
-    body: formData,
+    body,
   });
   if (!response.ok) {
     if (response.status === 401 && e2eeService.isRequired()) {

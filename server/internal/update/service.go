@@ -25,9 +25,10 @@ import (
 )
 
 const (
-	defaultCheckInterval = time.Hour
-	releaseNotesPath     = "release-notes.md"
-	relayDownloadBase    = "https://relay.a9gent.com/mindfs-downloads"
+	defaultCheckInterval   = time.Hour
+	releaseNotesPath       = "release-notes.md"
+	relayDownloadBase      = "https://relay.a9gent.com/mindfs-downloads"
+	maxUpdateArtifactBytes = 512 << 20
 )
 
 var releaseManifestPublicKey string
@@ -345,7 +346,7 @@ func (s *Service) installUpdate(ctx context.Context, version string, restart boo
 	}()
 
 	archivePath := filepath.Join(tmpDir, asset.Name)
-	if err := s.downloadReleaseAsset(ctx, asset, archivePath); err != nil {
+	if err := s.downloadReleaseAsset(ctx, asset, archivePath, artifact.Size); err != nil {
 		return err
 	}
 	if err := verifyFileSHA256(archivePath, artifact.SHA256, artifact.Size); err != nil {
@@ -616,7 +617,7 @@ func decodeBase64String(value string) ([]byte, error) {
 	return out, err
 }
 
-func (s *Service) downloadFile(ctx context.Context, url, dst string) error {
+func (s *Service) downloadFile(ctx context.Context, url, dst string, maxBytes int64) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return err
@@ -630,21 +631,42 @@ func (s *Service) downloadFile(ctx context.Context, url, dst string) error {
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("download failed: %s", resp.Status)
 	}
+	if maxBytes <= 0 {
+		maxBytes = maxUpdateArtifactBytes
+	}
 	file, err := os.Create(dst)
 	if err != nil {
 		return err
 	}
-	defer file.Close()
-	_, err = io.Copy(file, resp.Body)
-	return err
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(dst)
+		}
+	}()
+	limited := io.LimitReader(resp.Body, maxBytes+1)
+	written, copyErr := io.Copy(file, limited)
+	closeErr := file.Close()
+	if copyErr != nil {
+		return copyErr
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	if written > maxBytes {
+		return fmt.Errorf("download exceeds size limit: %d bytes", maxBytes)
+	}
+	cleanup = false
+	return nil
 }
 
-func (s *Service) downloadReleaseAsset(ctx context.Context, asset releaseAsset, dst string) error {
+func (s *Service) downloadReleaseAsset(ctx context.Context, asset releaseAsset, dst string, artifactSize int64) error {
 	primaryURL := strings.TrimSpace(asset.BrowserDownloadURL)
 	if primaryURL == "" {
 		return errors.New("release asset download URL unavailable")
 	}
-	if err := s.downloadFile(ctx, primaryURL, dst); err == nil {
+	limit := artifactDownloadLimit(artifactSize)
+	if err := s.downloadFile(ctx, primaryURL, dst, limit); err == nil {
 		return nil
 	} else {
 		fallbackURL := relayAssetURL(asset.Name)
@@ -653,11 +675,18 @@ func (s *Service) downloadReleaseAsset(ctx context.Context, asset releaseAsset, 
 		}
 		log.Printf("[update] download.github_failed asset=%s err=%v fallback=%s", strings.TrimSpace(asset.Name), err, fallbackURL)
 		_ = os.Remove(dst)
-		if fallbackErr := s.downloadFile(ctx, fallbackURL, dst); fallbackErr != nil {
+		if fallbackErr := s.downloadFile(ctx, fallbackURL, dst, limit); fallbackErr != nil {
 			return fmt.Errorf("download failed from GitHub (%v) and relay fallback (%v)", err, fallbackErr)
 		}
 		return nil
 	}
+}
+
+func artifactDownloadLimit(size int64) int64 {
+	if size > 0 && size < maxUpdateArtifactBytes {
+		return size
+	}
+	return maxUpdateArtifactBytes
 }
 
 func relayAssetURL(name string) string {
@@ -718,10 +747,7 @@ func (s *Service) installPackage(pkgDir string) error {
 	}
 	srcWeb := filepath.Join(pkgDir, "web")
 	if info, err := os.Stat(srcWeb); err == nil && info.IsDir() {
-		if err := os.RemoveAll(dstWeb); err != nil {
-			return err
-		}
-		if err := copyDir(srcWeb, dstWeb); err != nil {
+		if err := replaceDir(srcWeb, dstWeb); err != nil {
 			return err
 		}
 	}
@@ -740,10 +766,7 @@ func (s *Service) installPackage(pkgDir string) error {
 		if layout.Mode == "installed" {
 			dstBridge = filepath.Join(layout.Prefix, "share", "mindfs", "server", "internal", "agent", "pi_sdk_bridge")
 		}
-		if err := os.RemoveAll(dstBridge); err != nil {
-			return err
-		}
-		if err := copyDir(srcBridge, dstBridge); err != nil {
+		if err := replaceDir(srcBridge, dstBridge); err != nil {
 			return err
 		}
 	}
@@ -1115,8 +1138,8 @@ func findPackageDir(root string) (string, error) {
 }
 
 func replaceFile(src, dst string, mode os.FileMode) error {
-	tmp := dst + ".tmp"
-	if err := os.RemoveAll(tmp); err != nil {
+	parent := filepath.Dir(dst)
+	if err := os.MkdirAll(parent, 0o755); err != nil {
 		return err
 	}
 	in, err := os.Open(src)
@@ -1124,21 +1147,102 @@ func replaceFile(src, dst string, mode os.FileMode) error {
 		return err
 	}
 	defer in.Close()
-	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
+	out, err := os.CreateTemp(parent, "."+filepath.Base(dst)+".tmp-*")
 	if err != nil {
 		return err
 	}
+	tmp := out.Name()
+	cleanupTmp := true
+	defer func() {
+		if cleanupTmp {
+			_ = os.Remove(tmp)
+		}
+	}()
 	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	if err := out.Chmod(mode); err != nil {
 		out.Close()
 		return err
 	}
 	if err := out.Close(); err != nil {
 		return err
 	}
-	if err := os.Remove(dst); err != nil && !errors.Is(err, os.ErrNotExist) {
+
+	backupDir, backupPath, movedOld, err := movePathToTemporaryBackup(dst)
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, dst)
+	if err := os.Rename(tmp, dst); err != nil {
+		restoreTemporaryBackup(dst, backupDir, backupPath, movedOld)
+		return err
+	}
+	cleanupTmp = false
+	removeTemporaryBackup(backupDir, movedOld)
+	return nil
+}
+
+func replaceDir(src, dst string) error {
+	parent := filepath.Dir(dst)
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.MkdirTemp(parent, "."+filepath.Base(dst)+"-update-*")
+	if err != nil {
+		return err
+	}
+	cleanupTmp := true
+	defer func() {
+		if cleanupTmp {
+			_ = os.RemoveAll(tmp)
+		}
+	}()
+	if err := copyDir(src, tmp); err != nil {
+		return err
+	}
+	backupDir, backupPath, movedOld, err := movePathToTemporaryBackup(dst)
+	if err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, dst); err != nil {
+		restoreTemporaryBackup(dst, backupDir, backupPath, movedOld)
+		return err
+	}
+	cleanupTmp = false
+	removeTemporaryBackup(backupDir, movedOld)
+	return nil
+}
+
+func movePathToTemporaryBackup(path string) (string, string, bool, error) {
+	parent := filepath.Dir(path)
+	backupDir, err := os.MkdirTemp(parent, "."+filepath.Base(path)+".old-*")
+	if err != nil {
+		return "", "", false, err
+	}
+	backupPath := filepath.Join(backupDir, filepath.Base(path))
+	if err := os.Rename(path, backupPath); err != nil {
+		_ = os.RemoveAll(backupDir)
+		if errors.Is(err, os.ErrNotExist) {
+			return "", "", false, nil
+		}
+		return "", "", false, err
+	}
+	return backupDir, backupPath, true, nil
+}
+
+func restoreTemporaryBackup(dst, backupDir, backupPath string, moved bool) {
+	if !moved {
+		return
+	}
+	_ = os.Rename(backupPath, dst)
+	_ = os.RemoveAll(backupDir)
+}
+
+func removeTemporaryBackup(backupDir string, moved bool) {
+	if moved {
+		_ = os.RemoveAll(backupDir)
+	}
 }
 
 func copyDir(src, dst string) error {

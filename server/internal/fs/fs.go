@@ -82,7 +82,7 @@ func (r RootInfo) resolveRelativePath(relPath string) (string, error) {
 	}
 	clean := filepath.Clean(filepath.Join(root, relPath))
 	rel, err := filepath.Rel(root, clean)
-	if err != nil || strings.HasPrefix(rel, "..") {
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return "", errors.New("path outside root")
 	}
 	return clean, nil
@@ -95,7 +95,7 @@ func (r RootInfo) relativeFromAbsolute(absPath string) (string, error) {
 	}
 	clean := filepath.Clean(absPath)
 	rel, err := filepath.Rel(root, clean)
-	if err != nil || strings.HasPrefix(rel, "..") {
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return "", errors.New("path outside root")
 	}
 	return filepath.ToSlash(rel), nil

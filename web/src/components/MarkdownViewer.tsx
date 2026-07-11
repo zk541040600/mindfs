@@ -386,17 +386,25 @@ function dirnamePosix(input: string): string {
   return parts.join("/") || ".";
 }
 
+function safeDecodeURIComponent(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
 function resolveMarkdownHref(currentPath: string, href: string): string {
   const trimmed = href.trim();
   if (!trimmed) return "";
   if (trimmed.startsWith("file://")) {
-    return decodeURIComponent(trimmed.slice("file://".length));
+    return safeDecodeURIComponent(trimmed.slice("file://".length));
   }
   if (trimmed.startsWith("/")) {
-    return decodeURIComponent(trimmed);
+    return safeDecodeURIComponent(trimmed);
   }
   const baseDir = currentPath ? dirnamePosix(currentPath) : ".";
-  return decodeURIComponent(normalizePosixPath(`${baseDir}/${trimmed}`));
+  return safeDecodeURIComponent(normalizePosixPath(`${baseDir}/${trimmed}`));
 }
 
 function isExternalHref(href: string): boolean {
@@ -413,6 +421,10 @@ const markdownSanitizeSchema = {
     ...defaultSchema.attributes,
     p: [...(defaultSchema.attributes?.p || []), "align"],
     img: [...(defaultSchema.attributes?.img || []), "alt", "title", "width"],
+  },
+  protocols: {
+    ...defaultSchema.protocols,
+    href: [...(defaultSchema.protocols?.href || []), "tel"],
   },
 };
 

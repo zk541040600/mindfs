@@ -23,6 +23,7 @@ export type NativeReplyPollerConfig = {
 export type NativeBridge = {
   platform?: "android" | "harmony" | string;
   download?: (input: { url: string; filename: string } | string) => Promise<NativeDownloadResult> | NativeDownloadResult | string | void;
+  downloadBase64?: (input: { filename: string; data: string } | string) => Promise<NativeDownloadResult> | NativeDownloadResult | string | void;
   openExternalURL?: (url: string) => Promise<string | void> | string | void;
   getAppInfo?: () => Promise<NativeAppInfo | string> | NativeAppInfo | string;
   configureReplyPoller?: (input: NativeReplyPollerConfig | string) => Promise<void> | void;
@@ -53,6 +54,7 @@ export function getNativeBridge(): NativeBridge | null {
 function hasCallableNativeMethod(bridge: NativeBridge): boolean {
   return [
     bridge.download,
+    bridge.downloadBase64,
     bridge.openExternalURL,
     bridge.getAppInfo,
     bridge.configureReplyPoller,

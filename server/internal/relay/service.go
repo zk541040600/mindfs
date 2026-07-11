@@ -26,6 +26,7 @@ const (
 	relayReconnectInitialBackoff = time.Second
 	relayReconnectMaxBackoff     = 30 * time.Second
 	relayReconnectStableDuration = time.Minute
+	relayBindPollMaxPayloadBytes = 64 << 10
 )
 
 const relayDeviceIDHeader = "X-MindFS-Device-ID"
@@ -177,7 +178,7 @@ func (s *Service) PollBind(ctx context.Context, baseURL, pendingCode string) (Bi
 	}
 
 	var out bindPollResponse
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, relayBindPollMaxPayloadBytes)).Decode(&out); err != nil {
 		return BindPollResult{}, err
 	}
 	result := BindPollResult{

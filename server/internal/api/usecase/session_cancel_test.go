@@ -2,6 +2,7 @@ package usecase
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	rootfs "mindfs/server/internal/fs"
@@ -62,5 +63,28 @@ func TestCancelSessionTurnBeforeActiveRegistrationDoesNotCancelDifferentRequest(
 	}
 	if cancelCalled {
 		t.Fatal("different request cancel func was invoked")
+	}
+}
+
+func TestCancelSessionTurnActiveRequestMismatchReturnsError(t *testing.T) {
+	resetActiveTurnStateForTest()
+	root := rootfs.NewRootInfo("root", "root", t.TempDir())
+	manager := session.NewManager(root)
+	current, err := manager.Create(context.Background(), session.CreateInput{Key: "s1", Type: session.TypeChat, Agent: "pi"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := &Service{Registry: &commandTestRegistry{root: root, manager: manager}}
+
+	cancelCalled := false
+	registerActiveTurn(root.ID, current.Key, "req-2", func() { cancelCalled = true })
+	defer unregisterActiveTurn(root.ID, current.Key)
+
+	err = svc.CancelSessionTurn(context.Background(), CancelSessionTurnInput{RootID: root.ID, Key: current.Key, RequestID: "req-1"})
+	if !errors.Is(err, ErrSessionCancelRequestMismatch) {
+		t.Fatalf("expected ErrSessionCancelRequestMismatch, got %v", err)
+	}
+	if cancelCalled {
+		t.Fatal("mismatched request should not be cancelled by usecase without WS retry")
 	}
 }

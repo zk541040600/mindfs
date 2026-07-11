@@ -1,4 +1,5 @@
 import { appURL } from "./base";
+import { getStoredString, removeStoredString, setStoredString } from "./storage";
 
 const SECRET_STORAGE_PREFIX = "mindfs.e2ee.secret.";
 export const E2EE_HEADER = "X-MindFS-E2EE";
@@ -100,28 +101,28 @@ class E2EEService {
   }
 
   hasSecret(): boolean {
-    if (!this.nodeId || typeof window === "undefined") {
+    if (!this.nodeId) {
       return false;
     }
-    return !!window.localStorage.getItem(this.secretStorageKey());
+    return !!getStoredString(this.secretStorageKey());
   }
 
   getSecret(): string {
-    if (!this.nodeId || typeof window === "undefined") {
+    if (!this.nodeId) {
       return "";
     }
-    return String(window.localStorage.getItem(this.secretStorageKey()) || "").trim();
+    return String(getStoredString(this.secretStorageKey()) || "").trim();
   }
 
   setSecret(secret: string) {
     const trimmed = String(secret || "").trim();
-    if (!this.nodeId || typeof window === "undefined") {
+    if (!this.nodeId) {
       return;
     }
     if (!trimmed) {
-      window.localStorage.removeItem(this.secretStorageKey());
+      removeStoredString(this.secretStorageKey());
     } else {
-      window.localStorage.setItem(this.secretStorageKey(), trimmed);
+      setStoredString(this.secretStorageKey(), trimmed);
     }
     this.session = null;
     this.openingPromise = null;
@@ -137,8 +138,8 @@ class E2EEService {
   }
 
   clearSecret() {
-    if (typeof window !== "undefined" && this.nodeId) {
-      window.localStorage.removeItem(this.secretStorageKey());
+    if (this.nodeId) {
+      removeStoredString(this.secretStorageKey());
     }
     this.clearSession();
   }
@@ -180,6 +181,22 @@ class E2EEService {
       throw new Error("e2ee_required");
     }
     return decryptJSON<T>(session.transportKey, envelope);
+  }
+
+  async encryptEnvelopeBytes(bytes: Uint8Array): Promise<CipherEnvelope> {
+    const session = await this.ensureSession();
+    if (!session) {
+      throw new Error("e2ee_required");
+    }
+    return encryptBytes(session.transportKey, bytes);
+  }
+
+  async decryptEnvelopeBytes(envelope: CipherEnvelope): Promise<Uint8Array> {
+    const session = await this.ensureSession();
+    if (!session) {
+      throw new Error("e2ee_required");
+    }
+    return decryptBytes(session.transportKey, envelope);
   }
 
   async encodeProtectedJSON(value: unknown): Promise<string> {

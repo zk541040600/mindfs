@@ -236,16 +236,32 @@ func (s *probeSessionStore) saveLocked() error {
 	if err != nil {
 		return err
 	}
-	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, append(payload, '\n'), 0o600); err != nil {
+	tmp, err := os.CreateTemp(filepath.Dir(s.path), filepath.Base(s.path)+".tmp-*")
+	if err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, s.path); err != nil {
-		_ = os.Remove(s.path)
-		if retryErr := os.Rename(tmp, s.path); retryErr != nil {
-			return err
+	tmpName := tmp.Name()
+	cleanupTmp := true
+	defer func() {
+		if cleanupTmp {
+			_ = os.Remove(tmpName)
 		}
+	}()
+	if _, err := tmp.Write(append(payload, '\n')); err != nil {
+		_ = tmp.Close()
+		return err
 	}
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, s.path); err != nil {
+		return err
+	}
+	cleanupTmp = false
 	return nil
 }
 

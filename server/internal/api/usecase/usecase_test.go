@@ -67,6 +67,57 @@ func TestSaveUploadedFilesDefaultsToAttachmentDirAndRenamesConflicts(t *testing.
 	assertFileContent(t, filepath.Join(rootDir, filepath.FromSlash(wantSecond)), "second file")
 }
 
+func TestSaveUploadedFilesRejectsParentDirectoryName(t *testing.T) {
+	rootDir := t.TempDir()
+	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
+	service := Service{Registry: uploadTestRegistry{root: root}}
+
+	_, err := service.SaveUploadedFiles(context.Background(), SaveUploadedFilesInput{
+		RootID: "mindfs",
+		Files: []UploadFile{{
+			Name:   "..",
+			Reader: bytes.NewBufferString("escape"),
+		}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "file name required") {
+		t.Fatalf("SaveUploadedFiles error = %v, want file name required", err)
+	}
+}
+
+func TestImportExternalSessionRejectsEmptyTranscriptWithoutCreatingSession(t *testing.T) {
+	rootDir := t.TempDir()
+	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
+	manager := session.NewManager(root)
+	registry := &externalImportTestRegistry{
+		commandTestRegistry: &commandTestRegistry{root: root, manager: manager},
+		importer: &fakeExternalSessionImporter{imported: agenttypes.ImportedExternalSession{
+			Agent:          "codex",
+			AgentSessionID: "agent-session",
+			Exchanges: []agenttypes.ImportedExchange{
+				{Role: "system", Content: "hidden"},
+				{Role: "user", Content: "   "},
+			},
+		}},
+	}
+	service := Service{Registry: registry}
+
+	_, err := service.ImportExternalSession(context.Background(), ImportExternalSessionInput{
+		RootID:         root.ID,
+		Agent:          "codex",
+		AgentSessionID: "agent-session",
+	})
+	if err == nil || !strings.Contains(err.Error(), "no importable messages") {
+		t.Fatalf("ImportExternalSession error = %v, want no importable messages", err)
+	}
+	sessions, listErr := manager.List(context.Background(), session.ListOptions{})
+	if listErr != nil {
+		t.Fatalf("List sessions returned error: %v", listErr)
+	}
+	if len(sessions) != 0 {
+		t.Fatalf("created %d sessions for empty transcript, want 0", len(sessions))
+	}
+}
+
 func TestSendCommandMessagePersistsFinalToolCallAndSuggestion(t *testing.T) {
 	rootDir := t.TempDir()
 	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
@@ -1030,6 +1081,37 @@ func TestPromptStoreAppendMovesExistingToLatestAndLimits(t *testing.T) {
 	}
 }
 
+func TestPromptStoreSaveUsesAtomicFileReplacement(t *testing.T) {
+	dir := t.TempDir()
+	store := &PromptStore{filePath: filepath.Join(dir, "prompts.json")}
+
+	if _, err := store.Append("remember this"); err != nil {
+		t.Fatalf("Append returned error: %v", err)
+	}
+	info, err := os.Stat(store.filePath)
+	if err != nil {
+		t.Fatalf("Stat prompts returned error: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o644 {
+		t.Fatalf("prompts mode = %v, want 0644", got)
+	}
+	temps, err := filepath.Glob(filepath.Join(dir, "prompts.json.tmp-*"))
+	if err != nil {
+		t.Fatalf("Glob temp files returned error: %v", err)
+	}
+	if len(temps) != 0 {
+		t.Fatalf("prompt temp files left behind: %#v", temps)
+	}
+
+	items, err := store.Load()
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if len(items) != 1 || items[0] != "remember this" {
+		t.Fatalf("prompts = %#v, want saved prompt", items)
+	}
+}
+
 func TestPromptCandidateProviderSearchReturnsNewestFirst(t *testing.T) {
 	store := &PromptStore{filePath: filepath.Join(t.TempDir(), "prompts.json")}
 	for _, item := range []string{"first prompt", "second prompt", "another"} {
@@ -1557,6 +1639,32 @@ func (s *fakeUsecaseAgentSession) emit(event agenttypes.Event) {
 	if s.onUpdate != nil {
 		s.onUpdate(event)
 	}
+}
+
+type externalImportTestRegistry struct {
+	*commandTestRegistry
+	importer agenttypes.ExternalSessionImporter
+}
+
+func (r *externalImportTestRegistry) GetExternalSessionImporter(string) (agenttypes.ExternalSessionImporter, error) {
+	if r.importer == nil {
+		return nil, errors.New("not implemented")
+	}
+	return r.importer, nil
+}
+
+type fakeExternalSessionImporter struct {
+	imported agenttypes.ImportedExternalSession
+}
+
+func (i *fakeExternalSessionImporter) AgentName() string { return strings.TrimSpace(i.imported.Agent) }
+
+func (i *fakeExternalSessionImporter) ListExternalSessions(context.Context, agenttypes.ListExternalSessionsInput) (agenttypes.ListExternalSessionsResult, error) {
+	return agenttypes.ListExternalSessionsResult{}, nil
+}
+
+func (i *fakeExternalSessionImporter) ImportExternalSession(context.Context, agenttypes.ImportExternalSessionInput) (agenttypes.ImportedExternalSession, error) {
+	return i.imported, nil
 }
 
 type commandTestRegistry struct {

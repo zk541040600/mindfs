@@ -551,6 +551,20 @@ public class MainActivity extends BridgeActivity {
                 return "Failed to enqueue download: " + ex.getMessage();
             }
         }
+
+        @JavascriptInterface
+        public String downloadBase64(String data, String filename) {
+            try {
+                String safeFilename = NativeDownloadPlugin.sanitizeFilename(filename);
+                if (safeFilename.isEmpty()) {
+                    safeFilename = "download";
+                }
+                NativeDownloadPlugin.saveBase64ToDownloads(MainActivity.this, data, safeFilename);
+                return "";
+            } catch (Exception ex) {
+                return "Failed to save download: " + ex.getMessage();
+            }
+        }
     }
 
     private class AppInfoBridge {

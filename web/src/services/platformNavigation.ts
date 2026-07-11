@@ -5,8 +5,23 @@ type ExternalBrowserBridge = {
   open?: (url: string) => string | void;
 };
 
+const allowedExternalProtocols = new Set(["http:", "https:", "mailto:", "tel:"]);
+
+export function isSafeExternalURL(url: string): boolean {
+  const trimmed = String(url || "").trim();
+  if (!trimmed || typeof window === "undefined") {
+    return false;
+  }
+  try {
+    const parsed = new URL(trimmed, window.location.href);
+    return allowedExternalProtocols.has(parsed.protocol);
+  } catch {
+    return false;
+  }
+}
+
 export function openExternalURL(url: string): void {
-  if (typeof window === "undefined") {
+  if (typeof window === "undefined" || !isSafeExternalURL(url)) {
     return;
   }
   if (isNativeShellRuntime()) {

@@ -27,6 +27,11 @@ interface DownloadInput {
   filename?: string;
 }
 
+interface DownloadBytesInput {
+  data?: string;
+  filename?: string;
+}
+
 interface ReplyPollerConfig {
   apiBaseUrl?: string;
   token?: string;
@@ -222,6 +227,24 @@ export class MindFSNativeBridge {
     return '';
   }
 
+  downloadBase64(rawInput: string): string {
+    const input = parseDownloadBytesInput(rawInput);
+    const filename = sanitizeFilename(`${input.filename ?? ''}`.trim());
+    if (!filename) {
+      return 'download filename is required';
+    }
+    if (!this.context) {
+      return 'Harmony context is not ready';
+    }
+    try {
+      const data = decodeBase64(`${input.data ?? ''}`.trim());
+      this.startDownloadBytes(data, filename);
+      return '';
+    } catch (error) {
+      return `invalid download data: ${errorSummary(error as Error)}`;
+    }
+  }
+
   openExternalURL(url: string): string {
     const value = `${url ?? ''}`.trim();
     if (!/^https?:\/\//i.test(value)) {
@@ -410,6 +433,11 @@ export class MindFSNativeBridge {
     void this.startDownloadAsync(url, filename, notificationId);
   }
 
+  private startDownloadBytes(data: Uint8Array, filename: string): void {
+    const notificationId = this.nextNotificationId++;
+    void this.startDownloadBytesAsync(data, filename, notificationId);
+  }
+
   private ensurePreferences(): void {
     if (this.preferences || !this.context) {
       return;
@@ -501,6 +529,41 @@ export class MindFSNativeBridge {
         }
       }
       requestTask.destroy();
+    }
+  }
+
+  private async startDownloadBytesAsync(data: Uint8Array, filename: string, notificationId: number): Promise<void> {
+    const context = this.context;
+    if (!context) {
+      return;
+    }
+
+    await this.ensureNotificationPermission();
+    await this.publishBasicNotification(notificationId, '开始下载', filename, true, false);
+    let file: fileIo.File | undefined = undefined;
+    let targetPath = '';
+    try {
+      targetPath = uniqueDownloadPath(environment.getUserDownloadDir(), filename);
+      const bytes = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+      file = fileIo.openSync(
+        targetPath,
+        fileIo.OpenMode.WRITE_ONLY | fileIo.OpenMode.CREATE | fileIo.OpenMode.TRUNC
+      );
+      await fileIo.write(file.fd, bytes);
+      await fileIo.fsync(file.fd);
+      await this.publishBasicNotification(notificationId, '下载完成', `已保存到：${targetPath}`, false, true);
+    } catch (error) {
+      const detail = errorSummary(error);
+      console.warn(`MindFS save decrypted download failed: ${detail}`);
+      await this.publishBasicNotification(notificationId, '下载失败', `${filename}，${detail}`, false, true);
+    } finally {
+      if (file) {
+        try {
+          fileIo.closeSync(file);
+        } catch (error) {
+          console.warn(`MindFS close download file failed: ${errorSummary(error)}`);
+        }
+      }
     }
   }
 
@@ -903,6 +966,17 @@ function parseDownloadInput(input: string): DownloadInput {
   }
 }
 
+function parseDownloadBytesInput(input: string): DownloadBytesInput {
+  if (!input.trim()) {
+    return {};
+  }
+  try {
+    return JSON.parse(input) as DownloadBytesInput;
+  } catch (_error) {
+    return {};
+  }
+}
+
 function parseReplyPollerConfig(input: string): ReplyPollerConfig {
   if (!input.trim()) {
     return {};
@@ -1231,7 +1305,7 @@ function mergeRelayNodesIntoLauncherNodes(
 }
 
 function sanitizeFilename(filename: string): string {
-  return filename
+  const sanitized = filename
     .trim()
     .replace(/\\/g, '_')
     .replace(/\//g, '_')
@@ -1241,7 +1315,12 @@ function sanitizeFilename(filename: string): string {
     .replace(/"/g, '_')
     .replace(/</g, '_')
     .replace(/>/g, '_')
-    .replace(/\|/g, '_');
+    .replace(/\|/g, '_')
+    .replace(/[\x00-\x1f\x7f]/g, '_');
+  if (sanitized === '.' || sanitized === '..') {
+    return '';
+  }
+  return sanitized;
 }
 
 function uniqueDownloadPath(directory: string, filename: string): string {

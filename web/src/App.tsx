@@ -113,10 +113,28 @@ import {
   type ProjectAddMode,
 } from "./components/ProjectAddPopover";
 import { fetchAgents, type AgentStatus } from "./services/agents";
+import { getStoredString, setStoredString } from "./services/storage";
 
 // 类型定义
 type SessionMode = "chat" | "plugin" | "command";
 type WSStatus = "connecting" | "connected" | "reconnecting" | "disconnected";
+
+const HIDDEN_EXTENSION_UI_CHROME_KEYS = new Set(["codex-compact", "nano-context"]);
+const CANCEL_REQUEST_TOMBSTONE_TTL_MS = 30_000;
+
+function cancelRequestTombstoneTTL(): number {
+  if (typeof window !== "undefined") {
+    const override = Number((window as any).__mindfsCancelRequestTombstoneTTLMS);
+    if (Number.isFinite(override) && override >= 0) {
+      return override;
+    }
+  }
+  return CANCEL_REQUEST_TOMBSTONE_TTL_MS;
+}
+
+function isVisibleExtensionUIChromeEntry([key]: [string, unknown]): boolean {
+  return !HIDDEN_EXTENSION_UI_CHROME_KEYS.has(key);
+}
 
 function normalizeFastService(
   value: unknown,
@@ -377,6 +395,8 @@ const PLUGIN_QUERY_STORAGE_PREFIX = "vp-progress:";
 const TREE_SORT_STORAGE_KEY = "mindfs-tree-sort-mode";
 const DIRECTORY_SORT_OVERRIDES_STORAGE_KEY = "mindfs-directory-sort-overrides";
 const FILE_SCROLL_STORAGE_KEY = "mindfs-file-scroll-positions";
+const FILE_SCROLL_PERSIST_DEBOUNCE_MS = 400;
+const FILE_SCROLL_POSITIONS_MAX_ENTRIES = 200;
 const LAST_ROOT_STORAGE_KEY = "mindfs-last-root-id";
 const SHOW_GIT_HISTORY_BY_ROOT_STORAGE_KEY = "mindfs-show-git-history-by-root";
 const GIT_STATUS_EXPANDED_STORAGE_KEY = "mindfs-git-status-expanded";
@@ -591,6 +611,27 @@ function extractHTTPStatusFromErrorMessage(message: string): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function trimFileScrollPositions(
+  positions: Record<string, number>,
+  keepKey = "",
+): void {
+  const keys = Object.keys(positions);
+  if (keys.length <= FILE_SCROLL_POSITIONS_MAX_ENTRIES) {
+    return;
+  }
+  let remaining = keys.length;
+  for (const key of keys) {
+    if (remaining <= FILE_SCROLL_POSITIONS_MAX_ENTRIES) {
+      return;
+    }
+    if (key === keepKey) {
+      continue;
+    }
+    delete positions[key];
+    remaining -= 1;
+  }
+}
+
 function loadPersistedFileScrollPositions(): Record<string, number> {
   if (typeof window === "undefined") {
     return {};
@@ -612,6 +653,7 @@ function loadPersistedFileScrollPositions(): Record<string, number> {
       }
       next[key] = scrollTop;
     });
+    trimFileScrollPositions(next);
     return next;
   } catch {
     return {};
@@ -928,10 +970,7 @@ function buildDirectorySelectionKey(
 }
 
 function loadLastRootId(): string {
-  if (typeof window === "undefined") {
-    return "";
-  }
-  return window.localStorage.getItem(LAST_ROOT_STORAGE_KEY) || "";
+  return getStoredString(LAST_ROOT_STORAGE_KEY) || "";
 }
 
 function loadBooleanRecord(key: string): Record<string, boolean> {
@@ -1056,6 +1095,51 @@ export function App({ onGoHome }: AppProps) {
   const fileScrollPositionsRef = useRef<Record<string, number>>(
     loadPersistedFileScrollPositions(),
   );
+  const fileScrollPersistTimerRef = useRef<number | null>(null);
+  const flushFileScrollPositions = useCallback(() => {
+    if (
+      typeof window !== "undefined" &&
+      fileScrollPersistTimerRef.current !== null
+    ) {
+      window.clearTimeout(fileScrollPersistTimerRef.current);
+      fileScrollPersistTimerRef.current = null;
+    }
+    trimFileScrollPositions(fileScrollPositionsRef.current);
+    persistFileScrollPositions(fileScrollPositionsRef.current);
+  }, []);
+  const scheduleFileScrollPositionsPersist = useCallback(() => {
+    if (typeof window === "undefined") {
+      persistFileScrollPositions(fileScrollPositionsRef.current);
+      return;
+    }
+    if (fileScrollPersistTimerRef.current !== null) {
+      window.clearTimeout(fileScrollPersistTimerRef.current);
+    }
+    fileScrollPersistTimerRef.current = window.setTimeout(() => {
+      fileScrollPersistTimerRef.current = null;
+      trimFileScrollPositions(fileScrollPositionsRef.current);
+      persistFileScrollPositions(fileScrollPositionsRef.current);
+    }, FILE_SCROLL_PERSIST_DEBOUNCE_MS);
+  }, []);
+  const updateFileScrollPosition = useCallback(
+    (key: string, scrollTop: number) => {
+      if (!key || !Number.isFinite(scrollTop) || scrollTop < 0) {
+        return;
+      }
+      const positions = fileScrollPositionsRef.current;
+      if (positions[key] === scrollTop) {
+        return;
+      }
+      if (Object.prototype.hasOwnProperty.call(positions, key)) {
+        delete positions[key];
+      }
+      positions[key] = scrollTop;
+      trimFileScrollPositions(positions, key);
+      scheduleFileScrollPositionsPersist();
+    },
+    [scheduleFileScrollPositionsPersist],
+  );
+  useEffect(() => () => flushFileScrollPositions(), [flushFileScrollPositions]);
   const pluginContentRef = useRef<HTMLDivElement | null>(null);
   const lastPluginChapterRef = useRef<string>("");
   const viewerSelectionRef = useRef<ViewerSelection | null>(null);
@@ -1255,10 +1339,7 @@ export function App({ onGoHome }: AppProps) {
   );
   const [gitDiff, setGitDiff] = useState<GitDiffPayload | null>(null);
   const [treeSortMode, setTreeSortMode] = useState<DirectorySortMode>(() => {
-    if (typeof window === "undefined") {
-      return DEFAULT_DIRECTORY_SORT_MODE;
-    }
-    const saved = window.localStorage.getItem(TREE_SORT_STORAGE_KEY);
+    const saved = getStoredString(TREE_SORT_STORAGE_KEY);
     return isDirectorySortMode(saved) ? saved : DEFAULT_DIRECTORY_SORT_MODE;
   });
   const [directorySortOverrides, setDirectorySortOverrides] = useState<
@@ -1469,11 +1550,8 @@ export function App({ onGoHome }: AppProps) {
     return () => document.removeEventListener("mousedown", handlePointerDown);
   }, [projectAddMode]);
   useEffect(() => {
-    if (typeof window === "undefined") {
-      return;
-    }
     if (currentRootId) {
-      window.localStorage.setItem(LAST_ROOT_STORAGE_KEY, currentRootId);
+      setStoredString(LAST_ROOT_STORAGE_KEY, currentRootId);
     }
   }, [currentRootId]);
   useEffect(() => {
@@ -1551,34 +1629,19 @@ export function App({ onGoHome }: AppProps) {
     interactionModeRef.current = interactionMode;
   }, [interactionMode]);
   useEffect(() => {
-    if (typeof window === "undefined") {
-      return;
-    }
-    window.localStorage.setItem(TREE_SORT_STORAGE_KEY, treeSortMode);
+    setStoredString(TREE_SORT_STORAGE_KEY, treeSortMode);
   }, [treeSortMode]);
   useEffect(() => {
-    if (typeof window === "undefined") {
-      return;
-    }
-    window.localStorage.setItem(SHOW_GIT_HISTORY_BY_ROOT_STORAGE_KEY, JSON.stringify(showGitHistoryByRoot));
+    setStoredString(SHOW_GIT_HISTORY_BY_ROOT_STORAGE_KEY, JSON.stringify(showGitHistoryByRoot));
   }, [showGitHistoryByRoot]);
   useEffect(() => {
-    if (typeof window === "undefined") {
-      return;
-    }
-    window.localStorage.setItem(GIT_STATUS_EXPANDED_STORAGE_KEY, JSON.stringify(gitStatusExpandedByRoot));
+    setStoredString(GIT_STATUS_EXPANDED_STORAGE_KEY, JSON.stringify(gitStatusExpandedByRoot));
   }, [gitStatusExpandedByRoot]);
   useEffect(() => {
-    if (typeof window === "undefined") {
-      return;
-    }
-    window.localStorage.setItem(GIT_HISTORY_EXPANDED_STORAGE_KEY, JSON.stringify(gitHistoryExpandedByRoot));
+    setStoredString(GIT_HISTORY_EXPANDED_STORAGE_KEY, JSON.stringify(gitHistoryExpandedByRoot));
   }, [gitHistoryExpandedByRoot]);
   useEffect(() => {
-    if (typeof window === "undefined") {
-      return;
-    }
-    window.localStorage.setItem(
+    setStoredString(
       DIRECTORY_SORT_OVERRIDES_STORAGE_KEY,
       JSON.stringify(directorySortOverrides),
     );
@@ -4497,6 +4560,58 @@ export function App({ onGoHome }: AppProps) {
     ],
   );
 
+  const clearPendingExtensionUIForSession = useCallback(
+    (rootID: string | null | undefined, sessionKey: string | null | undefined) => {
+      const resolvedRoot = String(rootID || "");
+      const resolvedKey = String(sessionKey || "");
+      if (!resolvedRoot || !resolvedKey) return;
+      setPendingExtensionUI((current) =>
+        current?.rootId === resolvedRoot && current?.sessionKey === resolvedKey
+          ? null
+          : current,
+      );
+      setExtensionUISubmitting(false);
+    },
+    [],
+  );
+
+  const cancelPendingExtensionUIForSession = useCallback(
+    async (rootID: string, sessionKey: string) => {
+      const request = pendingExtensionUI;
+      if (
+        !request ||
+        request.rootId !== rootID ||
+        request.sessionKey !== sessionKey ||
+        !request.id
+      ) {
+        return;
+      }
+      setExtensionUISubmitting(true);
+      const sent = await sessionService.answerExtensionUI(
+        request.rootId,
+        request.sessionKey,
+        request.agent,
+        request.id,
+        request.method,
+        { cancelled: true },
+      );
+      setExtensionUISubmitting(false);
+      if (!sent) {
+        reportError("network.disconnected", "扩展 UI 取消失败：连接未就绪，请稍后重试", {
+          details: {
+            rootId: request.rootId,
+            sessionKey: request.sessionKey,
+            requestId: request.id,
+            method: request.method,
+          },
+        });
+        return;
+      }
+      setPendingExtensionUI((current) => (current?.id === request.id ? null : current));
+    },
+    [pendingExtensionUI],
+  );
+
   const handleCancelCurrentTurn = useCallback(
     async (sessionKey: string) => {
       const activeRoot = currentRootIdRef.current;
@@ -4507,17 +4622,29 @@ export function App({ onGoHome }: AppProps) {
         pendingBySessionRef.current[cacheKey]?.requestId ||
         "";
       cancelRequestedBySessionRef.current[cacheKey] = true;
+      await cancelPendingExtensionUIForSession(activeRoot, sessionKey);
       const sent = await sessionService.cancelMessage(activeRoot, sessionKey, requestId);
       if (!sent) {
         delete cancelRequestedBySessionRef.current[cacheKey];
         return;
       }
-      clearLocalPendingForSession(activeRoot, sessionKey);
       window.setTimeout(() => {
-        delete cancelRequestedBySessionRef.current[cacheKey];
-      }, 30000);
+        if (!cancelRequestedBySessionRef.current[cacheKey]) {
+          return;
+        }
+        const pendingRequestId = pendingBySessionRef.current[cacheKey]?.requestId || "";
+        const runningRequestId = runningTurnBySessionRef.current[cacheKey]?.requestId || "";
+        if (
+          !requestId ||
+          (pendingRequestId !== requestId && runningRequestId !== requestId)
+        ) {
+          delete cancelRequestedBySessionRef.current[cacheKey];
+        }
+      }, cancelRequestTombstoneTTL());
+      clearLocalPendingForSession(activeRoot, sessionKey);
+      clearPendingExtensionUIForSession(activeRoot, sessionKey);
     },
-    [clearLocalPendingForSession, rootSessionKey],
+    [cancelPendingExtensionUIForSession, clearPendingExtensionUIForSession, rootSessionKey],
   );
 
   const markSessionPending = useCallback(
@@ -4654,8 +4781,8 @@ export function App({ onGoHome }: AppProps) {
 
   const cancelExtensionUI = useCallback(() => {
     if (!pendingExtensionUI) return;
-    void submitExtensionUIResponse(pendingExtensionUI, { cancelled: true });
-  }, [pendingExtensionUI, submitExtensionUIResponse]);
+    void handleCancelCurrentTurn(pendingExtensionUI.sessionKey);
+  }, [handleCancelCurrentTurn, pendingExtensionUI]);
 
   const handleNewSession = useCallback(() => {
     const rootID = currentRootIdRef.current;
@@ -4807,11 +4934,10 @@ export function App({ onGoHome }: AppProps) {
       currentFile?.path,
     );
     if (!key) return;
-    if (!(key in fileScrollPositionsRef.current)) {
-      fileScrollPositionsRef.current[key] = 0;
-      persistFileScrollPositions(fileScrollPositionsRef.current);
+    if (!Object.prototype.hasOwnProperty.call(fileScrollPositionsRef.current, key)) {
+      updateFileScrollPosition(key, 0);
     }
-  }, []);
+  }, [updateFileScrollPosition]);
 
   const actionHandlers = useMemo(
     () => ({
@@ -6666,6 +6792,8 @@ export function App({ onGoHome }: AppProps) {
       }
       const wasCanceled = !!cancelRequestedBySessionRef.current[cacheKey];
       forgetSessionTurnRunning(rootID, sessionKey);
+      delete cancelRequestedBySessionRef.current[cacheKey];
+      clearPendingExtensionUIForSession(rootID, sessionKey);
       const queued = queuedMessagesBySessionRef.current[cacheKey] || [];
       const queueFrozen = !!queueFrozenBySessionRef.current[cacheKey];
       const hiddenQueued = optimisticDequeuedIdsRef.current[cacheKey];
@@ -7352,7 +7480,9 @@ export function App({ onGoHome }: AppProps) {
         case "session.cancelled": {
           const sessionKey =
             typeof payload?.session_key === "string" ? payload.session_key : "";
-          console.info("[session/ws] cancelled", { rootId: typeof payload?.root_id === "string" ? payload.root_id : null, sessionKey: sessionKey || null });
+          const requestId =
+            typeof payload?.request_id === "string" ? payload.request_id : "";
+          console.info("[session/ws] cancelled", { rootId: typeof payload?.root_id === "string" ? payload.root_id : null, sessionKey: sessionKey || null, requestId: requestId || null });
           const rootID =
             typeof payload?.root_id === "string" && payload.root_id
               ? payload.root_id
@@ -7360,7 +7490,20 @@ export function App({ onGoHome }: AppProps) {
                 currentRootIdRef.current ||
                 "";
           if (rootID && sessionKey) {
-            handleSessionStreamDone(rootID, sessionKey);
+            const cacheKey = rootSessionKey(rootID, sessionKey);
+            if (
+              !requestId &&
+              !cancelRequestedBySessionRef.current[cacheKey] &&
+              (pendingBySessionRef.current[cacheKey] ||
+                runningTurnBySessionRef.current[cacheKey])
+            ) {
+              console.info("[session/ws] ignore_stale_cancelled_without_request", {
+                rootId: rootID,
+                sessionKey,
+              });
+              break;
+            }
+            handleSessionStreamDone(rootID, sessionKey, requestId);
           }
           break;
         }
@@ -7369,7 +7512,7 @@ export function App({ onGoHome }: AppProps) {
             typeof payload?.session_key === "string" ? payload.session_key : "";
           const requestId =
             typeof payload?.request_id === "string" ? payload.request_id : "";
-          console.info("[session/ws] done", { rootId: typeof payload?.root_id === "string" ? payload.root_id : null, sessionKey: sessionKey || null });
+          console.info("[session/ws] done", { rootId: typeof payload?.root_id === "string" ? payload.root_id : null, sessionKey: sessionKey || null, requestId: requestId || null });
           const rootID =
             typeof payload?.root_id === "string" && payload.root_id
               ? payload.root_id
@@ -7377,6 +7520,18 @@ export function App({ onGoHome }: AppProps) {
                 currentRootIdRef.current ||
                 "";
           if (rootID && sessionKey) {
+            const cacheKey = rootSessionKey(rootID, sessionKey);
+            const pendingRequestId = pendingBySessionRef.current[cacheKey]?.requestId || "";
+            const runningRequestId = runningTurnBySessionRef.current[cacheKey]?.requestId || "";
+            if (!requestId && (pendingRequestId || runningRequestId)) {
+              console.info("[session/ws] ignore_stale_done_without_request", {
+                rootId: rootID,
+                sessionKey,
+                pendingRequestId: pendingRequestId || null,
+                runningRequestId: runningRequestId || null,
+              });
+              break;
+            }
             handleSessionStreamDone(rootID, sessionKey, requestId);
             const newest = sessionsRef.current[0]?.updated_at || "";
             void loadSessionsForRoot(
@@ -7685,6 +7840,7 @@ export function App({ onGoHome }: AppProps) {
     appendTodoUpdateForSession,
     clearLocalPendingForSession,
     forgetSessionTurnRunning,
+    clearPendingExtensionUIForSession,
     clearSessionStale,
     markSessionPending,
     markSessionTurnRunning,
@@ -7736,9 +7892,7 @@ export function App({ onGoHome }: AppProps) {
     let cancelled = false;
     let settled = false;
     if (isRelayPWAContext() && !isRelayNodePage()) {
-      const lastNodeID = window.localStorage.getItem(
-        RELAY_LAST_NODE_ID_STORAGE_KEY,
-      );
+      const lastNodeID = getStoredString(RELAY_LAST_NODE_ID_STORAGE_KEY);
       if (lastNodeID) {
         window.location.replace(`/n/${lastNodeID}/`);
         return;
@@ -7921,7 +8075,7 @@ export function App({ onGoHome }: AppProps) {
     if (!nodeID) {
       return;
     }
-    window.localStorage.setItem(RELAY_LAST_NODE_ID_STORAGE_KEY, nodeID);
+    setStoredString(RELAY_LAST_NODE_ID_STORAGE_KEY, nodeID);
   }, []);
 
   useEffect(() => {
@@ -8372,6 +8526,12 @@ export function App({ onGoHome }: AppProps) {
   const currentFileScrollKey = buildFileScrollKey(
     file?.root || currentRootId,
     file?.path,
+  );
+  const handleFileScrollTopChange = useCallback(
+    (scrollTop: number) => {
+      updateFileScrollPosition(currentFileScrollKey, scrollTop);
+    },
+    [currentFileScrollKey, updateFileScrollPosition],
   );
   const sessionView = (
     <SessionViewer
@@ -8852,11 +9012,7 @@ export function App({ onGoHome }: AppProps) {
             initialScrollTop={
               fileScrollPositionsRef.current[currentFileScrollKey] || 0
             }
-            onScrollTopChange={(scrollTop) => {
-              if (!currentFileScrollKey) return;
-              fileScrollPositionsRef.current[currentFileScrollKey] = scrollTop;
-              persistFileScrollPositions(fileScrollPositionsRef.current);
-            }}
+            onScrollTopChange={handleFileScrollTopChange}
             onSessionClick={(sessionKey) =>
               handleSessionChipClick(
                 sessionKey,
@@ -9282,8 +9438,12 @@ export function App({ onGoHome }: AppProps) {
       />
     );
 
-  const extensionUIStatusEntries = Object.entries(extensionUIChrome.statuses);
-  const extensionUIWidgetEntries = Object.entries(extensionUIChrome.widgets);
+  const extensionUIStatusEntries = Object.entries(extensionUIChrome.statuses).filter(
+    isVisibleExtensionUIChromeEntry,
+  );
+  const extensionUIWidgetEntries = Object.entries(extensionUIChrome.widgets).filter(
+    isVisibleExtensionUIChromeEntry,
+  );
   const hasExtensionUIChrome =
     extensionUIStatusEntries.length > 0 || extensionUIWidgetEntries.length > 0;
   const renderExtensionUIChrome = (variant: "mobile" | "desktop") => {

@@ -106,9 +106,10 @@ type Service struct {
 	parser      cron.Parser
 	cron        *cron.Cron
 
-	mu      sync.Mutex
-	entries map[string][]cron.EntryID
-	running map[string]bool
+	storageMu sync.Mutex
+	mu        sync.Mutex
+	entries   map[string][]cron.EntryID
+	running   map[string]bool
 }
 
 func NewService(registry usecase.Registry, broadcaster SessionActivityBroadcaster) *Service {
@@ -175,33 +176,27 @@ func (s *Service) Create(ctx context.Context, in SaveInput) (Task, error) {
 	if err := s.validateInput(in); err != nil {
 		return Task{}, err
 	}
-	store, err := s.store(in.RootID)
-	if err != nil {
-		return Task{}, err
-	}
-	tasks, err := store.List()
-	if err != nil {
-		return Task{}, err
-	}
-	now := time.Now().UTC()
-	task := Task{
-		ID:             newID(),
-		RootID:         strings.TrimSpace(in.RootID),
-		Name:           strings.TrimSpace(in.Name),
-		Enabled:        in.Enabled,
-		TaskCron:       strings.TrimSpace(in.TaskCron),
-		Agent:          strings.TrimSpace(in.Agent),
-		Model:          strings.TrimSpace(in.Model),
-		Mode:           strings.TrimSpace(in.Mode),
-		Effort:         strings.TrimSpace(in.Effort),
-		FastService:    strings.TrimSpace(in.FastService),
-		Prompt:         strings.TrimSpace(in.Prompt),
-		NewSessionCron: strings.TrimSpace(in.NewSessionCron),
-		CreatedAt:      now,
-		UpdatedAt:      now,
-	}
-	tasks = append(tasks, task)
-	if err := store.Save(tasks); err != nil {
+	var task Task
+	if err := s.mutateTasks(in.RootID, func(tasks []Task) ([]Task, error) {
+		now := time.Now().UTC()
+		task = Task{
+			ID:             newID(),
+			RootID:         strings.TrimSpace(in.RootID),
+			Name:           strings.TrimSpace(in.Name),
+			Enabled:        in.Enabled,
+			TaskCron:       strings.TrimSpace(in.TaskCron),
+			Agent:          strings.TrimSpace(in.Agent),
+			Model:          strings.TrimSpace(in.Model),
+			Mode:           strings.TrimSpace(in.Mode),
+			Effort:         strings.TrimSpace(in.Effort),
+			FastService:    strings.TrimSpace(in.FastService),
+			Prompt:         strings.TrimSpace(in.Prompt),
+			NewSessionCron: strings.TrimSpace(in.NewSessionCron),
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		}
+		return append(tasks, task), nil
+	}); err != nil {
 		return Task{}, err
 	}
 	if err := s.ReloadRoot(task.RootID); err != nil {
@@ -218,65 +213,54 @@ func (s *Service) Update(ctx context.Context, in SaveInput) (Task, error) {
 	if err := s.validateInput(in); err != nil {
 		return Task{}, err
 	}
-	store, err := s.store(in.RootID)
-	if err != nil {
+	var task Task
+	if err := s.mutateTasks(in.RootID, func(tasks []Task) ([]Task, error) {
+		for i := range tasks {
+			if tasks[i].ID != strings.TrimSpace(in.ID) {
+				continue
+			}
+			tasks[i].Name = strings.TrimSpace(in.Name)
+			tasks[i].Enabled = in.Enabled
+			tasks[i].TaskCron = strings.TrimSpace(in.TaskCron)
+			tasks[i].Agent = strings.TrimSpace(in.Agent)
+			tasks[i].Model = strings.TrimSpace(in.Model)
+			tasks[i].Mode = strings.TrimSpace(in.Mode)
+			tasks[i].Effort = strings.TrimSpace(in.Effort)
+			tasks[i].FastService = strings.TrimSpace(in.FastService)
+			tasks[i].Prompt = strings.TrimSpace(in.Prompt)
+			tasks[i].NewSessionCron = strings.TrimSpace(in.NewSessionCron)
+			tasks[i].UpdatedAt = time.Now().UTC()
+			task = tasks[i]
+			return tasks, nil
+		}
+		return nil, errors.New("task not found")
+	}); err != nil {
 		return Task{}, err
 	}
-	tasks, err := store.List()
-	if err != nil {
+	if err := s.ReloadRoot(in.RootID); err != nil {
 		return Task{}, err
 	}
-	for i := range tasks {
-		if tasks[i].ID != strings.TrimSpace(in.ID) {
-			continue
-		}
-		tasks[i].Name = strings.TrimSpace(in.Name)
-		tasks[i].Enabled = in.Enabled
-		tasks[i].TaskCron = strings.TrimSpace(in.TaskCron)
-		tasks[i].Agent = strings.TrimSpace(in.Agent)
-		tasks[i].Model = strings.TrimSpace(in.Model)
-		tasks[i].Mode = strings.TrimSpace(in.Mode)
-		tasks[i].Effort = strings.TrimSpace(in.Effort)
-		tasks[i].FastService = strings.TrimSpace(in.FastService)
-		tasks[i].Prompt = strings.TrimSpace(in.Prompt)
-		tasks[i].NewSessionCron = strings.TrimSpace(in.NewSessionCron)
-		tasks[i].UpdatedAt = time.Now().UTC()
-		if err := store.Save(tasks); err != nil {
-			return Task{}, err
-		}
-		if err := s.ReloadRoot(in.RootID); err != nil {
-			return Task{}, err
-		}
-		task := tasks[i]
-		s.decorateTask(&task)
-		return task, nil
-	}
-	return Task{}, errors.New("task not found")
+	s.decorateTask(&task)
+	return task, nil
 }
 
 func (s *Service) Delete(ctx context.Context, rootID, id string) error {
-	store, err := s.store(rootID)
-	if err != nil {
-		return err
-	}
-	tasks, err := store.List()
-	if err != nil {
-		return err
-	}
 	id = strings.TrimSpace(id)
-	next := tasks[:0]
-	found := false
-	for _, task := range tasks {
-		if task.ID == id {
-			found = true
-			continue
+	if err := s.mutateTasks(rootID, func(tasks []Task) ([]Task, error) {
+		next := tasks[:0]
+		found := false
+		for _, task := range tasks {
+			if task.ID == id {
+				found = true
+				continue
+			}
+			next = append(next, task)
 		}
-		next = append(next, task)
-	}
-	if !found {
-		return errors.New("task not found")
-	}
-	if err := store.Save(next); err != nil {
+		if !found {
+			return nil, errors.New("task not found")
+		}
+		return next, nil
+	}); err != nil {
 		return err
 	}
 	return s.ReloadRoot(rootID)
@@ -287,14 +271,15 @@ func (s *Service) RunNow(ctx context.Context, rootID, id string) (Task, error) {
 	if err != nil {
 		return Task{}, err
 	}
-	if err := s.runTask(ctx, task, true); err != nil {
-		task.LastError = err.Error()
-	}
+	runErr := s.runTask(ctx, task, true)
 	updated, err := s.findTask(rootID, id)
 	if err != nil {
 		return Task{}, err
 	}
 	s.decorateTask(&updated)
+	if runErr != nil {
+		return updated, runErr
+	}
 	return updated, nil
 }
 
@@ -353,6 +338,24 @@ func (s *Service) store(rootID string) (*Store, error) {
 		return nil, err
 	}
 	return NewStore(root), nil
+}
+
+func (s *Service) mutateTasks(rootID string, mutate func([]Task) ([]Task, error)) error {
+	store, err := s.store(rootID)
+	if err != nil {
+		return err
+	}
+	s.storageMu.Lock()
+	defer s.storageMu.Unlock()
+	tasks, err := store.List()
+	if err != nil {
+		return err
+	}
+	next, err := mutate(tasks)
+	if err != nil {
+		return err
+	}
+	return store.Save(next)
 }
 
 func (s *Service) validateInput(in SaveInput) error {
@@ -535,22 +538,16 @@ func (s *Service) recordRunError(task Task, err error) error {
 }
 
 func (s *Service) updateTask(rootID, id string, update func(*Task)) error {
-	store, err := s.store(rootID)
-	if err != nil {
-		return err
-	}
-	tasks, err := store.List()
-	if err != nil {
-		return err
-	}
-	for i := range tasks {
-		if tasks[i].ID != id {
-			continue
+	return s.mutateTasks(rootID, func(tasks []Task) ([]Task, error) {
+		for i := range tasks {
+			if tasks[i].ID != id {
+				continue
+			}
+			update(&tasks[i])
+			return tasks, nil
 		}
-		update(&tasks[i])
-		return store.Save(tasks)
-	}
-	return errors.New("task not found")
+		return nil, errors.New("task not found")
+	})
 }
 
 func (s *Service) shouldCreateNewSession(task Task, now time.Time) bool {

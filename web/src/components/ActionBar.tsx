@@ -1073,8 +1073,7 @@ export function ActionBar({
   const isSelectedAgentUnavailable = agents.length > 0 ? agents.find((a) => a.name === agent)?.available === false : false;
   const canSend = (!!serializedInput.trim() || pendingAttachments.length > 0) && isConnected && !sending && !currentSession?.pending && (mode === "command" || !!agent);
   const hasBoundSession = !!currentSession;
-  const hasDraft = !!serializedInput.trim() || pendingAttachments.length > 0;
-  const showCancel = !!currentSession?.pending && !!currentSession?.key && !hasDraft;
+  const showCancel = !!currentSession?.pending && !!currentSession?.key;
   const isModeLocked = !!currentSession;
 
   useEffect(() => {

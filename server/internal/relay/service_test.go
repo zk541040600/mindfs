@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -31,6 +32,21 @@ func TestGetOrCreateDeviceIDStable(t *testing.T) {
 	}
 	if second != first {
 		t.Fatalf("device id changed: first=%q second=%q", first, second)
+	}
+	deviceFile := filepath.Join(configRoot, "mindfs", "device.json")
+	info, err := os.Stat(deviceFile)
+	if err != nil {
+		t.Fatalf("Stat device file returned error: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o644 {
+		t.Fatalf("device file mode = %v, want 0644", got)
+	}
+	temps, err := filepath.Glob(filepath.Join(filepath.Dir(deviceFile), "device.json.tmp-*"))
+	if err != nil {
+		t.Fatalf("Glob temp files returned error: %v", err)
+	}
+	if len(temps) != 0 {
+		t.Fatalf("device temp files left behind: %#v", temps)
 	}
 }
 
@@ -69,6 +85,48 @@ func TestCredentialsStoreSaveLoad(t *testing.T) {
 	}
 	if info.Mode().Perm() != 0o600 {
 		t.Fatalf("credentials file mode = %o, want 0600", info.Mode().Perm())
+	}
+	temps, err := filepath.Glob(filepath.Join(filepath.Dir(store.filePath), "credentials.json.tmp-*"))
+	if err != nil {
+		t.Fatalf("Glob credential temp files returned error: %v", err)
+	}
+	if len(temps) != 0 {
+		t.Fatalf("credential temp files left behind: %#v", temps)
+	}
+}
+
+func TestServiceStoreSaveTightensExistingFilePermissions(t *testing.T) {
+	configRoot := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", configRoot)
+	t.Setenv("HOME", configRoot)
+
+	store, err := NewServiceStore()
+	if err != nil {
+		t.Fatalf("NewServiceStore() error = %v", err)
+	}
+	if err := os.WriteFile(store.filePath, []byte(`{"services":[]}`), 0o644); err != nil {
+		t.Fatalf("WriteFile setup error = %v", err)
+	}
+	if err := os.Chmod(store.filePath, 0o644); err != nil {
+		t.Fatalf("Chmod setup error = %v", err)
+	}
+
+	if err := store.Save(LocalService{Slug: "demo-service", Name: "Demo", LocalURL: "http://localhost:3000", Enabled: false}); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	info, err := os.Stat(store.filePath)
+	if err != nil {
+		t.Fatalf("service file missing: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("service file mode = %o, want 0600", got)
+	}
+	temps, err := filepath.Glob(filepath.Join(filepath.Dir(store.filePath), "services.json.tmp-*"))
+	if err != nil {
+		t.Fatalf("Glob service temp files returned error: %v", err)
+	}
+	if len(temps) != 0 {
+		t.Fatalf("service temp files left behind: %#v", temps)
 	}
 }
 
@@ -109,6 +167,28 @@ func TestBuildBindPollURL(t *testing.T) {
 	}
 	if got != "https://relay.example.com/api/bind/poll?code=pc_123" {
 		t.Fatalf("buildBindPollURL() = %q", got)
+	}
+}
+
+func TestSanitizeTipHrefAllowsOnlySafeExternalProtocols(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "https", raw: "https://a9gent.com/mindfs", want: "https://a9gent.com/mindfs"},
+		{name: "mailto", raw: "mailto:support@example.com", want: "mailto:support@example.com"},
+		{name: "tel", raw: "tel:+123456789", want: "tel:+123456789"},
+		{name: "javascript", raw: "javascript:alert(1)", want: ""},
+		{name: "relative", raw: "/login", want: ""},
+		{name: "invalid", raw: "http://%zz", want: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := sanitizeTipHref(tt.raw); got != tt.want {
+				t.Fatalf("sanitizeTipHref(%q) = %q, want %q", tt.raw, got, tt.want)
+			}
+		})
 	}
 }
 

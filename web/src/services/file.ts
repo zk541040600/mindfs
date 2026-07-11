@@ -70,6 +70,12 @@ type FileResponse = {
   file?: FilePayload | null;
 };
 
+type ProtectedBlobEnvelope = {
+  nonce: string;
+  ciphertext: string;
+  content_type?: string;
+};
+
 const DB_NAME = "mindfs-file-cache";
 const DB_VERSION = 1;
 const STORE_NAME = "files";
@@ -638,6 +644,11 @@ export async function fetchProofProtectedBlob(params: {
       }
       throw new Error(`open raw file failed: status=${response.status}`);
     }
+    if (e2eeService.isRequired()) {
+      const envelope = (await response.json()) as ProtectedBlobEnvelope;
+      const plaintext = await e2eeService.decryptEnvelopeBytes(envelope);
+      return new Blob([bytesToBlobPart(plaintext)], { type: envelope.content_type || "application/octet-stream" });
+    }
     return response.blob();
   } finally {
     if (request.timer !== null) {
@@ -651,6 +662,12 @@ async function unwrapFileResponse(payload: FileResponse): Promise<FilePayload | 
     return payload.file;
   }
   return null;
+}
+
+function bytesToBlobPart(bytes: Uint8Array): BlobPart {
+  const copy = new Uint8Array(bytes.byteLength);
+  copy.set(bytes);
+  return copy.buffer;
 }
 
 function withRawFlag(url: string): string {

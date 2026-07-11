@@ -66,6 +66,38 @@ func TestCleanupExpiredZeroesExpiredSessionKey(t *testing.T) {
 	}
 }
 
+func TestSessionForClientNoTouchDoesNotRefreshLastSeen(t *testing.T) {
+	manager := newTestManager()
+	if _, err := manager.OpenSessionForClient("client", DerivedKey{Transport: []byte("0123456789abcdef0123456789abcdef")}); err != nil {
+		t.Fatalf("OpenSessionForClient: %v", err)
+	}
+	oldSeen := time.Now().Add(-time.Hour).UTC()
+	manager.mu.Lock()
+	sessionID := manager.clientIDs["client"]
+	manager.sessions[sessionID].LastSeenAt = oldSeen
+	manager.mu.Unlock()
+
+	if _, err := manager.SessionForClientNoTouch("client"); err != nil {
+		t.Fatalf("SessionForClientNoTouch: %v", err)
+	}
+	manager.mu.RLock()
+	got := manager.sessions[sessionID].LastSeenAt
+	manager.mu.RUnlock()
+	if !got.Equal(oldSeen) {
+		t.Fatalf("LastSeenAt changed to %s, want %s", got, oldSeen)
+	}
+
+	if err := manager.TouchSessionForClient("client"); err != nil {
+		t.Fatalf("TouchSessionForClient: %v", err)
+	}
+	manager.mu.RLock()
+	got = manager.sessions[sessionID].LastSeenAt
+	manager.mu.RUnlock()
+	if !got.After(oldSeen) {
+		t.Fatalf("LastSeenAt = %s, want after %s", got, oldSeen)
+	}
+}
+
 func newTestManager() *Manager {
 	return NewManager(Config{
 		Enabled:       true,

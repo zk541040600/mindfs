@@ -130,6 +130,22 @@ function matchesRule(file: PluginInput, rule: MatchRule): boolean {
   return true;
 }
 
+function isValidPluginOutput(value: unknown): value is PluginOutput {
+  if (!value || typeof value !== "object") return false;
+  const output = value as Record<string, unknown>;
+  const tree = output.tree as Record<string, unknown> | undefined;
+  return (
+    !!tree &&
+    typeof tree === "object" &&
+    typeof tree.root === "string" &&
+    tree.root.trim().length > 0 &&
+    !!tree.elements &&
+    typeof tree.elements === "object" &&
+    !Array.isArray(tree.elements) &&
+    (output.data === undefined || (!!output.data && typeof output.data === "object" && !Array.isArray(output.data)))
+  );
+}
+
 function isValidPlugin(value: unknown): value is ViewPlugin {
   if (!value || typeof value !== "object") return false;
   const plugin = value as Record<string, unknown>;
@@ -189,7 +205,11 @@ export class PluginManager {
   }
 
   run(plugin: ViewPlugin, file: PluginInput): PluginOutput {
-    return plugin.process(file);
+    const output = plugin.process(file);
+    if (!isValidPluginOutput(output)) {
+      throw new Error("invalid plugin output");
+    }
+    return output;
   }
 
   viewContext(plugin: ViewPlugin, file: PluginInput): PluginViewContext {

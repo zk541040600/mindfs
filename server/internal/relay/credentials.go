@@ -67,10 +67,38 @@ func (s *CredentialsStore) Save(creds Credentials) error {
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(s.filePath, payload, 0o600); err != nil {
+	return writePrivateFileAtomic(s.filePath, payload)
+}
+
+func writePrivateFileAtomic(path string, payload []byte) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
+	if err != nil {
 		return err
 	}
-	return os.Chmod(s.filePath, 0o600)
+	tmpName := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if _, err := tmp.Write(payload); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	cleanup = false
+	return os.Chmod(path, 0o600)
 }
 
 func (s *CredentialsStore) Clear() error {

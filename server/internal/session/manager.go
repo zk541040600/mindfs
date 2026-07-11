@@ -906,6 +906,9 @@ func (m *Manager) createSessionUnsafe(session *Session) error {
 	if session == nil {
 		return errors.New("session required")
 	}
+	if err := validateSessionKey(session.Key); err != nil {
+		return err
+	}
 	if _, ok := m.sessions[session.Key]; ok {
 		return fmt.Errorf("session already exists: %s", session.Key)
 	}
@@ -1312,11 +1315,8 @@ func (m *Manager) exchangePath(key string) (string, error) {
 	if strings.TrimSpace(m.root.MetaDir()) == "" {
 		return "", errors.New("managed dir required")
 	}
-	if key == "" {
-		return "", errors.New("session key required")
-	}
-	if strings.Contains(key, "..") || strings.ContainsRune(key, filepath.Separator) || strings.Contains(key, "/") {
-		return "", fmt.Errorf("invalid session key: %s", key)
+	if err := validateSessionKey(key); err != nil {
+		return "", err
 	}
 	return filepath.ToSlash(fmt.Sprintf(exchangeFileTpl, key)), nil
 }
@@ -1325,13 +1325,20 @@ func (m *Manager) auxPath(key string) (string, error) {
 	if strings.TrimSpace(m.root.MetaDir()) == "" {
 		return "", errors.New("managed dir required")
 	}
-	if key == "" {
-		return "", errors.New("session key required")
-	}
-	if strings.Contains(key, "..") || strings.ContainsRune(key, filepath.Separator) || strings.Contains(key, "/") {
-		return "", fmt.Errorf("invalid session key: %s", key)
+	if err := validateSessionKey(key); err != nil {
+		return "", err
 	}
 	return filepath.ToSlash(fmt.Sprintf(auxFileTpl, key)), nil
+}
+
+func validateSessionKey(key string) error {
+	if key == "" {
+		return errors.New("session key required")
+	}
+	if key == "." || key == ".." || strings.Contains(key, "/") || strings.Contains(key, "\\") {
+		return fmt.Errorf("invalid session key: %s", key)
+	}
+	return nil
 }
 
 func (m *Manager) ensureSessionMetaDBUnsafe() (*sql.DB, error) {

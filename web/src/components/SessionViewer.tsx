@@ -1,4 +1,4 @@
-import React, { memo, useEffect, useRef, useState } from "react";
+import React, { memo, useCallback, useEffect, useRef, useState } from "react";
 import { useSessionStream, type TimelineItem } from "../hooks/useSessionStream";
 import type { TodoUpdate } from "../services/session";
 import { ThinkingBlock } from "./stream/ThinkingBlock";
@@ -858,6 +858,14 @@ function SessionViewerInner({
   const targetSeqFrameRef = useRef<number | null>(null);
   const targetSeqTimerRefs = useRef<number[]>([]);
   const [showJumpToLatest, setShowJumpToLatest] = useState(false);
+  const showJumpToLatestRef = useRef(false);
+  const setShowJumpToLatestIfChanged = useCallback((next: boolean) => {
+    if (showJumpToLatestRef.current === next) {
+      return;
+    }
+    showJumpToLatestRef.current = next;
+    setShowJumpToLatest(next);
+  }, []);
 
   const cancelTargetSeqScroll = () => {
     if (targetSeqFrameRef.current !== null) {
@@ -935,7 +943,7 @@ function SessionViewerInner({
     const el = scrollRef.current;
     if (!useInnerScrollContainer || !el) {
       shouldStickToBottomRef.current = true;
-      setShowJumpToLatest(false);
+      setShowJumpToLatestIfChanged(false);
       return;
     }
     let lastScrollTop = el.scrollTop;
@@ -955,7 +963,7 @@ function SessionViewerInner({
       } else if (movedDown && distanceFromBottom < 200) {
         shouldStickToBottomRef.current = true;
       }
-      setShowJumpToLatest(!shouldStickToBottomRef.current);
+      setShowJumpToLatestIfChanged(!shouldStickToBottomRef.current);
       lastScrollTop = el.scrollTop;
     };
     updateStickiness();
@@ -963,7 +971,7 @@ function SessionViewerInner({
     return () => {
       el.removeEventListener("scroll", updateStickiness);
     };
-  }, [sessionKey, useInnerScrollContainer]);
+  }, [sessionKey, setShowJumpToLatestIfChanged, useInnerScrollContainer]);
 
   useEffect(() => {
     if (!targetSeq) {
@@ -2035,7 +2043,7 @@ function SessionViewerInner({
                 targetSeqScrollKeyRef.current = `${sessionKey || ""}:${targetSeq}:${targetSeqRequestKey}`;
               }
               shouldStickToBottomRef.current = true;
-              setShowJumpToLatest(false);
+              setShowJumpToLatestIfChanged(false);
               scrollEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
             }}
             aria-label="回到底部最新消息"

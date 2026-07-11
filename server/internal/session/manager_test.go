@@ -9,6 +9,41 @@ import (
 	rootfs "mindfs/server/internal/fs"
 )
 
+func TestManagerSessionPathAcceptsDotDotSubstring(t *testing.T) {
+	root := rootfs.NewRootInfo("mindfs", "mindfs", t.TempDir())
+	manager := NewManager(root)
+
+	if _, err := manager.exchangePath("abc..def"); err != nil {
+		t.Fatalf("exchangePath rejected key with dot-dot substring: %v", err)
+	}
+	for _, key := range []string{"..", "a/b", `a\\b`} {
+		if _, err := manager.exchangePath(key); err == nil {
+			t.Fatalf("exchangePath(%q) error = nil, want invalid session key", key)
+		}
+	}
+}
+
+func TestManagerCreateRejectsInvalidKeyBeforePersistingMeta(t *testing.T) {
+	root := rootfs.NewRootInfo("mindfs", "mindfs", t.TempDir())
+	manager := NewManager(root)
+
+	_, err := manager.Create(context.Background(), CreateInput{
+		Key:  "bad/key",
+		Type: TypeChat,
+		Name: "Bad",
+	})
+	if err == nil || !strings.Contains(err.Error(), "invalid session key") {
+		t.Fatalf("Create invalid key error = %v, want invalid session key", err)
+	}
+	sessions, err := manager.List(context.Background(), ListOptions{})
+	if err != nil {
+		t.Fatalf("List after invalid create returned error: %v", err)
+	}
+	if len(sessions) != 0 {
+		t.Fatalf("persisted %d sessions after invalid create, want 0", len(sessions))
+	}
+}
+
 func TestManagerPersistsParentSessionMetadata(t *testing.T) {
 	root := rootfs.NewRootInfo("mindfs", "mindfs", t.TempDir())
 	manager := NewManager(root)

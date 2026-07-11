@@ -5,13 +5,26 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
 	"mindfs/server/internal/agent"
 	agenttypes "mindfs/server/internal/agent/types"
 	"mindfs/server/internal/e2ee"
+
+	"github.com/gorilla/websocket"
 )
+
+func TestSessionDoneResponseIncludesRequestIDPayload(t *testing.T) {
+	resp := buildSessionDoneResponse("root", "session", "msg-123")
+	if resp.ID != "msg-123" {
+		t.Fatalf("ID = %q, want request id", resp.ID)
+	}
+	if got := resp.Payload["request_id"]; got != "msg-123" {
+		t.Fatalf("payload request_id = %#v, want msg-123", got)
+	}
+}
 
 func TestParseClientContext(t *testing.T) {
 	payload := map[string]any{
@@ -209,6 +222,43 @@ func TestStreamHubUnfreezeQueueAllowsAutomaticPop(t *testing.T) {
 	}
 }
 
+func TestAcknowledgeStaleSessionCancelKeepsActiveTurnAndUnfreezesQueue(t *testing.T) {
+	hub := NewStreamHub(nil)
+	rootID := "root"
+	sessionKey := "session"
+	hub.SetPendingUser(rootID, sessionKey, "Session", "pi", "", "", "", "", "new turn")
+	hub.EnqueueSessionMessage(rootID, sessionKey, "Session", QueuedUserMessage{
+		ID: "queued",
+		PendingUserMessage: PendingUserMessage{
+			Content:   "queued message",
+			Timestamp: time.Now().UTC(),
+		},
+	})
+	if _, frozen := hub.FreezeQueuedSessionMessages(sessionKey); !frozen {
+		t.Fatal("expected queue freeze to succeed")
+	}
+
+	handler := &WSHandler{}
+	handler.acknowledgeStaleSessionCancel(nil, "client", "cancel-ws-id", rootID, sessionKey, "old-request", hub)
+
+	if !hub.IsSessionReplying(sessionKey) {
+		t.Fatal("stale cancel acknowledgement cleared the newer active turn")
+	}
+	item, _, ok := hub.PopQueuedSessionMessage(sessionKey, "")
+	if !ok {
+		t.Fatal("stale cancel acknowledgement left the queue frozen")
+	}
+	if item.ID != "queued" {
+		t.Fatalf("popped item = %q, want queued", item.ID)
+	}
+	hub.mu.RLock()
+	completed := hub.completed[sessionKey]
+	hub.mu.RUnlock()
+	if completed != nil {
+		t.Fatalf("stale cancel stored replay completion: %#v", completed)
+	}
+}
+
 func TestRequireWSProofAcceptsValidProof(t *testing.T) {
 	clientID := "web-test"
 	key := []byte("0123456789abcdef0123456789abcdef")
@@ -251,5 +301,30 @@ func TestWSProofPathExcludesProofQueryParams(t *testing.T) {
 
 	if got, want := wsProofPath(req), "/ws?client_id=web-test"; got != want {
 		t.Fatalf("wsProofPath() = %q, want %q", got, want)
+	}
+}
+
+func TestWSRejectsMessagesOverReadLimit(t *testing.T) {
+	oldLimit := wsReadLimitBytes
+	wsReadLimitBytes = 32
+	t.Cleanup(func() { wsReadLimitBytes = oldLimit })
+
+	server := httptest.NewServer(&WSHandler{})
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws?client_id=limit-test"
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer conn.Close()
+
+	payload := strings.Repeat("x", int(wsReadLimitBytes)+1)
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(payload)); err != nil {
+		t.Fatalf("WriteMessage: %v", err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+	if _, _, err := conn.ReadMessage(); err == nil {
+		t.Fatal("expected websocket read to fail after oversized message")
 	}
 }

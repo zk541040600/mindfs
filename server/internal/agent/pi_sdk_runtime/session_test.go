@@ -11,9 +11,52 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	agenttypes "mindfs/server/internal/agent/types"
 )
+
+func TestPreviewTruncatesUTF8Safely(t *testing.T) {
+	got := preview(strings.Repeat("界", 180))
+	if !utf8.ValidString(got) {
+		t.Fatalf("preview is not valid UTF-8: %q", got)
+	}
+	if !strings.HasSuffix(got, "...") {
+		t.Fatalf("preview missing ellipsis: %q", got)
+	}
+}
+
+func TestWithDefaultTimeoutAddsCancellableDeadline(t *testing.T) {
+	ctx, cancel := withDefaultTimeout(context.Background())
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		t.Fatal("withDefaultTimeout did not add a deadline")
+	}
+	if !deadline.After(time.Now()) || time.Until(deadline) > defaultCommandTimeout {
+		t.Fatalf("deadline = %s, want within default timeout", deadline)
+	}
+
+	cancel()
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("cancel did not close context Done channel")
+	}
+}
+
+func TestWithDefaultTimeoutPreservesExistingDeadline(t *testing.T) {
+	parent, parentCancel := context.WithTimeout(context.Background(), time.Minute)
+	defer parentCancel()
+
+	ctx, cancel := withDefaultTimeout(parent)
+	cancel()
+
+	select {
+	case <-ctx.Done():
+		t.Fatal("returned cancel should not cancel a context that already had a deadline")
+	case <-time.After(20 * time.Millisecond):
+	}
+}
 
 func repoRoot(t *testing.T) string {
 	t.Helper()

@@ -120,7 +120,7 @@ func (i *Importer) ImportExternalSession(_ context.Context, in agenttypes.Import
 		return agenttypes.ImportedExternalSession{}, err
 	}
 	for _, file := range files {
-		if file.AgentSessionID != targetID {
+		if file.AgentSessionID != targetID || normalizeComparablePath(file.Cwd) != rootPath {
 			continue
 		}
 		exchanges, err := readCodexImportedExchanges(file.Path, in.AfterTimestamp)

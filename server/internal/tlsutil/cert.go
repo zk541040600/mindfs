@@ -37,6 +37,9 @@ func EnsureCert(certFile, keyFile string) (string, string, error) {
 	_, certErr := os.Stat(certPath)
 	_, keyErr := os.Stat(keyPath)
 	if certErr == nil && keyErr == nil {
+		if err := os.Chmod(keyPath, 0o600); err != nil {
+			return "", "", fmt.Errorf("failed to secure TLS key permissions: %w", err)
+		}
 		return certPath, keyPath, nil
 	}
 

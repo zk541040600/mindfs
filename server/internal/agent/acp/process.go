@@ -7,11 +7,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"os"
 	"os/exec"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -42,6 +44,9 @@ type Process struct {
 	commands     []acp.AvailableCommand
 	stderrHint   stderrHintState
 	activePrompt activePromptState
+
+	pendingPermissionMu sync.Mutex
+	pendingPermissions  map[string]*pendingPermissionRequest
 }
 
 type CapabilitySnapshot struct {
@@ -73,6 +78,15 @@ type sessionState struct {
 	contextWindow types.ContextWindow
 	onUpdate      func(SessionUpdate)
 	mu            sync.RWMutex
+}
+
+type pendingPermissionResponse struct {
+	optionID  acp.PermissionOptionId
+	cancelled bool
+}
+
+type pendingPermissionRequest struct {
+	ch chan pendingPermissionResponse
 }
 
 type qwenSlashCommandNotification struct {
@@ -153,9 +167,10 @@ func (s *sessionState) getContextWindow() types.ContextWindow {
 
 // SessionUpdate is the internal session update type.
 type SessionUpdate struct {
-	Type      UpdateType
-	SessionID string
-	Raw       acp.SessionUpdate
+	Type        UpdateType
+	SessionID   string
+	Raw         acp.SessionUpdate
+	ExtensionUI *types.ExtensionUIRequest
 }
 
 // UpdateType defines the type of session update.
@@ -168,6 +183,7 @@ const (
 	UpdateTypeToolCall     UpdateType = "tool_call"
 	UpdateTypeToolUpdate   UpdateType = "tool_update"
 	UpdateTypeMessageDone  UpdateType = "message_done"
+	UpdateTypeExtensionUI  UpdateType = "extension_ui"
 )
 
 // mindfsClient implements acp.Client interface
@@ -236,9 +252,11 @@ func (c *mindfsClient) SessionUpdate(ctx context.Context, params acp.SessionNoti
 }
 
 func (c *mindfsClient) RequestPermission(ctx context.Context, params acp.RequestPermissionRequest) (acp.RequestPermissionResponse, error) {
+	requestID := permissionRequestID(params)
+	sessionID := string(params.SessionId)
 	// Emit a synthetic tool_call update for permission-gated operations so upper
 	// layers can track tool execution and associate file paths immediately.
-	if session := c.proc.getSessionByID(string(params.SessionId)); session != nil {
+	if session := c.proc.getSessionByID(sessionID); session != nil {
 		if handler := session.getOnUpdate(); handler != nil {
 			toolCall := &acp.SessionUpdateToolCall{
 				Content:    params.ToolCall.Content,
@@ -246,7 +264,7 @@ func (c *mindfsClient) RequestPermission(ctx context.Context, params acp.Request
 				RawInput:   params.ToolCall.RawInput,
 				RawOutput:  params.ToolCall.RawOutput,
 				Title:      "",
-				ToolCallId: params.ToolCall.ToolCallId,
+				ToolCallId: acp.ToolCallId(requestID),
 				Status:     acp.ToolCallStatusPending,
 			}
 			if params.ToolCall.Title != nil {
@@ -262,41 +280,244 @@ func (c *mindfsClient) RequestPermission(ctx context.Context, params acp.Request
 			}
 			handler(SessionUpdate{
 				Type:      UpdateTypeToolCall,
-				SessionID: string(params.SessionId),
+				SessionID: sessionID,
 				Raw: acp.SessionUpdate{
 					ToolCall: toolCall,
 				},
 			})
 		}
 	}
-	// TODO: Forward to frontend for user approval
-	// For now, auto-approve with first allow option
-	for _, opt := range params.Options {
-		if opt.Kind == acp.PermissionOptionKindAllowOnce || opt.Kind == acp.PermissionOptionKindAllowAlways {
-			return acp.RequestPermissionResponse{
-				Outcome: acp.RequestPermissionOutcome{
-					Selected: &acp.RequestPermissionOutcomeSelected{
-						OptionId: opt.OptionId,
-					},
-				},
-			}, nil
-		}
+
+	if len(params.Options) == 0 {
+		return acp.RequestPermissionResponse{Outcome: newCancelledPermissionOutcome()}, nil
 	}
-	// Fallback to first option
-	if len(params.Options) > 0 {
+
+	session := c.proc.getSessionByID(sessionID)
+	if session == nil {
+		log.Printf("[agent/acp] permission.cancel agent=%s session_id=%s request_id=%s reason=no_session", c.proc.agentLabel(), sessionID, requestID)
+		return acp.RequestPermissionResponse{Outcome: newCancelledPermissionOutcome()}, nil
+	}
+	handler := session.getOnUpdate()
+	if handler == nil {
+		log.Printf("[agent/acp] permission.cancel agent=%s session_id=%s request_id=%s reason=no_session_handler", c.proc.agentLabel(), sessionID, requestID)
+		return acp.RequestPermissionResponse{Outcome: newCancelledPermissionOutcome()}, nil
+	}
+
+	pending, err := c.proc.registerPendingPermission(sessionID, requestID)
+	if err != nil {
+		return acp.RequestPermissionResponse{Outcome: newCancelledPermissionOutcome()}, err
+	}
+	defer c.proc.removePendingPermission(sessionID, requestID)
+
+	handler(SessionUpdate{
+		Type:      UpdateTypeExtensionUI,
+		SessionID: sessionID,
+		ExtensionUI: &types.ExtensionUIRequest{
+			ID:      requestID,
+			Method:  "select",
+			Payload: buildPermissionPayload(params),
+		},
+	})
+
+	select {
+	case <-ctx.Done():
+		return acp.RequestPermissionResponse{Outcome: newCancelledPermissionOutcome()}, nil
+	case result := <-pending.ch:
+		if result.cancelled || result.optionID == "" {
+			return acp.RequestPermissionResponse{Outcome: newCancelledPermissionOutcome()}, nil
+		}
 		return acp.RequestPermissionResponse{
 			Outcome: acp.RequestPermissionOutcome{
-				Selected: &acp.RequestPermissionOutcomeSelected{
-					OptionId: params.Options[0].OptionId,
-				},
+				Selected: &acp.RequestPermissionOutcomeSelected{OptionId: result.optionID},
 			},
 		}, nil
 	}
-	return acp.RequestPermissionResponse{
-		Outcome: acp.RequestPermissionOutcome{
-			Cancelled: &acp.RequestPermissionOutcomeCancelled{},
-		},
-	}, nil
+}
+
+func permissionRequestID(params acp.RequestPermissionRequest) string {
+	requestID := strings.TrimSpace(string(params.ToolCall.ToolCallId))
+	if requestID != "" {
+		return requestID
+	}
+	return "permission-" + strconv.FormatInt(time.Now().UnixNano(), 10)
+}
+
+func newCancelledPermissionOutcome() acp.RequestPermissionOutcome {
+	return acp.RequestPermissionOutcome{
+		Cancelled: &acp.RequestPermissionOutcomeCancelled{},
+	}
+}
+
+func buildPermissionPayload(params acp.RequestPermissionRequest) map[string]any {
+	payload := map[string]any{
+		"title":   "Agent permission request",
+		"message": permissionMessage(params),
+		"options": permissionOptionsPayload(params.Options),
+	}
+	if title := permissionToolTitle(params.ToolCall); title != "" {
+		payload["toolTitle"] = title
+		payload["title"] = title
+	}
+	if len(params.ToolCall.Locations) > 0 {
+		locations := make([]map[string]any, 0, len(params.ToolCall.Locations))
+		for _, loc := range params.ToolCall.Locations {
+			item := map[string]any{"path": loc.Path}
+			if loc.Line != nil {
+				item["line"] = *loc.Line
+			}
+			locations = append(locations, item)
+		}
+		payload["locations"] = locations
+	}
+	if !isEmptyRawValue(params.ToolCall.RawInput) {
+		payload["rawInput"] = params.ToolCall.RawInput
+	}
+	return payload
+}
+
+func permissionToolTitle(toolCall acp.ToolCallUpdate) string {
+	if toolCall.Title == nil {
+		return ""
+	}
+	return strings.TrimSpace(*toolCall.Title)
+}
+
+func permissionMessage(params acp.RequestPermissionRequest) string {
+	parts := []string{"Agent requested permission before running a tool."}
+	if title := permissionToolTitle(params.ToolCall); title != "" {
+		parts = append(parts, title)
+	}
+	if len(params.ToolCall.Locations) > 0 {
+		paths := make([]string, 0, len(params.ToolCall.Locations))
+		for _, loc := range params.ToolCall.Locations {
+			if strings.TrimSpace(loc.Path) != "" {
+				paths = append(paths, loc.Path)
+			}
+		}
+		if len(paths) > 0 {
+			parts = append(parts, "Affected paths: "+strings.Join(paths, ", "))
+		}
+	}
+	return strings.Join(parts, "\n")
+}
+
+func permissionOptionsPayload(options []acp.PermissionOption) []map[string]any {
+	items := make([]map[string]any, 0, len(options))
+	for _, opt := range options {
+		label := strings.TrimSpace(opt.Name)
+		optionID := strings.TrimSpace(string(opt.OptionId))
+		if label == "" {
+			label = optionID
+		}
+		item := map[string]any{
+			"label": label,
+			"value": optionID,
+			"kind":  string(opt.Kind),
+		}
+		if opt.Kind != "" {
+			item["description"] = string(opt.Kind)
+		}
+		items = append(items, item)
+	}
+	return items
+}
+
+func permissionKey(sessionID, requestID string) string {
+	return strings.TrimSpace(sessionID) + "\x00" + strings.TrimSpace(requestID)
+}
+
+func (p *Process) registerPendingPermission(sessionID, requestID string) (*pendingPermissionRequest, error) {
+	if p == nil {
+		return nil, errors.New("acp process not initialized")
+	}
+	sessionID = strings.TrimSpace(sessionID)
+	requestID = strings.TrimSpace(requestID)
+	if sessionID == "" || requestID == "" {
+		return nil, errors.New("permission session id and request id required")
+	}
+	pending := &pendingPermissionRequest{ch: make(chan pendingPermissionResponse, 1)}
+	key := permissionKey(sessionID, requestID)
+	p.pendingPermissionMu.Lock()
+	defer p.pendingPermissionMu.Unlock()
+	if p.pendingPermissions == nil {
+		p.pendingPermissions = make(map[string]*pendingPermissionRequest)
+	}
+	if _, exists := p.pendingPermissions[key]; exists {
+		return nil, errors.New("permission request is already pending: " + requestID)
+	}
+	p.pendingPermissions[key] = pending
+	return pending, nil
+}
+
+func (p *Process) removePendingPermission(sessionID, requestID string) {
+	if p == nil {
+		return
+	}
+	p.pendingPermissionMu.Lock()
+	delete(p.pendingPermissions, permissionKey(sessionID, requestID))
+	p.pendingPermissionMu.Unlock()
+}
+
+func (p *Process) resolvePendingPermission(sessionKey string, response types.ExtensionUIResponse) error {
+	if p == nil {
+		return errors.New("acp process not initialized")
+	}
+	requestID := strings.TrimSpace(response.RequestID)
+	if requestID == "" {
+		return errors.New("permission requestId required")
+	}
+	if requested := strings.TrimSpace(response.Method); requested != "" && requested != "select" {
+		return fmt.Errorf("permission UI method mismatch for %s: got %s want select", requestID, requested)
+	}
+	optionID := acp.PermissionOptionId(strings.TrimSpace(response.Value))
+	if !response.Cancelled && optionID == "" {
+		return errors.New("permission option required")
+	}
+	sess := p.getSessionByKey(sessionKey)
+	if sess == nil {
+		return errors.New("acp session not found")
+	}
+	pending := p.takePendingPermission(string(sess.ID), requestID)
+	if pending == nil {
+		return errors.New("permission request is not pending: " + requestID)
+	}
+	pending.ch <- pendingPermissionResponse{optionID: optionID, cancelled: response.Cancelled}
+	return nil
+}
+
+func (p *Process) takePendingPermission(sessionID, requestID string) *pendingPermissionRequest {
+	if p == nil {
+		return nil
+	}
+	key := permissionKey(sessionID, requestID)
+	p.pendingPermissionMu.Lock()
+	defer p.pendingPermissionMu.Unlock()
+	pending := p.pendingPermissions[key]
+	delete(p.pendingPermissions, key)
+	return pending
+}
+
+func (p *Process) cancelPendingPermissionsForSession(sessionID string) {
+	if p == nil {
+		return
+	}
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return
+	}
+	prefix := sessionID + "\x00"
+	var pending []*pendingPermissionRequest
+	p.pendingPermissionMu.Lock()
+	for key, request := range p.pendingPermissions {
+		if strings.HasPrefix(key, prefix) {
+			pending = append(pending, request)
+			delete(p.pendingPermissions, key)
+		}
+	}
+	p.pendingPermissionMu.Unlock()
+	for _, request := range pending {
+		request.ch <- pendingPermissionResponse{cancelled: true}
+	}
 }
 
 func (c *mindfsClient) ReadTextFile(ctx context.Context, params acp.ReadTextFileRequest) (acp.ReadTextFileResponse, error) {
@@ -347,10 +568,12 @@ func (c *mindfsClient) handleQwenSlashCommandNotification(params json.RawMessage
 	}
 	handler := c.proc.getSessionUpdateHandler(notif.SessionID)
 	if handler == nil {
+		log.Printf("[agent/acp] ext.notification.drop agent=%s method=_qwencode/slash_command session_id=%s reason=no_session_handler command=%q message_type=%s", c.proc.agentLabel(), notif.SessionID, notif.Command, notif.MessageType)
 		return nil
 	}
 	content := notif.Message
 	if content == "" {
+		log.Printf("[agent/acp] ext.notification.drop agent=%s method=_qwencode/slash_command session_id=%s reason=empty_message command=%q message_type=%s", c.proc.agentLabel(), notif.SessionID, notif.Command, notif.MessageType)
 		return nil
 	}
 	log.Printf("[agent/acp] ext.notification agent=%s method=_qwencode/slash_command session_id=%s command=%q message_type=%s", c.proc.agentLabel(), notif.SessionID, notif.Command, notif.MessageType)
@@ -603,6 +826,11 @@ func (p *Process) SendMessage(ctx context.Context, sessionKey, content string) e
 func (p *Process) CancelCurrentTurn(sessionKey string) error {
 	sess := p.getSessionByKey(sessionKey)
 	if sess == nil {
+		return nil
+	}
+	p.cancelPendingPermissionsForSession(string(sess.ID))
+	p.cancelActivePrompt()
+	if p.conn == nil {
 		return nil
 	}
 	return p.conn.Cancel(context.Background(), acp.CancelNotification{

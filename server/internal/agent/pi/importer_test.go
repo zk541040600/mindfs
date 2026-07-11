@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	pisdkbridge "mindfs/server/internal/agent/pi_sdk_bridge"
 	agenttypes "mindfs/server/internal/agent/types"
@@ -70,6 +71,19 @@ func TestImporterListExternalSessionsUsesSafeSDKMetadata(t *testing.T) {
 	}
 	if item.UpdatedAt.Format(time.RFC3339) != "2026-06-09T04:05:06Z" {
 		t.Fatalf("unexpected updated time: %s", item.UpdatedAt.Format(time.RFC3339))
+	}
+}
+
+func TestSafeSessionTitleTruncatesUTF8Safely(t *testing.T) {
+	title := safeSessionTitle(strings.Repeat("界", 50))
+	if !utf8.ValidString(title) {
+		t.Fatalf("title is not valid UTF-8: %q", title)
+	}
+	if len(title) > 120 {
+		t.Fatalf("title length = %d bytes, want <= 120", len(title))
+	}
+	if title != strings.Repeat("界", 40) {
+		t.Fatalf("unexpected truncated title: %q", title)
 	}
 }
 

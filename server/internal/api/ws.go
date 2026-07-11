@@ -33,7 +33,10 @@ const (
 	sessionDoneMaxWait      = 2 * time.Second
 )
 
-var upgrader = websocket.Upgrader{}
+var (
+	upgrader         = websocket.Upgrader{}
+	wsReadLimitBytes = int64(maxUploadRequestBytes)
+)
 
 // WSHandler manages JSON-RPC over WebSocket.
 type WSHandler struct {
@@ -172,6 +175,7 @@ func (h *WSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
+	conn.SetReadLimit(wsReadLimitBytes)
 	log.Printf("[ws] connected client=%s remote=%s path=%s", clientID, r.RemoteAddr, r.URL.Path)
 	if h.AppContext != nil {
 		h.AppContext.GetSessionStreamHub().RegisterClient(clientID, conn)
@@ -222,7 +226,7 @@ func (h *WSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if e2eeManager := h.AppContext.GetE2EEManager(); e2eeManager != nil && e2eeManager.Enabled() {
-			sess, err := e2eeManager.SessionForClient(clientID)
+			sess, err := e2eeManager.SessionForClientNoTouch(clientID)
 			if err != nil {
 				h.sendE2EEError(conn, "", err.Error())
 				continue
@@ -235,6 +239,10 @@ func (h *WSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			message, err = e2ee.DecryptBytes(sess.Key, &envelope)
 			if err != nil {
 				h.sendE2EEError(conn, "", "e2ee_proof_invalid")
+				continue
+			}
+			if err := e2eeManager.TouchSessionForClient(clientID); err != nil {
+				h.sendE2EEError(conn, "", err.Error())
 				continue
 			}
 		}
@@ -260,7 +268,7 @@ func (h *WSHandler) requireWSProof(r *http.Request, clientID string) error {
 	if clientID == "" || ts == "" || proof == "" {
 		return errInvalidRequest("e2ee_proof_required")
 	}
-	sess, err := manager.SessionForClient(clientID)
+	sess, err := manager.SessionForClientNoTouch(clientID)
 	if err != nil {
 		return errInvalidRequest(err.Error())
 	}
@@ -275,6 +283,9 @@ func (h *WSHandler) requireWSProof(r *http.Request, clientID string) error {
 	expected := e2ee.BuildRequestProof(sess.Key, r.Method, wsProofPath(r), ts, clientID)
 	if !e2ee.VerifyProof(expected, proof) {
 		return errInvalidRequest("e2ee_proof_invalid")
+	}
+	if err := manager.TouchSessionForClient(clientID); err != nil {
+		return errInvalidRequest(err.Error())
 	}
 	return nil
 }
@@ -925,11 +936,18 @@ func (h *WSHandler) handleSessionCancel(ctx context.Context, conn *websocket.Con
 	}
 
 	uc := &usecase.Service{Registry: h.AppContext}
-	if err := uc.CancelSessionTurn(ctx, usecase.CancelSessionTurnInput{
+	turnRequestID := getString(req.Payload, "request_id")
+	err := uc.CancelSessionTurn(ctx, usecase.CancelSessionTurnInput{
 		RootID:    rootID,
 		Key:       key,
-		RequestID: getString(req.Payload, "request_id"),
-	}); err != nil {
+		RequestID: turnRequestID,
+	})
+	if errors.Is(err, usecase.ErrSessionCancelRequestMismatch) {
+		log.Printf("[ws] session.cancel.request_mismatch root=%s session=%s request=%s turn_request=%s action=ack_stale err=%v", rootID, key, req.ID, turnRequestID, err)
+		h.acknowledgeStaleSessionCancel(conn, clientID, req.ID, rootID, key, turnRequestID, streamHub)
+		return
+	}
+	if err != nil {
 		if queue, changed := streamHub.UnfreezeQueuedSessionMessages(key); changed {
 			streamHub.BroadcastSessionQueueUpdated(rootID, key, queue)
 		}
@@ -937,12 +955,25 @@ func (h *WSHandler) handleSessionCancel(ctx context.Context, conn *websocket.Con
 		h.sendWSError(conn, clientID, req.ID, "session.cancel_failed", err.Error())
 		return
 	}
-	h.sendWSCancelled(conn, clientID, req.ID, rootID, key)
+	h.sendWSCancelled(conn, clientID, req.ID, rootID, key, turnRequestID)
 	if h.AppContext != nil {
 		streamHub := h.AppContext.GetSessionStreamHub()
-		streamHub.BroadcastSessionDone(rootID, key, req.ID)
+		doneRequestID := turnRequestID
+		if strings.TrimSpace(doneRequestID) == "" {
+			doneRequestID = req.ID
+		}
+		streamHub.BroadcastSessionDone(rootID, key, doneRequestID)
 		streamHub.ClearSessionPending(key)
 	}
+}
+
+func (h *WSHandler) acknowledgeStaleSessionCancel(conn *websocket.Conn, clientID, responseID, rootID, key, turnRequestID string, streamHub *StreamHub) {
+	if streamHub != nil {
+		if queue, changed := streamHub.UnfreezeQueuedSessionMessages(key); changed {
+			streamHub.BroadcastSessionQueueUpdated(rootID, key, queue)
+		}
+	}
+	h.sendWSCancelled(conn, clientID, responseID, rootID, key, turnRequestID)
 }
 
 func (h *WSHandler) handleSessionQueueRemove(_ context.Context, conn *websocket.Conn, clientID string, req WSRequest) {
@@ -1031,17 +1062,21 @@ func (h *WSHandler) sendE2EEError(conn *websocket.Conn, id, code string) {
 	_ = h.writeWSJSON("", conn, resp)
 }
 
-func (h *WSHandler) sendWSCancelled(conn *websocket.Conn, clientID, id, rootID, sessionKey string) {
+func (h *WSHandler) sendWSCancelled(conn *websocket.Conn, clientID, id, rootID, sessionKey, requestID string) {
 	if conn == nil {
 		return
 	}
+	payload := map[string]any{
+		"root_id":     rootID,
+		"session_key": sessionKey,
+	}
+	if strings.TrimSpace(requestID) != "" {
+		payload["request_id"] = requestID
+	}
 	resp := WSResponse{
-		ID:   id,
-		Type: "session.cancelled",
-		Payload: map[string]any{
-			"root_id":     rootID,
-			"session_key": sessionKey,
-		},
+		ID:      id,
+		Type:    "session.cancelled",
+		Payload: payload,
 	}
 	_ = h.writeWSJSON(clientID, conn, resp)
 }

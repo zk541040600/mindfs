@@ -1302,7 +1302,7 @@ func (s *session) AnswerQuestion(ctx context.Context, answer agenttypes.AskUserA
 	if !s.isPendingQuestion(callID) {
 		return errors.New("question is not pending: " + callID)
 	}
-	_, err := s.request(withDefaultTimeout(ctx), "answer-question", map[string]any{
+	_, err := s.requestWithDefaultTimeout(ctx, "answer-question", map[string]any{
 		"type":      "answer_question",
 		"toolUseId": callID,
 		"answers":   answers,
@@ -1360,7 +1360,7 @@ func (s *session) SetModel(ctx context.Context, model string) error {
 	if provider == "" || modelID == "" {
 		return errors.New("model must be provider/modelId")
 	}
-	_, err := s.request(withDefaultTimeout(ctx), "set-model", map[string]any{"type": "set_model", "provider": provider, "modelId": modelID})
+	_, err := s.requestWithDefaultTimeout(ctx, "set-model", map[string]any{"type": "set_model", "provider": provider, "modelId": modelID})
 	if err != nil {
 		return err
 	}
@@ -1371,7 +1371,7 @@ func (s *session) SetModel(ctx context.Context, model string) error {
 }
 
 func (s *session) ListModels(ctx context.Context) (agenttypes.ModelList, error) {
-	resp, err := s.request(withDefaultTimeout(ctx), "models", map[string]any{"type": "get_available_models"})
+	resp, err := s.requestWithDefaultTimeout(ctx, "models", map[string]any{"type": "get_available_models"})
 	if err != nil {
 		return agenttypes.ModelList{}, err
 	}
@@ -1415,7 +1415,7 @@ func (s *session) SetMode(ctx context.Context, mode string) error {
 	if mode == "" {
 		return nil
 	}
-	_, err := s.request(withDefaultTimeout(ctx), "set-mode", map[string]any{"type": "set_thinking_level", "level": mode})
+	_, err := s.requestWithDefaultTimeout(ctx, "set-mode", map[string]any{"type": "set_thinking_level", "level": mode})
 	if err != nil {
 		return err
 	}
@@ -1446,7 +1446,7 @@ func (s *session) ListModes(ctx context.Context) (agenttypes.ModeList, error) {
 }
 
 func (s *session) ListCommands(ctx context.Context) (agenttypes.CommandList, error) {
-	resp, err := s.request(withDefaultTimeout(ctx), "commands", map[string]any{"type": "get_commands"})
+	resp, err := s.requestWithDefaultTimeout(ctx, "commands", map[string]any{"type": "get_commands"})
 	if err != nil {
 		return agenttypes.CommandList{}, err
 	}
@@ -1476,8 +1476,22 @@ func (s *session) ListCommands(ctx context.Context) (agenttypes.CommandList, err
 	return agenttypes.CommandList{Commands: commands}, nil
 }
 
+func (s *session) cancelPendingExtensionUI() {
+	s.mu.Lock()
+	ids := make([]string, 0, len(s.pendingExtensionUI))
+	for id := range s.pendingExtensionUI {
+		ids = append(ids, id)
+	}
+	s.pendingExtensionUI = make(map[string]string)
+	s.mu.Unlock()
+	for _, id := range ids {
+		_ = s.writeJSON(map[string]any{"type": "extension_ui_response", "id": id, "cancelled": true})
+	}
+}
+
 func (s *session) CancelCurrentTurn() error {
 	s.clearPendingQuestions()
+	s.cancelPendingExtensionUI()
 	abortID := s.nextID("abort")
 	err := s.writeJSON(map[string]any{"type": "abort", "id": abortID})
 	s.turn.Cancel()
@@ -1530,7 +1544,7 @@ func (s *session) cachedContextWindow() agenttypes.ContextWindow {
 }
 
 func (s *session) refreshState(ctx context.Context) error {
-	resp, err := s.request(withDefaultTimeout(ctx), "state", map[string]any{"type": "get_state"})
+	resp, err := s.requestWithDefaultTimeout(ctx, "state", map[string]any{"type": "get_state"})
 	if err != nil {
 		return err
 	}
@@ -1556,15 +1570,20 @@ func (s *session) refreshState(ctx context.Context) error {
 	return nil
 }
 
-func withDefaultTimeout(ctx context.Context) context.Context {
+func (s *session) requestWithDefaultTimeout(ctx context.Context, prefix string, payload map[string]any) (bridgeResponse, error) {
+	timeoutCtx, cancel := withDefaultTimeout(ctx)
+	defer cancel()
+	return s.request(timeoutCtx, prefix, payload)
+}
+
+func withDefaultTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if _, ok := ctx.Deadline(); ok {
-		return ctx
+		return ctx, func() {}
 	}
-	child, _ := context.WithTimeout(ctx, defaultCommandTimeout)
-	return child
+	return context.WithTimeout(ctx, defaultCommandTimeout)
 }
 
 func splitModelID(model string) (string, string) {
@@ -2025,5 +2044,22 @@ func preview(s string) string {
 	if len(s) <= max {
 		return s
 	}
-	return s[:max] + "..."
+	return truncateUTF8ByBytes(s, max) + "..."
+}
+
+func truncateUTF8ByBytes(value string, maxBytes int) string {
+	if maxBytes <= 0 || value == "" {
+		return ""
+	}
+	if len(value) <= maxBytes {
+		return value
+	}
+	end := 0
+	for index := range value {
+		if index > maxBytes {
+			break
+		}
+		end = index
+	}
+	return strings.TrimSpace(value[:end])
 }

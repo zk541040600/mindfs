@@ -189,6 +189,20 @@ func TestVerifyFileSHA256(t *testing.T) {
 	}
 }
 
+func TestDownloadFileRejectsOversizedBodyAndCleansPartialFile(t *testing.T) {
+	url := "https://example.test/artifact.tar.gz"
+	service := NewService("a9gent/mindfs", "v1.2.2", "/tmp/bin/mindfs", nil, time.Hour)
+	service.client = &http.Client{Transport: staticTransport{url: []byte("abcdef")}}
+	dst := filepath.Join(t.TempDir(), "artifact.tar.gz")
+
+	if err := service.downloadFile(context.Background(), url, dst, 3); err == nil {
+		t.Fatal("downloadFile() error = nil, want oversized download error")
+	}
+	if _, err := os.Stat(dst); !os.IsNotExist(err) {
+		t.Fatalf("partial download still exists: %v", err)
+	}
+}
+
 func TestRelayAssetURL(t *testing.T) {
 	name := "mindfs_v0.3.4_windows_amd64.zip"
 	want := "https://relay.a9gent.com/mindfs-downloads/mindfs_v0.3.4_windows_amd64.zip"
@@ -284,6 +298,123 @@ func TestExtractZipRejectsTraversal(t *testing.T) {
 	}
 	if err := extractZip(archivePath, filepath.Join(dir, "out")); err == nil {
 		t.Fatal("extractZip() error = nil, want traversal error")
+	}
+}
+
+func TestReplaceFileRemovesTempFileOnCopyError(t *testing.T) {
+	dir := t.TempDir()
+	dst := filepath.Join(dir, "mindfs")
+	if err := os.WriteFile(dst, []byte("old binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := replaceFile(dir, dst, 0o755); err == nil {
+		t.Fatal("replaceFile() error = nil, want copy error")
+	}
+	if matches, err := filepath.Glob(filepath.Join(dir, ".mindfs.tmp-*")); err != nil {
+		t.Fatal(err)
+	} else if len(matches) != 0 {
+		t.Fatalf("temp files still exist after failed replace: %#v", matches)
+	}
+	payload, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatalf("old file was not preserved: %v", err)
+	}
+	if string(payload) != "old binary" {
+		t.Fatalf("old file content = %q, want old binary", string(payload))
+	}
+}
+
+func TestReplaceFileDoesNotDeleteExistingNeighborOldOrTmp(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "new-mindfs")
+	dst := filepath.Join(dir, "mindfs")
+	if err := os.WriteFile(src, []byte("new binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dst, []byte("old binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dst+".old", []byte("user backup"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dst+".tmp", []byte("user temp"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := replaceFile(src, dst, 0o755); err != nil {
+		t.Fatalf("replaceFile() error = %v", err)
+	}
+	if payload, err := os.ReadFile(dst + ".old"); err != nil || string(payload) != "user backup" {
+		t.Fatalf("neighbor .old = %q err=%v, want user backup", string(payload), err)
+	}
+	if payload, err := os.ReadFile(dst + ".tmp"); err != nil || string(payload) != "user temp" {
+		t.Fatalf("neighbor .tmp = %q err=%v, want user temp", string(payload), err)
+	}
+}
+
+func TestReplaceDirKeepsExistingDirectoryOnCopyError(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink setup requires additional privileges on Windows")
+	}
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	dst := filepath.Join(dir, "web")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(dir, "missing"), filepath.Join(src, "broken-link")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dst, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	oldPath := filepath.Join(dst, "index.html")
+	if err := os.WriteFile(oldPath, []byte("old web"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := replaceDir(src, dst); err == nil {
+		t.Fatal("replaceDir() error = nil, want copy error")
+	}
+	payload, err := os.ReadFile(oldPath)
+	if err != nil {
+		t.Fatalf("old directory was not preserved: %v", err)
+	}
+	if string(payload) != "old web" {
+		t.Fatalf("old file content = %q, want old web", string(payload))
+	}
+}
+
+func TestReplaceDirDoesNotDeleteExistingNeighborOldDirectory(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	dst := filepath.Join(dir, "web")
+	neighborOld := dst + ".old"
+	if err := os.MkdirAll(filepath.Join(src, "assets"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "assets", "index.html"), []byte("new web"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dst, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(neighborOld, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(neighborOld, "keep.txt"), []byte("user backup"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := replaceDir(src, dst); err != nil {
+		t.Fatalf("replaceDir() error = %v", err)
+	}
+	payload, err := os.ReadFile(filepath.Join(neighborOld, "keep.txt"))
+	if err != nil {
+		t.Fatalf("neighbor .old directory was removed: %v", err)
+	}
+	if string(payload) != "user backup" {
+		t.Fatalf("neighbor .old content = %q, want user backup", string(payload))
 	}
 }
 

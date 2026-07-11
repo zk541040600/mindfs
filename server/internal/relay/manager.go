@@ -448,7 +448,13 @@ func (m *Manager) ensurePendingLocked() {
 	if strings.TrimSpace(m.pendingCode) != "" {
 		return
 	}
-	m.pendingCode = generatePendingCode()
+	code, err := generatePendingCode()
+	if err != nil {
+		m.lastError = err.Error()
+		log.Printf("[relay] pending_code.random_failed err=%v", err)
+		return
+	}
+	m.pendingCode = code
 	m.pendingSince = time.Now().UTC()
 }
 
@@ -498,12 +504,12 @@ func nextDelay(current time.Duration) time.Duration {
 	return current
 }
 
-func generatePendingCode() string {
+func generatePendingCode() (string, error) {
 	buf := make([]byte, 18)
 	if _, err := rand.Read(buf); err != nil {
-		panic(err)
+		return "", err
 	}
-	return "pc_" + base64.RawURLEncoding.EncodeToString(buf)
+	return "pc_" + base64.RawURLEncoding.EncodeToString(buf), nil
 }
 
 func defaultNodeName() string {

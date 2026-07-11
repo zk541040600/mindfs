@@ -139,13 +139,17 @@ func buildSessionStreamResponse(rootID, sessionKey string, event *StreamEvent) W
 }
 
 func buildSessionDoneResponse(rootID, sessionKey, requestID string) WSResponse {
+	payload := map[string]any{
+		"root_id":     rootID,
+		"session_key": sessionKey,
+	}
+	if strings.TrimSpace(requestID) != "" {
+		payload["request_id"] = requestID
+	}
 	return WSResponse{
-		ID:   requestID,
-		Type: "session.done",
-		Payload: map[string]any{
-			"root_id":     rootID,
-			"session_key": sessionKey,
-		},
+		ID:      requestID,
+		Type:    "session.done",
+		Payload: payload,
 	}
 }
 

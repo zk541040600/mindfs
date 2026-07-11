@@ -225,20 +225,49 @@ func createAgentConfigBackup(req agentConfigBackupRequest) (agentConfigManifestE
 	if len(sources) == 0 && len(envLines) == 0 {
 		return agentConfigManifestEntry{}, errors.New("config source or environment variables required")
 	}
-	if err := os.RemoveAll(filepath.Join(configRoot, id)); err != nil {
-		return agentConfigManifestEntry{}, apperr.Wrap("remove", filepath.Join(configRoot, id), err)
+	backupDir, err := agentConfigBackupDir(configRoot, id)
+	if err != nil {
+		return agentConfigManifestEntry{}, err
 	}
-	for index, source := range sources {
-		name := fmt.Sprintf("%03d-%s", index+1, filepath.Base(source))
-		rel := filepath.Join(id, name)
-		dst := filepath.Join(configRoot, rel)
-		if err := copyFile(source, dst); err != nil {
+	stagingDir := ""
+	var finalizeBackupReplace func(bool)
+	replaceCommitted := false
+	defer func() {
+		if finalizeBackupReplace != nil {
+			finalizeBackupReplace(replaceCommitted)
+		}
+	}()
+	if len(sources) > 0 {
+		if err := os.MkdirAll(configRoot, 0o755); err != nil {
+			return agentConfigManifestEntry{}, apperr.Wrap("mkdir", configRoot, err)
+		}
+		stagingDir, err = os.MkdirTemp(configRoot, "."+id+".tmp-*")
+		if err != nil {
+			return agentConfigManifestEntry{}, apperr.Wrap("create", configRoot, err)
+		}
+		cleanupStaging := true
+		defer func() {
+			if cleanupStaging {
+				_ = os.RemoveAll(stagingDir)
+			}
+		}()
+		for index, source := range sources {
+			name := fmt.Sprintf("%03d-%s", index+1, filepath.Base(source))
+			rel := filepath.Join(id, name)
+			dst := filepath.Join(stagingDir, name)
+			if err := copyFile(source, dst); err != nil {
+				return agentConfigManifestEntry{}, err
+			}
+			entry.Sources = append(entry.Sources, agentConfigSource{
+				SourcePath: source,
+				BackupPath: filepath.ToSlash(rel),
+			})
+		}
+		finalizeBackupReplace, err = replaceAgentConfigBackupDir(backupDir, stagingDir)
+		if err != nil {
 			return agentConfigManifestEntry{}, err
 		}
-		entry.Sources = append(entry.Sources, agentConfigSource{
-			SourcePath: source,
-			BackupPath: filepath.ToSlash(rel),
-		})
+		cleanupStaging = false
 	}
 	envMap, err := readAgentEnvBackups()
 	if err != nil {
@@ -264,6 +293,7 @@ func createAgentConfigBackup(req agentConfigBackupRequest) (agentConfigManifestE
 	if err := writeAgentConfigManifest(manifest); err != nil {
 		return agentConfigManifestEntry{}, err
 	}
+	replaceCommitted = true
 	return entry, nil
 }
 
@@ -295,8 +325,12 @@ func deleteAgentConfigBackup(id string) ([]agentConfigManifestEntry, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := os.RemoveAll(filepath.Join(configRoot, id)); err != nil {
-		return nil, apperr.Wrap("remove", filepath.Join(configRoot, id), err)
+	backupDir, err := agentConfigBackupDir(configRoot, id)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.RemoveAll(backupDir); err != nil {
+		return nil, apperr.Wrap("remove", backupDir, err)
 	}
 	envBackups, err := readAgentEnvBackups()
 	if err != nil {
@@ -358,7 +392,11 @@ func switchAgentConfig(req agentConfigSwitchRequest, app *AppContext) (agentConf
 		if err != nil {
 			return agentConfigManifestEntry{}, false, err
 		}
-		if err := copyFile(filepath.Join(configRoot, filepath.FromSlash(source.BackupPath)), sourcePath); err != nil {
+		backupPath, err := agentConfigBackupEntryPath(configRoot, entry.ID, source.BackupPath)
+		if err != nil {
+			return agentConfigManifestEntry{}, false, err
+		}
+		if err := copyFile(backupPath, sourcePath); err != nil {
 			return agentConfigManifestEntry{}, false, err
 		}
 	}
@@ -446,7 +484,57 @@ func normalizeAgentConfigRequest(agentName, backupName string) (string, string, 
 	if !agentConfigNamePattern.MatchString(backupName) || strings.Contains(backupName, "..") {
 		return "", "", "", errors.New("backup name may only contain letters, numbers, dot, underscore, and hyphen")
 	}
-	return agentName, backupName, agentName + "-" + backupName, nil
+	id := agentName + "-" + backupName
+	if !validAgentConfigBackupID(id) {
+		return "", "", "", errors.New("backup id may only contain letters, numbers, dot, underscore, and hyphen")
+	}
+	return agentName, backupName, id, nil
+}
+
+func validAgentConfigBackupID(id string) bool {
+	id = strings.TrimSpace(id)
+	return id != "" && agentConfigNamePattern.MatchString(id) && !strings.Contains(id, "..") && !strings.ContainsAny(id, `/\\`)
+}
+
+func agentConfigBackupDir(configRoot, id string) (string, error) {
+	if !validAgentConfigBackupID(id) {
+		return "", errors.New("invalid backup id")
+	}
+	return agentConfigBackupPath(configRoot, id)
+}
+
+func agentConfigBackupPath(configRoot, relPath string) (string, error) {
+	configRoot = filepath.Clean(configRoot)
+	relPath = strings.TrimSpace(relPath)
+	if relPath == "" || filepath.IsAbs(relPath) {
+		return "", errors.New("invalid backup path")
+	}
+	clean := filepath.Clean(filepath.FromSlash(relPath))
+	if clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return "", errors.New("invalid backup path")
+	}
+	target := filepath.Join(configRoot, clean)
+	rel, err := filepath.Rel(configRoot, target)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return "", errors.New("backup path outside root")
+	}
+	return target, nil
+}
+
+func agentConfigBackupEntryPath(configRoot, id, relPath string) (string, error) {
+	backupDir, err := agentConfigBackupDir(configRoot, id)
+	if err != nil {
+		return "", err
+	}
+	target, err := agentConfigBackupPath(configRoot, relPath)
+	if err != nil {
+		return "", err
+	}
+	rel, err := filepath.Rel(backupDir, target)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return "", errors.New("backup path outside entry")
+	}
+	return target, nil
 }
 
 func normalizeFileSources(input []string) ([]string, error) {
@@ -593,7 +681,7 @@ func updateAgentConfigDefaults(agentName string, fileSources []string, envKeys [
 		return err
 	}
 	payload = append(payload, '\n')
-	return apperr.Wrap("write", path, os.WriteFile(path, payload, 0o644))
+	return writeAgentConfigFileAtomic(path, payload)
 }
 
 func updateAgentEnvConfig(agentName string, env map[string]string) error {
@@ -625,7 +713,7 @@ func updateAgentEnvConfig(agentName string, env map[string]string) error {
 		return err
 	}
 	payload = append(payload, '\n')
-	return apperr.Wrap("write", path, os.WriteFile(path, payload, 0o644))
+	return writeAgentConfigFileAtomic(path, payload)
 }
 
 func cloneStringMap(input map[string]string) map[string]string {
@@ -674,7 +762,7 @@ func writeAgentConfigManifest(manifest []agentConfigManifestEntry) error {
 		return err
 	}
 	payload = append(payload, '\n')
-	return apperr.Wrap("write", path, os.WriteFile(path, payload, 0o644))
+	return writeAgentConfigFileAtomic(path, payload)
 }
 
 func readAgentEnvBackups() (map[string][]string, error) {
@@ -715,7 +803,38 @@ func writeAgentEnvBackups(env map[string][]string) error {
 		return err
 	}
 	payload = append(payload, '\n')
-	return apperr.Wrap("write", path, os.WriteFile(path, payload, 0o644))
+	return writeAgentConfigFileAtomic(path, payload)
+}
+
+func writeAgentConfigFileAtomic(path string, payload []byte) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return apperr.Wrap("create", dir, err)
+	}
+	tmpName := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if _, err := tmp.Write(payload); err != nil {
+		_ = tmp.Close()
+		return apperr.Wrap("write", tmpName, err)
+	}
+	if err := tmp.Chmod(0o644); err != nil {
+		_ = tmp.Close()
+		return apperr.Wrap("write", tmpName, err)
+	}
+	if err := tmp.Close(); err != nil {
+		return apperr.Wrap("write", tmpName, err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return apperr.Wrap("rename", path, err)
+	}
+	cleanup = false
+	return nil
 }
 
 func copyFile(src, dst string) error {
@@ -724,18 +843,81 @@ func copyFile(src, dst string) error {
 		return apperr.Wrap("open", src, err)
 	}
 	defer in.Close()
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		return apperr.Wrap("mkdir", filepath.Dir(dst), err)
+	dir := filepath.Dir(dst)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return apperr.Wrap("mkdir", dir, err)
 	}
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	tmp, err := os.CreateTemp(dir, filepath.Base(dst)+".tmp-*")
 	if err != nil {
-		return apperr.Wrap("write", dst, err)
+		return apperr.Wrap("create", dir, err)
 	}
-	if _, err := io.Copy(out, in); err != nil {
-		_ = out.Close()
+	tmpName := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if _, err := io.Copy(tmp, in); err != nil {
+		_ = tmp.Close()
 		return apperr.Wrap("copy", dst, err)
 	}
-	return apperr.Wrap("write", dst, out.Close())
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return apperr.Wrap("write", tmpName, err)
+	}
+	if err := tmp.Close(); err != nil {
+		return apperr.Wrap("write", tmpName, err)
+	}
+	if err := os.Rename(tmpName, dst); err != nil {
+		return apperr.Wrap("rename", dst, err)
+	}
+	cleanup = false
+	return nil
+}
+
+func replaceAgentConfigBackupDir(dst, staging string) (func(bool), error) {
+	parent := filepath.Dir(dst)
+	backupDir, err := os.MkdirTemp(parent, "."+filepath.Base(dst)+".old-*")
+	if err != nil {
+		return nil, apperr.Wrap("create", parent, err)
+	}
+	backupPath := filepath.Join(backupDir, filepath.Base(dst))
+	movedOld := false
+	if err := os.Rename(dst, backupPath); err != nil {
+		_ = os.RemoveAll(backupDir)
+		if !os.IsNotExist(err) {
+			return nil, apperr.Wrap("rename", dst, err)
+		}
+		backupDir = ""
+	} else {
+		movedOld = true
+	}
+	if err := os.Rename(staging, dst); err != nil {
+		if movedOld {
+			_ = os.Rename(backupPath, dst)
+			_ = os.RemoveAll(backupDir)
+		}
+		return nil, apperr.Wrap("rename", dst, err)
+	}
+	finalized := false
+	return func(commit bool) {
+		if finalized {
+			return
+		}
+		finalized = true
+		if commit {
+			if movedOld {
+				_ = os.RemoveAll(backupDir)
+			}
+			return
+		}
+		_ = os.RemoveAll(dst)
+		if movedOld {
+			_ = os.Rename(backupPath, dst)
+			_ = os.RemoveAll(backupDir)
+		}
+	}, nil
 }
 
 func agentConfigRootDir() (string, error) {

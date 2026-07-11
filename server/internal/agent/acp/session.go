@@ -282,8 +282,8 @@ func (s *session) AnswerQuestion(context.Context, types.AskUserAnswer) error {
 	return errors.New("ask user question is not supported by acp sessions")
 }
 
-func (s *session) AnswerExtensionUI(context.Context, types.ExtensionUIResponse) error {
-	return errors.New("extension UI is not supported by acp sessions")
+func (s *session) AnswerExtensionUI(_ context.Context, response types.ExtensionUIResponse) error {
+	return s.proc.resolvePendingPermission(s.sessionKey, response)
 }
 
 func (s *session) CurrentModel() string {
@@ -464,6 +464,12 @@ func convertEvent(update SessionUpdate) types.Event {
 			}
 		} else {
 			logUnhandledConvertEvent(update, "tool_call_update")
+		}
+	case UpdateTypeExtensionUI:
+		if update.ExtensionUI != nil {
+			ev.Data = *update.ExtensionUI
+		} else {
+			logUnhandledConvertEvent(update, "extension_ui")
 		}
 	default:
 		logUnhandledConvertEvent(update, "update_type")

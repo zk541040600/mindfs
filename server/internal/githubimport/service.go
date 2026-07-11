@@ -154,19 +154,55 @@ func (s *Service) run(ctx context.Context, status Status, parentPath string) {
 		s.fail(status.TaskID, normalizedURL, targetPath, err)
 		return
 	}
+	if err := os.Mkdir(targetPath, 0o755); err != nil {
+		if os.IsExist(err) {
+			s.fail(status.TaskID, normalizedURL, targetPath, fmt.Errorf("target directory already exists"))
+		} else {
+			s.fail(status.TaskID, normalizedURL, targetPath, err)
+		}
+		return
+	}
+	reservedTarget := true
+	defer func() {
+		if reservedTarget {
+			_ = os.Remove(targetPath)
+		}
+	}()
+	cloneDir, err := os.MkdirTemp(parentPath, "."+filepath.Base(targetPath)+"-import-*")
+	if err != nil {
+		s.fail(status.TaskID, normalizedURL, targetPath, err)
+		return
+	}
+	cleanupCloneDir := true
+	defer func() {
+		if cleanupCloneDir {
+			_ = os.RemoveAll(cloneDir)
+		}
+	}()
 
 	s.updateStatus(status.TaskID, func(st *Status) {
 		st.Status = "cloning"
 		st.Progress = 60
 		st.Message = "cloning repository"
 	})
-	log.Printf("[github_import] clone.start task_id=%s url=%s owner=%s target=%s", status.TaskID, normalizedURL, owner, targetPath)
-	if err := cloneRepository(ctx, normalizedURL, targetPath); err != nil {
+	log.Printf("[github_import] clone.start task_id=%s url=%s owner=%s target=%s temp=%s", status.TaskID, normalizedURL, owner, targetPath, cloneDir)
+	if err := cloneRepository(ctx, normalizedURL, cloneDir); err != nil {
 		log.Printf("[github_import] clone.failed task_id=%s url=%s target=%s err=%v", status.TaskID, normalizedURL, targetPath, err)
-		_ = os.RemoveAll(targetPath)
 		s.fail(status.TaskID, normalizedURL, targetPath, err)
 		return
 	}
+	if err := os.Remove(targetPath); err != nil {
+		log.Printf("[github_import] reserve.remove_failed task_id=%s target=%s err=%v", status.TaskID, targetPath, err)
+		s.fail(status.TaskID, normalizedURL, targetPath, err)
+		return
+	}
+	reservedTarget = false
+	if err := os.Rename(cloneDir, targetPath); err != nil {
+		log.Printf("[github_import] clone.promote_failed task_id=%s temp=%s target=%s err=%v", status.TaskID, cloneDir, targetPath, err)
+		s.fail(status.TaskID, normalizedURL, targetPath, err)
+		return
+	}
+	cleanupCloneDir = false
 
 	s.updateStatus(status.TaskID, func(st *Status) {
 		st.Status = "registering"
@@ -226,7 +262,9 @@ func (s *Service) setStatus(status Status) {
 	}
 }
 
-func cloneRepository(ctx context.Context, repoURL, targetPath string) error {
+var cloneRepository = cloneRepositoryCommand
+
+func cloneRepositoryCommand(ctx context.Context, repoURL, targetPath string) error {
 	cmd := exec.CommandContext(ctx, "git", "clone", "--depth=1", repoURL, targetPath)
 	var stderr bytes.Buffer
 	cmd.Stdout = ioDiscard{}
@@ -255,7 +293,7 @@ func parseGitHubRepoURL(raw string) (owner string, repo string, normalized strin
 	}
 	owner = strings.TrimSpace(segments[0])
 	repo = strings.TrimSuffix(strings.TrimSpace(segments[1]), ".git")
-	if owner == "" || repo == "" {
+	if owner == "" || repo == "" || owner == "." || owner == ".." || repo == "." || repo == ".." {
 		return "", "", "", errors.New("invalid github repository url")
 	}
 	parsed.Path = "/" + owner + "/" + repo
@@ -273,6 +311,9 @@ func sanitizeName(value string) string {
 	}
 	replacer := strings.NewReplacer("/", "-", "\\", "-", ":", "-", " ", "-")
 	result := replacer.Replace(trimmed)
+	if result == "." || result == ".." {
+		return "repo"
+	}
 	if runtime.GOOS == "windows" {
 		result = strings.ToLower(result)
 	}

@@ -190,6 +190,10 @@ func (s *Service) ImportExternalSession(ctx context.Context, in ImportExternalSe
 		return ImportExternalSessionOutput{}, err
 	}
 
+	exchanges := validImportedExchanges(imported.Exchanges)
+	if len(exchanges) == 0 {
+		return ImportExternalSessionOutput{}, errors.New("external session has no importable messages")
+	}
 	name := buildImportedSessionName(imported)
 	created, err := manager.Create(ctx, session.CreateInput{
 		Type:  session.TypeChat,
@@ -199,12 +203,8 @@ func (s *Service) ImportExternalSession(ctx context.Context, in ImportExternalSe
 	if err != nil {
 		return ImportExternalSessionOutput{}, err
 	}
-	for _, exchange := range imported.Exchanges {
-		role := strings.TrimSpace(exchange.Role)
-		if role != "user" && role != "agent" {
-			continue
-		}
-		if err := manager.AddExchangeForAgentAt(ctx, created, role, exchange.Content, in.Agent, "", "", "", exchange.Timestamp); err != nil {
+	for _, exchange := range exchanges {
+		if err := manager.AddExchangeForAgentAt(ctx, created, exchange.Role, exchange.Content, in.Agent, "", "", "", exchange.Timestamp); err != nil {
 			return ImportExternalSessionOutput{}, err
 		}
 	}
@@ -324,15 +324,11 @@ func (s *Service) SyncExternalSessionDelta(ctx context.Context, in SyncExternalS
 	}
 
 	importedCount := 0
-	for _, exchange := range imported.Exchanges {
-		role := strings.TrimSpace(exchange.Role)
-		if role != "user" && role != "agent" {
-			continue
-		}
+	for _, exchange := range validImportedExchanges(imported.Exchanges) {
 		if exchange.Timestamp.IsZero() || !exchange.Timestamp.After(lastTimestamp) {
 			continue
 		}
-		if err := manager.AddExchangeForAgentAt(ctx, current, role, exchange.Content, agentName, "", "", "", exchange.Timestamp); err != nil {
+		if err := manager.AddExchangeForAgentAt(ctx, current, exchange.Role, exchange.Content, agentName, "", "", "", exchange.Timestamp); err != nil {
 			return out, err
 		}
 		importedCount++
@@ -379,6 +375,24 @@ func lastExternalSyncTimestamp(exchanges []session.Exchange) time.Time {
 		}
 	}
 	return time.Time{}
+}
+
+func validImportedExchanges(input []agenttypes.ImportedExchange) []agenttypes.ImportedExchange {
+	out := make([]agenttypes.ImportedExchange, 0, len(input))
+	for _, exchange := range input {
+		role := strings.TrimSpace(exchange.Role)
+		if role != "user" && role != "agent" {
+			continue
+		}
+		content := strings.TrimSpace(exchange.Content)
+		if content == "" {
+			continue
+		}
+		exchange.Role = role
+		exchange.Content = content
+		out = append(out, exchange)
+	}
+	return out
 }
 
 func buildImportedSessionName(imported agenttypes.ImportedExternalSession) string {

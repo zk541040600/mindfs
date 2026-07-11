@@ -465,6 +465,8 @@ type CancelSessionTurnInput struct {
 	SkipPendingIntent bool
 }
 
+var ErrSessionCancelRequestMismatch = errors.New("session cancel request id mismatch")
+
 const (
 	switchContextTailLines   = 20
 	sessionNameTimeout       = 30 * time.Second
@@ -2607,7 +2609,7 @@ func (s *Service) CancelSessionTurn(ctx context.Context, in CancelSessionTurnInp
 	}
 	requestID := strings.TrimSpace(in.RequestID)
 	if requestID != "" && active.requestID != "" && active.requestID != requestID {
-		return nil
+		return fmt.Errorf("%w: active request %q does not match cancel request %q", ErrSessionCancelRequestMismatch, active.requestID, requestID)
 	}
 	if active.session != nil {
 		// Let the runtime emit its own turn boundary after interrupt. Canceling

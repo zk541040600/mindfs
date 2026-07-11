@@ -461,7 +461,7 @@ func sanitizeUploadName(name string) string {
 		return ""
 	}
 	clean = filepath.Base(clean)
-	if clean == "." || clean == string(filepath.Separator) {
+	if clean == "." || clean == ".." || clean == string(filepath.Separator) {
 		return ""
 	}
 	return clean

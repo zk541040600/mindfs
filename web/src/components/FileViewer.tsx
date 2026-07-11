@@ -131,6 +131,7 @@ function Breadcrumbs({ root, path, onPathClick }: { root?: string; path: string;
 export function FileViewer({ file, onSessionClick, onPathClick, onFileClick, onSelectionChange, initialScrollTop = 0, onScrollTopChange, isVisible = true }: FileViewerProps) {
   const [isDownloading, setIsDownloading] = useState(false);
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  const scrollEmitFrameRef = useRef<number | null>(null);
   const restoredScrollKeyRef = useRef("");
   const contentRootRef = useRef<HTMLDivElement | null>(null);
   const codeContentRef = useRef<HTMLElement | null>(null);
@@ -180,12 +181,25 @@ export function FileViewer({ file, onSessionClick, onPathClick, onFileClick, onS
 
   useEffect(() => {
     const node = scrollRef.current;
-    if (!node || !fileScrollKey) return;
+    if (!node || !fileScrollKey || !onScrollTopChange) return;
+    const emitScrollTop = () => {
+      scrollEmitFrameRef.current = null;
+      onScrollTopChange(node.scrollTop);
+    };
     const handleScroll = () => {
-      onScrollTopChange?.(node.scrollTop);
+      if (scrollEmitFrameRef.current !== null) {
+        return;
+      }
+      scrollEmitFrameRef.current = window.requestAnimationFrame(emitScrollTop);
     };
     node.addEventListener("scroll", handleScroll, { passive: true });
-    return () => node.removeEventListener("scroll", handleScroll);
+    return () => {
+      node.removeEventListener("scroll", handleScroll);
+      if (scrollEmitFrameRef.current !== null) {
+        window.cancelAnimationFrame(scrollEmitFrameRef.current);
+        scrollEmitFrameRef.current = null;
+      }
+    };
   }, [fileScrollKey, onScrollTopChange]);
 
   const ext = file?.ext || (file?.path.includes(".") ? `.${file.path.split(".").pop()}` : "");

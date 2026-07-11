@@ -88,9 +88,37 @@ func writeLocalCLITokenStore(path string, store localCLITokenStore) error {
 		return err
 	}
 	payload = append(payload, '\n')
-	if err := os.WriteFile(path, payload, 0o600); err != nil {
+	return writeLocalCLITokenFileAtomic(path, payload)
+}
+
+func writeLocalCLITokenFileAtomic(path string, payload []byte) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
+	if err != nil {
 		return err
 	}
+	tmpName := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if _, err := tmp.Write(payload); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	cleanup = false
 	return os.Chmod(path, 0o600)
 }
 

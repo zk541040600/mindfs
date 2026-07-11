@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"strings"
 
@@ -40,7 +41,7 @@ func (h *HTTPHandler) handleRelayServiceSave(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	var req relay.LocalService
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxUploadRequestBytes)).Decode(&req); err != nil {
 		respondError(w, http.StatusBadRequest, errInvalidRequest("invalid json"))
 		return
 	}

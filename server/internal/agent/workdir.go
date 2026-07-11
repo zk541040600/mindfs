@@ -7,19 +7,27 @@ import (
 )
 
 func EnsureStableWorkDir(kind, agentName string) (string, error) {
-	base := filepath.Join(os.TempDir(), "mindfs-"+strings.TrimSpace(kind))
+	base := filepath.Join(os.TempDir(), "mindfs-"+stableWorkDirName(kind))
 	if err := os.MkdirAll(base, 0o755); err != nil {
 		return "", err
 	}
-	name := strings.TrimSpace(agentName)
-	if name == "" {
-		name = "default"
-	}
-	path := filepath.Join(base, name)
+	path := filepath.Join(base, stableWorkDirName(agentName))
 	if err := os.MkdirAll(path, 0o755); err != nil {
 		return "", err
 	}
 	return path, nil
+}
+
+func stableWorkDirName(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "default"
+	}
+	name = strings.NewReplacer("/", "_", "\\", "_").Replace(name)
+	if name == "." || name == ".." {
+		return "default"
+	}
+	return name
 }
 
 func IsTemporaryWorkDir(path string) bool {

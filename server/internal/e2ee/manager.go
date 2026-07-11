@@ -81,6 +81,19 @@ func (m *Manager) OpenSessionForClient(clientID string, key DerivedKey) (*Sessio
 }
 
 func (m *Manager) SessionForClient(clientID string) (*Session, error) {
+	return m.sessionForClient(clientID, true)
+}
+
+func (m *Manager) SessionForClientNoTouch(clientID string) (*Session, error) {
+	return m.sessionForClient(clientID, false)
+}
+
+func (m *Manager) TouchSessionForClient(clientID string) error {
+	_, err := m.sessionForClient(clientID, true)
+	return err
+}
+
+func (m *Manager) sessionForClient(clientID string, touch bool) (*Session, error) {
 	if !m.Enabled() {
 		return nil, errors.New("e2ee_required")
 	}
@@ -100,7 +113,9 @@ func (m *Manager) SessionForClient(clientID string) (*Session, error) {
 		delete(m.clientIDs, clientID)
 		return nil, errors.New("e2ee_session_expired")
 	}
-	sess.LastSeenAt = time.Now().UTC()
+	if touch {
+		sess.LastSeenAt = time.Now().UTC()
+	}
 	return cloneSession(sess), nil
 }
 

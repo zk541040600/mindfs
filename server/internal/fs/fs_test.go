@@ -40,6 +40,41 @@ func TestRegistryUpsertRejectsSameNameDifferentPath(t *testing.T) {
 	}
 }
 
+func TestRegistrySaveUsesAtomicFileReplacement(t *testing.T) {
+	dir := t.TempDir()
+	registryPath := filepath.Join(dir, "registry.json")
+	registry := NewRegistry(registryPath)
+	rootDir := filepath.Join(dir, "project")
+	if err := os.Mkdir(rootDir, 0o755); err != nil {
+		t.Fatalf("Mkdir root returned error: %v", err)
+	}
+
+	if _, err := registry.Upsert(rootDir); err != nil {
+		t.Fatalf("Upsert returned error: %v", err)
+	}
+	payload, err := os.ReadFile(registryPath)
+	if err != nil {
+		t.Fatalf("ReadFile registry returned error: %v", err)
+	}
+	if !strings.Contains(string(payload), "project") {
+		t.Fatalf("registry payload = %q, want project entry", string(payload))
+	}
+	info, err := os.Stat(registryPath)
+	if err != nil {
+		t.Fatalf("Stat registry returned error: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o644 {
+		t.Fatalf("registry mode = %v, want 0644", got)
+	}
+	temps, err := filepath.Glob(filepath.Join(dir, "registry.json.tmp-*"))
+	if err != nil {
+		t.Fatalf("Glob temp files returned error: %v", err)
+	}
+	if len(temps) != 0 {
+		t.Fatalf("registry temp files left behind: %#v", temps)
+	}
+}
+
 func TestRootInfoNormalizePathAcceptsAbsolutePathWithoutLeadingSlash(t *testing.T) {
 	root := NewRootInfo("mindfs", "mindfs", "/Users/bixin/project/mindfs")
 
@@ -61,6 +96,36 @@ func TestRootInfoNormalizePathStripsFragment(t *testing.T) {
 	}
 	if got != "design/test.md" {
 		t.Fatalf("NormalizePath = %q, want %q", got, "design/test.md")
+	}
+}
+
+func TestRootInfoNormalizePathAcceptsDotDotPrefixInsideRoot(t *testing.T) {
+	rootDir := t.TempDir()
+	root := NewRootInfo("mindfs", "mindfs", rootDir)
+
+	got, err := root.NormalizePath("..notes/file.txt")
+	if err != nil {
+		t.Fatalf("NormalizePath relative returned error: %v", err)
+	}
+	if got != "..notes/file.txt" {
+		t.Fatalf("NormalizePath relative = %q, want %q", got, "..notes/file.txt")
+	}
+
+	got, err = root.NormalizePath(filepath.Join(rootDir, "..notes", "file.txt"))
+	if err != nil {
+		t.Fatalf("NormalizePath absolute returned error: %v", err)
+	}
+	if got != "..notes/file.txt" {
+		t.Fatalf("NormalizePath absolute = %q, want %q", got, "..notes/file.txt")
+	}
+}
+
+func TestRootInfoNormalizePathRejectsParentTraversal(t *testing.T) {
+	rootDir := t.TempDir()
+	root := NewRootInfo("mindfs", "mindfs", rootDir)
+
+	if _, err := root.NormalizePath("../escape.txt"); err == nil {
+		t.Fatal("NormalizePath should reject parent traversal")
 	}
 }
 

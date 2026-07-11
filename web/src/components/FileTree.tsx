@@ -1,6 +1,6 @@
 import React from "react";
 import { rootBadgeStyle } from "./rootBadgeStyle";
-import { openExternalURL } from "../services/platformNavigation";
+import { isSafeExternalURL, openExternalURL } from "../services/platformNavigation";
 import { isNativeShellRuntime, shouldEnablePWAInstall } from "../services/runtime";
 import {
   DIRECTORY_SORT_OPTIONS,
@@ -1158,7 +1158,7 @@ export function FileTree({
   }, [relayTip, visibleRelayTips.length]);
 
   const openRelayTip = React.useCallback(() => {
-    if (typeof window === "undefined" || !relayTip?.href) {
+    if (typeof window === "undefined" || !relayTip?.href || !isSafeExternalURL(relayTip.href)) {
       return;
     }
     if (relayTip.target === "_self") {

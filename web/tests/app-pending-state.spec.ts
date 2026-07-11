@@ -317,6 +317,258 @@ test("ignores late stream events after cancelling a pending turn", async ({ page
   await expect(page.getByText("late chunk after cancel")).toHaveCount(0);
 });
 
+test("keeps a newer pending turn when a stale cancel acknowledgement arrives", async ({ page }) => {
+  const replying = { current: true };
+  let cancelSeen = false;
+  let newRequestId = "";
+  const app = await openPendingApp(page, replying, (message) => {
+    try {
+      const parsed = JSON.parse(message);
+      if (parsed?.type === "session.cancel") {
+        cancelSeen = true;
+      }
+      if (parsed?.type === "session.message" && typeof parsed.id === "string") {
+        newRequestId = parsed.id;
+      }
+    } catch {
+      // Ignore non-JSON websocket traffic in the harness.
+    }
+  });
+
+  await expect(page.getByText("已发送，等待响应...")).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect.poll(() => cancelSeen).toBe(true);
+  await expect(page.getByText("已发送，等待响应...")).toHaveCount(0);
+
+  const editor = page.locator(".token-editor-input").first();
+  await editor.click();
+  await editor.fill("new turn after cancel");
+  await page.keyboard.press("Enter");
+  await expect.poll(() => newRequestId).not.toBe("");
+  app.socket?.send(
+    JSON.stringify({
+      id: newRequestId,
+      type: "session.accepted",
+      payload: {
+        root_id: rootId,
+        session_key: sessionKey,
+        request_id: newRequestId,
+      },
+    }),
+  );
+  await expect(page.getByText("已发送，等待响应...")).toBeVisible();
+
+  app.socket?.send(
+    JSON.stringify({
+      id: "cancel-old",
+      type: "session.cancelled",
+      payload: {
+        root_id: rootId,
+        session_key: sessionKey,
+        request_id: "old-request",
+      },
+    }),
+  );
+
+  await page.waitForTimeout(150);
+  await expect(page.getByText("已发送，等待响应...")).toBeVisible();
+
+  replying.current = false;
+  app.socket?.send(
+    JSON.stringify({
+      id: newRequestId,
+      type: "session.done",
+      payload: {
+        root_id: rootId,
+        session_key: sessionKey,
+        request_id: newRequestId,
+      },
+    }),
+  );
+  await expect(page.getByText("已发送，等待响应...")).toHaveCount(0);
+});
+
+test("ignores request-less stale cancel acknowledgement after a new turn starts", async ({ page }) => {
+  const replying = { current: true };
+  let cancelSeen = false;
+  let newRequestId = "";
+  const app = await openPendingApp(page, replying, (message) => {
+    try {
+      const parsed = JSON.parse(message);
+      if (parsed?.type === "session.cancel") {
+        cancelSeen = true;
+      }
+      if (parsed?.type === "session.message" && typeof parsed.id === "string") {
+        newRequestId = parsed.id;
+      }
+    } catch {
+      // Ignore non-JSON websocket traffic in the harness.
+    }
+  });
+
+  await expect(page.getByText("已发送，等待响应...")).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect.poll(() => cancelSeen).toBe(true);
+  await expect(page.getByText("已发送，等待响应...")).toHaveCount(0);
+
+  const editor = page.locator(".token-editor-input").first();
+  await editor.click();
+  await editor.fill("new turn after request-less cancel");
+  await page.keyboard.press("Enter");
+  await expect.poll(() => newRequestId).not.toBe("");
+  app.socket?.send(
+    JSON.stringify({
+      id: newRequestId,
+      type: "session.accepted",
+      payload: {
+        root_id: rootId,
+        session_key: sessionKey,
+        request_id: newRequestId,
+      },
+    }),
+  );
+  await expect(page.getByText("已发送，等待响应...")).toBeVisible();
+
+  app.socket?.send(
+    JSON.stringify({
+      id: "cancel-old-no-request",
+      type: "session.cancelled",
+      payload: {
+        root_id: rootId,
+        session_key: sessionKey,
+      },
+    }),
+  );
+
+  await page.waitForTimeout(150);
+  await expect(page.getByText("已发送，等待响应...")).toBeVisible();
+
+  replying.current = false;
+  app.socket?.send(
+    JSON.stringify({
+      id: newRequestId,
+      type: "session.done",
+      payload: {
+        root_id: rootId,
+        session_key: sessionKey,
+        request_id: newRequestId,
+      },
+    }),
+  );
+  await expect(page.getByText("已发送，等待响应...")).toHaveCount(0);
+});
+
+test("ignores request-less stale done acknowledgement after a new turn starts", async ({ page }) => {
+  const replying = { current: true };
+  let cancelSeen = false;
+  let newRequestId = "";
+  const app = await openPendingApp(page, replying, (message) => {
+    try {
+      const parsed = JSON.parse(message);
+      if (parsed?.type === "session.cancel") {
+        cancelSeen = true;
+      }
+      if (parsed?.type === "session.message" && typeof parsed.id === "string") {
+        newRequestId = parsed.id;
+      }
+    } catch {
+      // Ignore non-JSON websocket traffic in the harness.
+    }
+  });
+
+  await expect(page.getByText("已发送，等待响应...")).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect.poll(() => cancelSeen).toBe(true);
+  await expect(page.getByText("已发送，等待响应...")).toHaveCount(0);
+
+  const editor = page.locator(".token-editor-input").first();
+  await editor.click();
+  await editor.fill("new turn after request-less done");
+  await page.keyboard.press("Enter");
+  await expect.poll(() => newRequestId).not.toBe("");
+  app.socket?.send(
+    JSON.stringify({
+      id: newRequestId,
+      type: "session.accepted",
+      payload: {
+        root_id: rootId,
+        session_key: sessionKey,
+        request_id: newRequestId,
+      },
+    }),
+  );
+  await expect(page.getByText("已发送，等待响应...")).toBeVisible();
+
+  app.socket?.send(
+    JSON.stringify({
+      id: "done-old-no-request",
+      type: "session.done",
+      payload: {
+        root_id: rootId,
+        session_key: sessionKey,
+      },
+    }),
+  );
+
+  await page.waitForTimeout(150);
+  await expect(page.getByText("已发送，等待响应...")).toBeVisible();
+
+  replying.current = false;
+  app.socket?.send(
+    JSON.stringify({
+      id: newRequestId,
+      type: "session.done",
+      payload: {
+        root_id: rootId,
+        session_key: sessionKey,
+        request_id: newRequestId,
+      },
+    }),
+  );
+  await expect(page.getByText("已发送，等待响应...")).toHaveCount(0);
+});
+
+test("allows a resumed stream after cancel tombstone timeout without a terminal event", async ({ page }) => {
+  await page.addInitScript(() => {
+    (window as any).__mindfsCancelRequestTombstoneTTLMS = 50;
+  });
+  const replying = { current: true };
+  let cancelSeen = false;
+  const app = await openPendingApp(page, replying, (message) => {
+    try {
+      const parsed = JSON.parse(message);
+      if (parsed?.type === "session.cancel") {
+        cancelSeen = true;
+      }
+    } catch {
+      // Ignore non-JSON websocket traffic in the harness.
+    }
+  });
+
+  await expect(page.getByText("已发送，等待响应...")).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect.poll(() => cancelSeen).toBe(true);
+  await expect(page.getByText("已发送，等待响应...")).toHaveCount(0);
+
+  await page.waitForTimeout(90);
+  app.socket?.send(
+    JSON.stringify({
+      id: "resumed-stream",
+      type: "session.stream",
+      payload: {
+        root_id: rootId,
+        session_key: sessionKey,
+        event: {
+          type: "message_chunk",
+          data: { content: "resumed after reconnect" },
+        },
+      },
+    }),
+  );
+
+  await expect(page.getByText("已发送，等待响应...")).toBeVisible();
+});
+
 test("keeps pending when replying-sessions drops before terminal event", async ({ page }) => {
   const replying = { current: true };
   const app = await openPendingApp(page, replying);

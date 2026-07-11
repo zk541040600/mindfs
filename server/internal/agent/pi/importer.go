@@ -210,12 +210,26 @@ func parseSDKBridgeTime(value string) time.Time {
 }
 
 func safeSessionTitle(name string) string {
-	trimmed := strings.TrimSpace(name)
+	trimmed := strings.Join(strings.Fields(strings.TrimSpace(name)), " ")
 	if trimmed == "" {
 		return ""
 	}
-	if len(trimmed) > 120 {
-		trimmed = trimmed[:120]
+	return truncateUTF8ByBytes(trimmed, 120)
+}
+
+func truncateUTF8ByBytes(value string, maxBytes int) string {
+	if maxBytes <= 0 || value == "" {
+		return ""
 	}
-	return strings.Join(strings.Fields(trimmed), " ")
+	if len(value) <= maxBytes {
+		return value
+	}
+	end := 0
+	for index := range value {
+		if index > maxBytes {
+			break
+		}
+		end = index
+	}
+	return strings.TrimSpace(value[:end])
 }

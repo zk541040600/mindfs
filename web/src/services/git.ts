@@ -102,7 +102,12 @@ const gitCommitDiffCache = new Map<string, GitDiffPayload>();
 const gitCommitDiffInflight = new Map<string, Promise<GitDiffPayload>>();
 
 function canUseStorage(): boolean {
-  return typeof window !== "undefined" && !!window.localStorage;
+  if (typeof window === "undefined") return false;
+  try {
+    return !!window.localStorage;
+  } catch {
+    return false;
+  }
 }
 
 function readStorageJSON<T>(key: string): T | null {
@@ -124,11 +129,13 @@ function writeStorageJSON(key: string, value: unknown): void {
 
 function removeStorageByPrefix(prefix: string): void {
   if (!canUseStorage()) return;
-  for (const key of Array.from({ length: window.localStorage.length }, (_, index) => window.localStorage.key(index)).filter(Boolean) as string[]) {
-    if (key.startsWith(prefix)) {
-      window.localStorage.removeItem(key);
+  try {
+    for (const key of Array.from({ length: window.localStorage.length }, (_, index) => window.localStorage.key(index)).filter(Boolean) as string[]) {
+      if (key.startsWith(prefix)) {
+        window.localStorage.removeItem(key);
+      }
     }
-  }
+  } catch {}
 }
 
 function historyListStorageKey(rootId: string): string {
@@ -241,7 +248,9 @@ export function clearGitHistoryCache(rootId?: string): void {
   if (rootId) {
     gitHistoryListCache.delete(rootId);
     if (canUseStorage()) {
-      window.localStorage.removeItem(historyListStorageKey(rootId));
+      try {
+        window.localStorage.removeItem(historyListStorageKey(rootId));
+      } catch {}
     }
     removeStorageByPrefix(`${COMMIT_FILES_STORAGE_PREFIX}${encodeURIComponent(rootId)}:`);
     removeStorageByPrefix(`${COMMIT_DIFF_STORAGE_PREFIX}${encodeURIComponent(rootId)}:`);

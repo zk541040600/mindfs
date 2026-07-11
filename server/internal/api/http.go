@@ -53,15 +53,17 @@ type protectedResponseWriter struct {
 }
 
 const (
-	maxUploadRequestBytes = 64 << 20
-	maxUploadFileCount    = 20
-	sessionListPageSize   = 50
-	e2eeHeaderName        = "X-MindFS-E2EE"
-	clientIDHeaderName    = "X-MindFS-Client-ID"
-	e2eeProofHeaderName   = "X-MindFS-Proof"
-	e2eeTSHeaderName      = "X-MindFS-TS"
-	localCLIHeaderName    = "X-MindFS-Local-CLI-Token"
-	requestProofMaxSkew   = 5 * time.Minute
+	maxUploadRequestBytes          = 64 << 20
+	maxProtectedUploadRequestBytes = maxUploadRequestBytes + (maxUploadRequestBytes / 2) + (1 << 20)
+	maxProtectedRawFileBytes       = maxUploadRequestBytes
+	maxUploadFileCount             = 20
+	sessionListPageSize            = 50
+	e2eeHeaderName                 = "X-MindFS-E2EE"
+	clientIDHeaderName             = "X-MindFS-Client-ID"
+	e2eeProofHeaderName            = "X-MindFS-Proof"
+	e2eeTSHeaderName               = "X-MindFS-TS"
+	localCLIHeaderName             = "X-MindFS-Local-CLI-Token"
+	requestProofMaxSkew            = 5 * time.Minute
 )
 
 var indexResourceRefPattern = regexp.MustCompile(`(?i)\b(?:src|href)\s*=\s*["']([^"']+)["']`)
@@ -82,7 +84,7 @@ func (h *HTTPHandler) requireProtectedHTTPSession(r *http.Request) (*e2ee.Sessio
 	if clientID == "" {
 		return nil, true, errInvalidRequest("client_id required")
 	}
-	sess, err := manager.SessionForClient(clientID)
+	sess, err := manager.SessionForClientNoTouch(clientID)
 	if err != nil {
 		return nil, true, errInvalidRequest(err.Error())
 	}
@@ -100,7 +102,7 @@ func (h *HTTPHandler) requireRequestProof(r *http.Request) (*e2ee.Session, error
 	if clientID == "" || ts == "" || proof == "" {
 		return nil, errInvalidRequest("e2ee_proof_required")
 	}
-	sess, err := manager.SessionForClient(clientID)
+	sess, err := manager.SessionForClientNoTouch(clientID)
 	if err != nil {
 		return nil, errInvalidRequest(err.Error())
 	}
@@ -115,6 +117,9 @@ func (h *HTTPHandler) requireRequestProof(r *http.Request) (*e2ee.Session, error
 	expected := e2ee.BuildRequestProof(sess.Key, r.Method, requestProofPath(r), ts, clientID)
 	if !e2ee.VerifyProof(expected, proof) {
 		return nil, errInvalidRequest("e2ee_proof_invalid")
+	}
+	if err := manager.TouchSessionForClient(clientID); err != nil {
+		return nil, errInvalidRequest(err.Error())
 	}
 	return sess, nil
 }
@@ -522,7 +527,7 @@ func (h *HTTPHandler) handleExternalSessionImport(w http.ResponseWriter, r *http
 		AgentSessionID string `json:"agent_session_id"`
 		Mode           string `json:"mode"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxUploadRequestBytes)).Decode(&req); err != nil {
 		respondError(w, http.StatusBadRequest, errInvalidRequest("invalid json body"))
 		return
 	}
@@ -566,7 +571,7 @@ func (h *HTTPHandler) handleExternalSessionImportBatch(w http.ResponseWriter, r 
 		AgentSessionIDs []string `json:"agent_session_ids"`
 		Mode            string   `json:"mode"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxUploadRequestBytes)).Decode(&req); err != nil {
 		respondError(w, http.StatusBadRequest, errInvalidRequest("invalid json body"))
 		return
 	}
@@ -1013,7 +1018,7 @@ func (h *HTTPHandler) handleGitHubImportStart(w http.ResponseWriter, r *http.Req
 		URL        string `json:"url"`
 		ParentPath string `json:"parent_path"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxUploadRequestBytes)).Decode(&req); err != nil {
 		respondError(w, http.StatusBadRequest, errInvalidRequest("invalid json body"))
 		return
 	}
@@ -1321,13 +1326,40 @@ func (h *HTTPHandler) handleFile(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		defer rawOut.File.Close()
-		w.Header().Set("Content-Length", strconv.FormatInt(rawOut.Info.Size(), 10))
-		ext := filepath.Ext(rawOut.RelPath)
-		if mimeType := mime.TypeByExtension(ext); mimeType != "" {
-			w.Header().Set("Content-Type", mimeType)
-		} else {
-			w.Header().Set("Content-Type", "application/octet-stream")
+		contentType := mime.TypeByExtension(filepath.Ext(rawOut.RelPath))
+		if contentType == "" {
+			contentType = "application/octet-stream"
 		}
+		if proofSession != nil {
+			if rawOut.Info.Size() > maxProtectedRawFileBytes {
+				respondError(w, http.StatusRequestEntityTooLarge, errInvalidRequest("file too large for e2ee raw download"))
+				return
+			}
+			payload, err := io.ReadAll(io.LimitReader(rawOut.File, maxProtectedRawFileBytes+1))
+			if err != nil {
+				respondError(w, http.StatusServiceUnavailable, err)
+				return
+			}
+			if int64(len(payload)) > maxProtectedRawFileBytes {
+				respondError(w, http.StatusRequestEntityTooLarge, errInvalidRequest("file too large for e2ee raw download"))
+				return
+			}
+			envelope, err := e2ee.EncryptBytes(proofSession.Key, payload)
+			if err != nil {
+				respondError(w, http.StatusServiceUnavailable, err)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set(e2eeHeaderName, "1")
+			respondJSON(w, http.StatusOK, map[string]any{
+				"nonce":        envelope.Nonce,
+				"ciphertext":   envelope.Ciphertext,
+				"content_type": contentType,
+			})
+			return
+		}
+		w.Header().Set("Content-Length", strconv.FormatInt(rawOut.Info.Size(), 10))
+		w.Header().Set("Content-Type", contentType)
 		if r.URL.Query().Get("download") == "1" {
 			w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filepath.Base(rawOut.RelPath)))
 		}
@@ -1511,7 +1543,7 @@ func (h *HTTPHandler) handleGitCheckout(w http.ResponseWriter, r *http.Request) 
 		RootID string `json:"root"`
 		Branch string `json:"branch"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxUploadRequestBytes)).Decode(&req); err != nil {
 		respondError(w, http.StatusBadRequest, errInvalidRequest("invalid json body"))
 		return
 	}
@@ -1563,7 +1595,7 @@ func (h *HTTPHandler) handleGitWorktreeCreate(w http.ResponseWriter, r *http.Req
 		BranchMode string `json:"branch_mode"`
 		Branch     string `json:"branch"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxUploadRequestBytes)).Decode(&req); err != nil {
 		respondError(w, http.StatusBadRequest, errInvalidRequest("invalid json"))
 		return
 	}
@@ -1589,7 +1621,7 @@ func (h *HTTPHandler) handleGitWorktreeRemove(w http.ResponseWriter, r *http.Req
 	var req struct {
 		RootID string `json:"root"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxUploadRequestBytes)).Decode(&req); err != nil {
 		respondError(w, http.StatusBadRequest, errInvalidRequest("invalid json"))
 		return
 	}
@@ -1616,35 +1648,52 @@ func (h *HTTPHandler) handleUpload(w http.ResponseWriter, r *http.Request) {
 		respondError(w, http.StatusUnauthorized, err)
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, maxUploadRequestBytes)
-	if err := r.ParseMultipartForm(maxUploadRequestBytes); err != nil {
-		respondError(w, http.StatusBadRequest, errInvalidRequest("invalid multipart form"))
-		return
+	var dir string
+	var files []usecase.UploadFile
+	if proofSession != nil {
+		if strings.TrimSpace(r.Header.Get(e2eeHeaderName)) != "1" {
+			respondError(w, http.StatusBadRequest, errInvalidRequest("e2ee_upload_payload_required"))
+			return
+		}
+		parsedDir, parsedFiles, err := buildProtectedUploadFiles(w, r, proofSession)
+		if err != nil {
+			respondError(w, http.StatusBadRequest, err)
+			return
+		}
+		dir = parsedDir
+		files = parsedFiles
+	} else {
+		r.Body = http.MaxBytesReader(w, r.Body, maxUploadRequestBytes)
+		if err := r.ParseMultipartForm(maxUploadRequestBytes); err != nil {
+			respondError(w, http.StatusBadRequest, errInvalidRequest("invalid multipart form"))
+			return
+		}
+		if r.MultipartForm == nil {
+			respondError(w, http.StatusBadRequest, errInvalidRequest("files required"))
+			return
+		}
+		fileHeaders := r.MultipartForm.File["files"]
+		if len(fileHeaders) == 0 {
+			respondError(w, http.StatusBadRequest, errInvalidRequest("files required"))
+			return
+		}
+		if len(fileHeaders) > maxUploadFileCount {
+			respondError(w, http.StatusBadRequest, errInvalidRequest("too many files"))
+			return
+		}
+		files, err = buildUploadFiles(fileHeaders)
+		if err != nil {
+			respondError(w, http.StatusBadRequest, err)
+			return
+		}
+		defer closeMultipartFiles(files)
+		dir = strings.TrimSpace(r.FormValue("dir"))
 	}
-	if r.MultipartForm == nil {
-		respondError(w, http.StatusBadRequest, errInvalidRequest("files required"))
-		return
-	}
-	fileHeaders := r.MultipartForm.File["files"]
-	if len(fileHeaders) == 0 {
-		respondError(w, http.StatusBadRequest, errInvalidRequest("files required"))
-		return
-	}
-	if len(fileHeaders) > maxUploadFileCount {
-		respondError(w, http.StatusBadRequest, errInvalidRequest("too many files"))
-		return
-	}
-	files, err := buildUploadFiles(fileHeaders)
-	if err != nil {
-		respondError(w, http.StatusBadRequest, err)
-		return
-	}
-	defer closeMultipartFiles(files)
 
 	uc := h.service()
 	out, err := uc.SaveUploadedFiles(r.Context(), usecase.SaveUploadedFilesInput{
 		RootID: rootID,
-		Dir:    strings.TrimSpace(r.FormValue("dir")),
+		Dir:    dir,
 		Files:  files,
 	})
 	if err != nil {
@@ -1665,6 +1714,52 @@ func (h *HTTPHandler) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	respondJSON(w, http.StatusOK, payload)
+}
+
+type protectedUploadRequest struct {
+	Dir   string                `json:"dir"`
+	Files []protectedUploadFile `json:"files"`
+}
+
+type protectedUploadFile struct {
+	Name        string              `json:"name"`
+	ContentType string              `json:"content_type"`
+	Envelope    e2ee.CipherEnvelope `json:"envelope"`
+}
+
+func buildProtectedUploadFiles(w http.ResponseWriter, r *http.Request, sess *e2ee.Session) (string, []usecase.UploadFile, error) {
+	if sess == nil {
+		return "", nil, errInvalidRequest("e2ee_required")
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxProtectedUploadRequestBytes)
+	var payload protectedUploadRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxProtectedUploadRequestBytes)).Decode(&payload); err != nil {
+		return "", nil, errInvalidRequest("invalid protected upload payload")
+	}
+	if len(payload.Files) == 0 {
+		return "", nil, errInvalidRequest("files required")
+	}
+	if len(payload.Files) > maxUploadFileCount {
+		return "", nil, errInvalidRequest("too many files")
+	}
+	files := make([]usecase.UploadFile, 0, len(payload.Files))
+	var totalPlaintext int64
+	for _, encrypted := range payload.Files {
+		plaintext, err := e2ee.DecryptBytes(sess.Key, &encrypted.Envelope)
+		if err != nil {
+			return "", nil, errInvalidRequest("invalid protected upload payload")
+		}
+		totalPlaintext += int64(len(plaintext))
+		if totalPlaintext > maxUploadRequestBytes {
+			return "", nil, errInvalidRequest("upload too large")
+		}
+		files = append(files, usecase.UploadFile{
+			Name:        encrypted.Name,
+			ContentType: encrypted.ContentType,
+			Reader:      bytes.NewReader(plaintext),
+		})
+	}
+	return strings.TrimSpace(payload.Dir), files, nil
 }
 
 func buildUploadFiles(headers []*multipart.FileHeader) ([]usecase.UploadFile, error) {
@@ -1752,7 +1847,7 @@ func (h *HTTPHandler) handleAddDir(w http.ResponseWriter, r *http.Request) {
 		Path   string `json:"path"`
 		Create bool   `json:"create"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxUploadRequestBytes)).Decode(&req); err != nil {
 		respondError(w, http.StatusBadRequest, errInvalidRequest("invalid json"))
 		return
 	}
@@ -1833,7 +1928,7 @@ func readManagedDirPath(r *http.Request) string {
 	var req struct {
 		Path string `json:"path"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxUploadRequestBytes)).Decode(&req); err != nil {
 		return ""
 	}
 	return strings.TrimSpace(req.Path)
@@ -2161,7 +2256,12 @@ const indexHTML = `<!doctype html>
 
             var card = document.createElement("div");
             card.className = "card";
-            card.innerHTML = "<span>" + entry.name + "</span><span>" + (entry.is_dir ? "Folder" : "File") + "</span>";
+            var name = document.createElement("span");
+            name.textContent = entry.name;
+            var kind = document.createElement("span");
+            kind.textContent = entry.is_dir ? "Folder" : "File";
+            card.appendChild(name);
+            card.appendChild(kind);
             listEl.appendChild(card);
           });
         })
