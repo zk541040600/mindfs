@@ -11,12 +11,14 @@ export type ErrorCode =
   | "session.rename_failed"
   | "session.sync_failed"
   | "session.extension_ui"
+  | "session.slash_command_failed"
   | "app.init_failed"
   // Root/project errors
   | "root.create_failed"
   | "root.delete_failed"
   | "root.rename_failed"
   | "git.checkout_failed"
+  | "git.related_file_diff_failed"
   | "git.worktree_switch_failed"
   | "git.worktree_remove_failed"
   // Agent errors
@@ -156,6 +158,11 @@ class ErrorService {
         severity: "info",
         recoverable: false,
       },
+      "session.slash_command_failed": {
+        message: "命令执行失败",
+        severity: "error",
+        recoverable: true,
+      },
       "app.init_failed": {
         message: "初始化失败",
         severity: "error",
@@ -179,6 +186,11 @@ class ErrorService {
       "git.checkout_failed": {
         message: "切换分支失败",
         severity: "error",
+        recoverable: true,
+      },
+      "git.related_file_diff_failed": {
+        message: "关联文件 diff 不可用",
+        severity: "warning",
         recoverable: true,
       },
       "git.worktree_switch_failed": {

@@ -30,6 +30,14 @@ import {
   switchAgentConfig,
   type AgentConfigBackup,
 } from "../services/agentConfig";
+import {
+  getWebPushStatus,
+  sendWebPushTest,
+  subscribeWebPush,
+  unsubscribeWebPush,
+  webPushReasonLabel,
+  type WebPushStatus,
+} from "../services/webPush";
 
 type BeforeInstallPromptEvent = Event & {
   prompt: () => Promise<void>;
@@ -42,6 +50,8 @@ const RELAYER_AD_DISMISS_STORAGE_KEY = "mindfs-relayer-ad-dismissed";
 const APPEARANCE_OPTIONS: Array<{ value: AppearanceMode; label: string }> = [
   { value: "dark", label: "深色模式" },
   { value: "light", label: "浅色模式" },
+  { value: "meadow", label: "翠谷金光" },
+  { value: "moss", label: "苔痕绿影" },
   { value: "system", label: "跟随系统" },
 ];
 
@@ -67,6 +77,16 @@ type RootSessionIndicator = {
   pending?: boolean;
 };
 
+type ProjectTreeTab = "files" | "git" | "worktrees" | "related";
+
+const PROJECT_TREE_TAB_STORAGE_KEY = "mindfs-project-tree-tab";
+const PROJECT_TREE_ROOT_PADDING_LEFT = 0;
+const PROJECT_TREE_INDENT = 16;
+
+function isProjectTreeTab(value: unknown): value is ProjectTreeTab {
+  return value === "files" || value === "git" || value === "worktrees" || value === "related";
+}
+
 type FileTreeProps = {
   entries: FileEntry[];
   childrenByPath: Record<string, FileEntry[]>;
@@ -84,6 +104,11 @@ type FileTreeProps = {
   onSelectFile?: (entry: FileEntry, rootId: string) => void;
   onSelectRoot?: (entry: FileEntry, rootId: string) => void;
   onToggleDir?: (entry: FileEntry, rootId: string) => void;
+  renderRootExtraContent?: (rootId: string) => React.ReactNode;
+  renderRootWorktreeContent?: (rootId: string) => React.ReactNode;
+  renderRootRelatedContent?: (rootId: string) => React.ReactNode;
+  projectTreeTabRequest?: { tab: ProjectTreeTab; nonce: number } | null;
+  onProjectTreeTabChange?: (tab: ProjectTreeTab) => void;
   creatingRootName?: string | null;
   creatingRootBusy?: boolean;
   creatingRootExtraContent?: React.ReactNode;
@@ -110,6 +135,12 @@ type FileTreeProps = {
   showEnterKeySendOption?: boolean;
   enterKeySends?: boolean;
   onEnterKeySendsChange?: (enabled: boolean) => void;
+  sidebarsSwapped?: boolean;
+  onSidebarsSwappedChange?: (enabled: boolean) => void;
+  gitDiffSideBySide?: boolean;
+  onGitDiffSideBySideChange?: (enabled: boolean) => void;
+  multiProjectSessionsEnabled?: boolean;
+  onMultiProjectSessionsChange?: (enabled: boolean) => void;
   onRunAgentLifecycleCommand?: (agentName: string, action: "install" | "update", commands: string[]) => void | Promise<void>;
   onGoHome?: () => void;
 };
@@ -141,6 +172,165 @@ const fileTreeMenuButtonStyle: React.CSSProperties = {
   cursor: "pointer",
   fontSize: "12px",
 };
+
+function NotificationIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.1" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 7h18s-3 0-3-7" />
+      <path d="M13.73 21a2 2 0 0 1-3.46 0" />
+    </svg>
+  );
+}
+
+function InfoIcon() {
+  return (
+    <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 48 48" aria-hidden="true">
+      <path d="M0 0h48v48H0z" fill="none" />
+      <g fill="none">
+        <path stroke="currentColor" strokeLinejoin="round" strokeWidth="4" d="M24 44a19.94 19.94 0 0 0 14.142-5.858A19.94 19.94 0 0 0 44 24a19.94 19.94 0 0 0-5.858-14.142A19.94 19.94 0 0 0 24 4A19.94 19.94 0 0 0 9.858 9.858A19.94 19.94 0 0 0 4 24a19.94 19.94 0 0 0 5.858 14.142A19.94 19.94 0 0 0 24 44Z" />
+        <path fill="currentColor" fillRule="evenodd" d="M24 11a2.5 2.5 0 1 1 0 5a2.5 2.5 0 0 1 0-5" clipRule="evenodd" />
+        <path stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="4" d="M24.5 34V20h-2M21 34h7" />
+      </g>
+    </svg>
+  );
+}
+
+function WebPushMenuItem() {
+  const [status, setStatus] = React.useState<WebPushStatus | null>(null);
+  const [busy, setBusy] = React.useState(false);
+  const [message, setMessage] = React.useState("");
+  const [expanded, setExpanded] = React.useState(false);
+
+  const refresh = React.useCallback(async () => {
+    try {
+      setStatus(await getWebPushStatus());
+    } catch (error) {
+      setStatus(null);
+      setMessage(error instanceof Error ? error.message : "通知状态读取失败");
+    }
+  }, []);
+
+  React.useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  const run = async (action: "subscribe" | "unsubscribe" | "test") => {
+    if (busy) return;
+    setBusy(true);
+    setMessage("");
+    try {
+      if (action === "subscribe") {
+        setStatus(await subscribeWebPush());
+      } else if (action === "unsubscribe") {
+        setStatus(await unsubscribeWebPush());
+      } else {
+        await sendWebPushTest();
+        setMessage("测试通知已发送");
+        await refresh();
+      }
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "通知操作失败");
+      await refresh();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const disabledReason = webPushReasonLabel(status?.reason);
+  const enabled = Boolean(status?.enabled && status.supported);
+  const subscribed = Boolean(status?.subscribed);
+  const label = subscribed ? "通知已开启" : "开启通知";
+  const subscriptionCount = status?.subscription_count || 0;
+  const currentDeviceDetail = subscribed && subscriptionCount > 0
+    ? `已有 ${subscriptionCount} 个设备订阅`
+    : subscribed
+      ? "回复、需要输入和定时任务会通知"
+      : "iOS 需从主屏幕打开";
+  const detail = message || disabledReason || currentDeviceDetail;
+
+  return (
+    <div>
+      <div
+        style={{
+          ...fileTreeMenuButtonStyle,
+          color: subscribed ? "var(--accent-color)" : "var(--text-primary)",
+          opacity: busy || !enabled ? 0.55 : 1,
+          cursor: "default",
+          minWidth: 0,
+          whiteSpace: "nowrap",
+        }}
+      >
+        <button
+          type="button"
+          disabled={busy || !enabled}
+          onClick={() => void run(subscribed ? "unsubscribe" : "subscribe")}
+          style={{
+            minWidth: 0,
+            border: "none",
+            background: "transparent",
+            color: "inherit",
+            padding: 0,
+            display: "inline-flex",
+            alignItems: "center",
+            gap: "8px",
+            flex: "0 1 auto",
+            cursor: busy || !enabled ? "not-allowed" : "pointer",
+            font: "inherit",
+            textAlign: "left",
+            whiteSpace: "nowrap",
+          }}
+        >
+          <NotificationIcon />
+          <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{busy ? "通知处理中" : label}</span>
+        </button>
+        <button
+          type="button"
+          aria-label="通知说明"
+          title="通知说明"
+          onClick={() => setExpanded((value) => !value)}
+          style={{
+            border: "none",
+            background: "transparent",
+            color: expanded ? "var(--accent-color)" : "var(--text-secondary)",
+            display: "inline-flex",
+            alignItems: "center",
+            justifyContent: "center",
+            cursor: "pointer",
+            flexShrink: 0,
+            padding: 0,
+            marginLeft: "-4px",
+          }}
+        >
+          <InfoIcon />
+        </button>
+        <span style={{ marginLeft: "auto", fontSize: "11px", opacity: subscribed ? 1 : 0, flexShrink: 0 }}>✓</span>
+      </div>
+      {expanded ? (
+        <>
+          <div style={{ padding: "0 10px 6px 32px", color: "var(--text-secondary)", fontSize: "11px", lineHeight: 1.35 }}>
+            {detail}
+          </div>
+          {subscribed ? (
+            <button
+              type="button"
+              disabled={busy}
+              onClick={() => void run("test")}
+              style={{
+                ...fileTreeMenuButtonStyle,
+                paddingLeft: "32px",
+                color: "var(--text-secondary)",
+                opacity: busy ? 0.55 : 1,
+                cursor: busy ? "not-allowed" : "pointer",
+              }}
+            >
+              <span>发送测试通知</span>
+            </button>
+          ) : null}
+        </>
+      ) : null}
+    </div>
+  );
+}
 
 const ChevronRight = ({ isOpen }: { isOpen: boolean }) => (
   <svg
@@ -177,7 +367,7 @@ function DirectoryIconSlot({ entry, isOpen }: { entry: FileEntry; isOpen: boolea
 
 const getFileIcon = (filename: string) => {
   const ext = filename.split('.').pop()?.toLowerCase();
-  
+
   // 核心文件类型使用极简 SVG
   if (['js', 'ts', 'jsx', 'tsx', 'go', 'py', 'java', 'c', 'cpp'].includes(ext!)) {
     return (
@@ -201,7 +391,7 @@ const getFileIcon = (filename: string) => {
       </svg>
     );
   }
-  
+
   return (
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ opacity: 0.5 }}>
       <path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/>
@@ -827,6 +1017,11 @@ export function FileTree({
   onSelectFile,
   onSelectRoot,
   onToggleDir,
+  renderRootExtraContent,
+  renderRootWorktreeContent,
+  renderRootRelatedContent,
+  projectTreeTabRequest = null,
+  onProjectTreeTabChange,
   creatingRootName = null,
   creatingRootBusy = false,
   creatingRootExtraContent = null,
@@ -853,11 +1048,28 @@ export function FileTree({
   showEnterKeySendOption = false,
   enterKeySends = false,
   onEnterKeySendsChange,
+  sidebarsSwapped = false,
+  onSidebarsSwappedChange,
+  gitDiffSideBySide = false,
+  onGitDiffSideBySideChange,
+  multiProjectSessionsEnabled = false,
+  onMultiProjectSessionsChange,
   onRunAgentLifecycleCommand,
   onGoHome,
 }: FileTreeProps) {
   const expandedSet = new Set(expanded);
   const [isMenuOpen, setIsMenuOpen] = React.useState(false);
+  const [projectTreeTab, setProjectTreeTab] = React.useState<ProjectTreeTab>(() => {
+    if (typeof window === "undefined") {
+      return "files";
+    }
+    try {
+      const saved = window.localStorage.getItem(PROJECT_TREE_TAB_STORAGE_KEY);
+      return isProjectTreeTab(saved) ? saved : "files";
+    } catch {
+      return "files";
+    }
+  });
   const [isAppearanceMenuOpen, setIsAppearanceMenuOpen] = React.useState(false);
   const [isSortMenuOpen, setIsSortMenuOpen] = React.useState(false);
   const [appearanceMode, setAppearanceModeState] = React.useState<AppearanceMode>(() => getAppearanceMode());
@@ -950,6 +1162,27 @@ export function FileTree({
   }, []);
 
   const [isNativeApp, setIsNativeApp] = React.useState(() => isNativeShellRuntime());
+
+  React.useEffect(() => {
+    if (!projectTreeTabRequest || !isProjectTreeTab(projectTreeTabRequest.tab)) {
+      return;
+    }
+    setProjectTreeTab(projectTreeTabRequest.tab);
+  }, [projectTreeTabRequest?.nonce, projectTreeTabRequest?.tab]);
+
+  React.useEffect(() => {
+    onProjectTreeTabChange?.(projectTreeTab);
+  }, [onProjectTreeTabChange, projectTreeTab]);
+
+  React.useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    try {
+      window.localStorage.setItem(PROJECT_TREE_TAB_STORAGE_KEY, projectTreeTab);
+    } catch {
+    }
+  }, [projectTreeTab]);
 
   React.useEffect(() => {
     if (typeof window === "undefined") {
@@ -1532,12 +1765,15 @@ export function FileTree({
     return `${entryRoot}:${entry.path}`;
   };
 
-  const visibleEntries = React.useCallback((items: FileEntry[]) => {
-    if (showHiddenFiles) {
-      return items;
+  const visibleEntries = React.useCallback((items: FileEntry[], depth = 0) => {
+    const hiddenFiltered = showHiddenFiles
+      ? items
+      : items.filter((entry) => !entry.name.startsWith("."));
+    if (projectTreeTab !== "related" || depth !== 0) {
+      return hiddenFiltered;
     }
-    return items.filter((entry) => !entry.name.startsWith("."));
-  }, [showHiddenFiles]);
+    return hiddenFiltered.filter((entry) => !!rootId && entry.path === rootId);
+  }, [projectTreeTab, rootId, showHiddenFiles]);
 
   const renderEntries = (items: FileEntry[], depth: number, branchRoot: string) => (
     <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
@@ -1546,7 +1782,7 @@ export function FileTree({
           <div
             style={{
               padding: "6px 8px",
-              paddingLeft: 8,
+              paddingLeft: PROJECT_TREE_ROOT_PADDING_LEFT,
               display: "flex",
               alignItems: creatingRootExtraContent ? "flex-start" : "center",
               gap: "8px",
@@ -1638,7 +1874,7 @@ export function FileTree({
           </div>
         </li>
       ) : null}
-      {sortDirectoryEntries(visibleEntries(items), sortMode).map((entry) => {
+      {sortDirectoryEntries(visibleEntries(items, depth), sortMode).map((entry) => {
         const isManagedRootNode = entry.is_root === true;
         const entryRoot = isManagedRootNode ? entry.path : branchRoot;
         const expandedKey = isManagedRootNode ? entry.path : `${entryRoot}:${entry.path}`;
@@ -1646,7 +1882,7 @@ export function FileTree({
 
         const cKey = childKeyFor(entry, entryRoot);
         const children = childrenByPath[cKey] ?? [];
-        
+
         const isCurrentRootNode = isManagedRootNode && entry.path === rootId;
         // 普通目录沿用 selectedDirKey；当前 managed root 永远跟随 current root 高亮。
         const isSelected =
@@ -1681,6 +1917,17 @@ export function FileTree({
           onToggleDir?.(entry, entryRoot);
         };
 
+        const rootExtraContent = isManagedRootNode
+          ? projectTreeTab === "git"
+            ? renderRootExtraContent?.(entry.path)
+            : projectTreeTab === "worktrees"
+              ? renderRootWorktreeContent?.(entry.path)
+            : projectTreeTab === "related"
+              ? renderRootRelatedContent?.(entry.path)
+              : null
+          : null;
+        const shouldRenderChildren = projectTreeTab === "files" || !isManagedRootNode;
+
         return (
           <li key={expandedKey}>
             <button
@@ -1691,7 +1938,7 @@ export function FileTree({
                 background: isSelected ? "var(--selection-bg)" : "transparent",
                 cursor: "pointer",
                 padding: "6px 8px",
-                paddingLeft: 8 + depth * 16,
+                paddingLeft: PROJECT_TREE_ROOT_PADDING_LEFT + depth * PROJECT_TREE_INDENT,
                 display: "flex",
                 alignItems: "center",
                 gap: "4px",
@@ -1765,7 +2012,12 @@ export function FileTree({
                 </span>
               )}
             </button>
-            {entry.is_dir && isOpen && children.length > 0 ? renderEntries(children, depth + 1, entryRoot) : null}
+            {entry.is_dir && isOpen && shouldRenderChildren && children.length > 0 ? renderEntries(children, depth + 1, entryRoot) : null}
+            {entry.is_dir && isOpen && rootExtraContent ? (
+              <div style={{ padding: `2px 4px 8px ${PROJECT_TREE_INDENT}px` }}>
+                {rootExtraContent}
+              </div>
+            ) : null}
           </li>
         );
       })}
@@ -1774,9 +2026,70 @@ export function FileTree({
 
   return (
     <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
-      <div style={{ position: "relative", height: "36px", padding: "0 3px 0 16px", borderBottom: "1px solid var(--border-color)", display: "flex", justifyContent: "space-between", alignItems: "center", background: "var(--mindfs-topbar-bg, transparent)", boxSizing: "border-box", flexShrink: 0, gap: 12, overflow: "visible" }}>
-        <h3 style={{ margin: 0, fontSize: "11px", fontWeight: 600, color: "var(--text-secondary)", letterSpacing: "0.5px", textTransform: "uppercase" }}>Projects</h3>
-        <div ref={menuRef} style={{ position: "relative" }}>
+      <div style={{ position: "relative", height: "36px", padding: "0 3px", borderBottom: "1px solid var(--border-color)", display: "flex", justifyContent: "flex-end", alignItems: "center", background: "var(--mindfs-topbar-bg, transparent)", boxSizing: "border-box", flexShrink: 0, gap: 12, overflow: "visible" }}>
+        <div style={{ position: "absolute", left: "50%", top: "50%", transform: "translate(-50%, -50%)", display: "flex", alignItems: "center", minWidth: 0, maxWidth: "calc(100% - 42px)" }}>
+          <div
+            role="tablist"
+            aria-label="项目展开内容"
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 0,
+              padding: "2px",
+              borderRadius: "8px",
+              border: "1px solid rgba(100, 116, 139, 0.36)",
+              background: "rgba(148, 163, 184, 0.10)",
+              minWidth: 0,
+            }}
+          >
+            {([
+              ["files", "文件"],
+              ["git", "git"],
+              ["worktrees", "工作树"],
+              ["related", "关联文件"],
+            ] as const).map(([value, label], index) => {
+              const active = projectTreeTab === value;
+              return (
+                <React.Fragment key={value}>
+                  {index > 0 ? (
+                    <span
+                      aria-hidden="true"
+                      style={{
+                        width: "1px",
+                        height: "16px",
+                        background: "rgba(100, 116, 139, 0.32)",
+                        margin: "0 1px",
+                        flexShrink: 0,
+                      }}
+                    />
+                  ) : null}
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={active}
+                    onClick={() => setProjectTreeTab(value)}
+                    style={{
+                      border: "none",
+                      borderRadius: "6px",
+                      background: active ? "var(--accent-color)" : "transparent",
+                      color: active ? "#fff" : "var(--text-secondary)",
+                      padding: "3px 7px",
+                      fontSize: "11px",
+                      fontWeight: 700,
+                      lineHeight: "14px",
+                      cursor: "pointer",
+                      whiteSpace: "nowrap",
+                      boxShadow: active ? "0 1px 3px rgba(37, 99, 235, 0.28)" : "none",
+                    }}
+                  >
+                    {label}
+                  </button>
+                </React.Fragment>
+              );
+            })}
+          </div>
+        </div>
+        <div ref={menuRef} style={{ position: "relative", flexShrink: 0 }}>
           <button
             type="button"
             onClick={() => {
@@ -1903,6 +2216,7 @@ export function FileTree({
                   </svg>
                   <span>公网访问本地服务</span>
                 </button>
+                {!isNativeApp ? <WebPushMenuItem /> : null}
                 <div style={{ height: "1px", background: "var(--border-color)", margin: "6px 4px" }} />
                 <button
                   type="button"
@@ -2045,6 +2359,81 @@ export function FileTree({
               >
                 <span>显示隐藏文件</span>
                 <span style={{ fontSize: "11px", opacity: showHiddenFiles ? 1 : 0 }}>✓</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  onMultiProjectSessionsChange?.(!multiProjectSessionsEnabled);
+                  setIsAppearanceMenuOpen(false);
+                  setIsSortMenuOpen(false);
+                }}
+                style={{
+                  width: "100%",
+                  border: "none",
+                  background: multiProjectSessionsEnabled ? "var(--selection-bg)" : "transparent",
+                  color: multiProjectSessionsEnabled ? "var(--accent-color)" : "var(--text-primary)",
+                  borderRadius: "8px",
+                  padding: "8px 10px",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  textAlign: "left",
+                  cursor: "pointer",
+                  fontSize: "12px",
+                }}
+              >
+                <span>多项目会话列表</span>
+                <span style={{ fontSize: "11px", opacity: multiProjectSessionsEnabled ? 1 : 0 }}>✓</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  onSidebarsSwappedChange?.(!sidebarsSwapped);
+                  setIsAppearanceMenuOpen(false);
+                  setIsSortMenuOpen(false);
+                }}
+                style={{
+                  width: "100%",
+                  border: "none",
+                  background: sidebarsSwapped ? "var(--selection-bg)" : "transparent",
+                  color: sidebarsSwapped ? "var(--accent-color)" : "var(--text-primary)",
+                  borderRadius: "8px",
+                  padding: "8px 10px",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  textAlign: "left",
+                  cursor: "pointer",
+                  fontSize: "12px",
+                }}
+              >
+                <span>交换左右侧边栏</span>
+                <span style={{ fontSize: "11px", opacity: sidebarsSwapped ? 1 : 0 }}>✓</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  onGitDiffSideBySideChange?.(!gitDiffSideBySide);
+                  setIsAppearanceMenuOpen(false);
+                  setIsSortMenuOpen(false);
+                }}
+                style={{
+                  width: "100%",
+                  border: "none",
+                  background: gitDiffSideBySide ? "var(--selection-bg)" : "transparent",
+                  color: gitDiffSideBySide ? "var(--accent-color)" : "var(--text-primary)",
+                  borderRadius: "8px",
+                  padding: "8px 10px",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  textAlign: "left",
+                  cursor: "pointer",
+                  fontSize: "12px",
+                }}
+              >
+                <span>双栏 diff 视图</span>
+                <span style={{ fontSize: "11px", opacity: gitDiffSideBySide ? 1 : 0 }}>✓</span>
               </button>
               {showEnterKeySendOption ? (
                 <button

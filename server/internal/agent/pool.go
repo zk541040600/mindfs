@@ -120,27 +120,36 @@ func (p *Pool) openSession(ctx context.Context, protocol Protocol, def Definitio
 			SessionKey:      in.SessionKey,
 			Model:           in.Model,
 			Effort:          in.Effort,
-			PlanMode:       in.PlanMode,
+			PlanMode:        in.PlanMode,
 			RootPath:        in.RootPath,
 			Command:         def.Command,
 			Args:            append([]string{}, def.Args...),
 			Env:             cloneEnv(def.Env),
 			ResumeSessionID: in.AgentSessionID,
+			ForkSessionID:   in.ForkPoint.AgentSessionID,
+			ResumeMessageID: in.ForkPoint.ClaudeMessageUUID,
 		})
 	case ProtocolCodexSDK:
+		var codexUserOrdinal *int
+		if in.ForkPoint.Kind == agenttypes.ForkPointCodexUserOrdinal {
+			value := in.ForkPoint.CodexUserOrdinal
+			codexUserOrdinal = &value
+		}
 		return p.codex.OpenSession(ctx, codex.OpenOptions{
-			AgentName:       in.AgentName,
-			SessionKey:      in.SessionKey,
-			Model:           in.Model,
-			Effort:          in.Effort,
-			FastService:     in.FastService,
-			PlanMode:       in.PlanMode,
-			Probe:           in.Probe,
-			RootPath:        in.RootPath,
-			Command:         def.Command,
-			Args:            append([]string{}, def.Args...),
-			Env:             cloneEnv(def.Env),
-			ResumeSessionID: in.AgentSessionID,
+			AgentName:        in.AgentName,
+			SessionKey:       in.SessionKey,
+			Model:            in.Model,
+			Effort:           in.Effort,
+			FastService:      in.FastService,
+			PlanMode:         in.PlanMode,
+			Probe:            in.Probe,
+			RootPath:         in.RootPath,
+			Command:          def.Command,
+			Args:             append([]string{}, def.Args...),
+			Env:              cloneEnv(def.Env),
+			ResumeSessionID:  in.AgentSessionID,
+			ForkSessionID:    in.ForkPoint.AgentSessionID,
+			CodexUserOrdinal: codexUserOrdinal,
 		})
 	case ProtocolPiRPC:
 		return p.pi.OpenSession(ctx, pi.OpenOptions{
@@ -175,6 +184,7 @@ func (p *Pool) openSession(ctx context.Context, protocol Protocol, def Definitio
 			SessionKey:      in.SessionKey,
 			Model:           in.Model,
 			Mode:            in.Mode,
+			Effort:          in.Effort,
 			RootPath:        in.RootPath,
 			Command:         def.Command,
 			Args:            def.BuildArgs(in.RootPath),

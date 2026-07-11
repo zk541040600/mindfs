@@ -22,6 +22,7 @@ type OpenOptions struct {
 	SessionKey      string
 	Model           string
 	Mode            string
+	Effort          string
 	RootPath        string
 	Command         string
 	Args            []string
@@ -76,33 +77,17 @@ func (r *Runtime) OpenSession(ctx context.Context, opts OpenOptions) (types.Sess
 			return nil, err
 		}
 	}
+	if strings.TrimSpace(opts.Effort) != "" {
+		if err := proc.SetThoughtLevel(ctx, opts.SessionKey, opts.Effort); err != nil {
+			proc.CloseSession(opts.SessionKey)
+			return nil, err
+		}
+	}
 	return &session{
 		proc:          proc,
 		sessionKey:    opts.SessionKey,
 		agentDebugLog: logs.NewAgentLogger(opts.RootPath, opts.SessionKey, opts.AgentName),
 	}, nil
-}
-
-func mapModelState(state *acpsdk.SessionModelState) types.ModelList {
-	if state == nil {
-		return types.ModelList{}
-	}
-	models := make([]types.ModelInfo, 0, len(state.AvailableModels))
-	for _, model := range state.AvailableModels {
-		description := ""
-		if model.Description != nil {
-			description = *model.Description
-		}
-		models = append(models, types.ModelInfo{
-			ID:          string(model.ModelId),
-			Name:        model.Name,
-			Description: description,
-		})
-	}
-	return types.ModelList{
-		CurrentModelID: string(state.CurrentModelId),
-		Models:         models,
-	}
 }
 
 func mapCommandState(commands []acpsdk.AvailableCommand) types.CommandList {
@@ -290,7 +275,7 @@ func (s *session) CurrentModel() string {
 	if s == nil || s.proc == nil {
 		return ""
 	}
-	return strings.TrimSpace(mapModelState(s.proc.SessionModelState(s.sessionKey)).CurrentModelID)
+	return strings.TrimSpace(mapModelConfigOptions(s.proc.SessionConfigOptions(s.sessionKey)).CurrentModelID)
 }
 
 func (s *session) SetModel(ctx context.Context, model string) error {
@@ -304,7 +289,7 @@ func (s *session) ListModels(_ context.Context) (types.ModelList, error) {
 	if s == nil || s.proc == nil {
 		return types.ModelList{}, errors.New("acp session not initialized")
 	}
-	return mapModelState(s.proc.SessionModelState(s.sessionKey)), nil
+	return mapModelConfigOptions(s.proc.SessionConfigOptions(s.sessionKey)), nil
 }
 
 func (s *session) SetMode(ctx context.Context, mode string) error {
@@ -321,6 +306,9 @@ func (s *session) SetPlanMode(_ context.Context, _ bool) error {
 func (s *session) ListModes(_ context.Context) (types.ModeList, error) {
 	if s == nil || s.proc == nil {
 		return types.ModeList{}, errors.New("acp session not initialized")
+	}
+	if modes := mapModeConfigOptions(s.proc.SessionConfigOptions(s.sessionKey)); len(modes.Modes) > 0 || modes.CurrentModeID != "" {
+		return modes, nil
 	}
 	return mapModeState(s.proc.SessionModeState(s.sessionKey)), nil
 }
@@ -352,7 +340,11 @@ func (s *session) OnUpdate(onUpdate func(types.Event)) {
 				})
 				return
 			}
-			onUpdate(convertEvent(update))
+			ev := convertEvent(update)
+			if ev.Type == "" {
+				return
+			}
+			onUpdate(ev)
 		}
 	})
 }
@@ -366,6 +358,17 @@ func (s *session) ContextWindow(_ context.Context) (types.ContextWindow, error) 
 		return types.ContextWindow{}, errors.New("acp session not initialized")
 	}
 	return s.proc.SessionContextWindow(s.sessionKey), nil
+}
+
+func (s *session) RuntimeDefaults(context.Context) (types.RuntimeDefaults, error) {
+	if s == nil || s.proc == nil {
+		return types.RuntimeDefaults{}, errors.New("acp session not initialized")
+	}
+	options := s.proc.SessionConfigOptions(s.sessionKey)
+	return types.RuntimeDefaults{
+		Model:  configOptionCurrentValue(options, acpsdk.SessionConfigOptionCategoryModel),
+		Effort: configOptionCurrentValue(options, acpsdk.SessionConfigOptionCategoryThoughtLevel),
+	}, nil
 }
 
 func (s *session) Close() error {
@@ -408,6 +411,9 @@ func convertEvent(update SessionUpdate) types.Event {
 		}
 	case UpdateTypeToolCall:
 		if raw.ToolCall != nil {
+			if isACPTodoTool(raw.ToolCall.Title, string(raw.ToolCall.Kind), raw.ToolCall.RawInput, raw.ToolCall.RawOutput) {
+				return types.Event{}
+			}
 			locations := make([]types.ToolCallLocation, 0, len(raw.ToolCall.Locations))
 			for _, loc := range raw.ToolCall.Locations {
 				locations = append(locations, types.ToolCallLocation{Path: loc.Path, Line: loc.Line})
@@ -434,6 +440,17 @@ func convertEvent(update SessionUpdate) types.Event {
 		}
 	case UpdateTypeToolUpdate:
 		if raw.ToolCallUpdate != nil {
+			name := ""
+			if raw.ToolCallUpdate.Title != nil {
+				name = *raw.ToolCallUpdate.Title
+			}
+			rawKind := ""
+			if raw.ToolCallUpdate.Kind != nil {
+				rawKind = string(*raw.ToolCallUpdate.Kind)
+			}
+			if isACPTodoTool(name, rawKind, raw.ToolCallUpdate.RawInput, raw.ToolCallUpdate.RawOutput) {
+				return types.Event{}
+			}
 			status := "complete"
 			if raw.ToolCallUpdate.Status != nil && *raw.ToolCallUpdate.Status == acpsdk.ToolCallStatusFailed {
 				status = "failed"
@@ -441,10 +458,6 @@ func convertEvent(update SessionUpdate) types.Event {
 			kind := types.ToolKind("")
 			if raw.ToolCallUpdate.Kind != nil {
 				kind = types.ToolKind(*raw.ToolCallUpdate.Kind)
-			}
-			name := ""
-			if raw.ToolCallUpdate.Title != nil {
-				name = *raw.ToolCallUpdate.Title
 			}
 			locations := make([]types.ToolCallLocation, 0, len(raw.ToolCallUpdate.Locations))
 			for _, loc := range raw.ToolCallUpdate.Locations {
@@ -471,10 +484,132 @@ func convertEvent(update SessionUpdate) types.Event {
 		} else {
 			logUnhandledConvertEvent(update, "extension_ui")
 		}
+	case UpdateTypePlan:
+		if raw.Plan != nil {
+			ev.Type = types.EventTypeTodoUpdate
+			ev.Data = types.TodoUpdate{Items: convertACPPlanEntriesToTodos(raw.Plan.Entries)}
+		} else if raw.PlanUpdate != nil {
+			ev.Type, ev.Data = convertACPPlanUpdate(*raw.PlanUpdate)
+		} else {
+			logUnhandledConvertEvent(update, "plan")
+		}
 	default:
 		logUnhandledConvertEvent(update, "update_type")
 	}
 	return ev
+}
+
+func isACPTodoTool(title, kind string, rawInput, rawOutput any) bool {
+	normalizedKind := strings.ToLower(strings.TrimSpace(kind))
+	if normalizedKind != "" && normalizedKind != "other" && normalizedKind != "todo" {
+		return false
+	}
+	normalizedTitle := strings.ToLower(strings.TrimSpace(title))
+	if normalizedTitle == "todowrite" {
+		return true
+	}
+	return strings.HasSuffix(normalizedTitle, " todos") && (hasACPTodosPayload(rawInput) || hasACPTodosPayload(rawOutput))
+}
+
+func hasACPTodosPayload(value any) bool {
+	normalized := normalizeACPValue(value)
+	data, ok := normalized.(map[string]any)
+	if !ok {
+		return false
+	}
+	if _, ok := data["todos"]; ok {
+		return true
+	}
+	metadata, ok := data["metadata"].(map[string]any)
+	if !ok {
+		return false
+	}
+	_, ok = metadata["todos"]
+	return ok
+}
+
+func normalizeACPValue(value any) any {
+	switch v := value.(type) {
+	case []byte:
+		var decoded any
+		if err := json.Unmarshal(v, &decoded); err == nil {
+			return decoded
+		}
+	case json.RawMessage:
+		var decoded any
+		if err := json.Unmarshal(v, &decoded); err == nil {
+			return decoded
+		}
+	case string:
+		var decoded any
+		if err := json.Unmarshal([]byte(v), &decoded); err == nil {
+			return decoded
+		}
+	}
+	return value
+}
+
+func convertACPPlanUpdate(update acpsdk.SessionPlanUpdate) (types.EventType, any) {
+	content := update.Plan
+	switch {
+	case content.Markdown != nil:
+		return types.EventTypePlanUpdate, types.PlanUpdate{
+			ID:      string(content.Markdown.Id),
+			Content: strings.TrimSpace(content.Markdown.Content),
+		}
+	case content.Items != nil:
+		return types.EventTypeTodoUpdate, types.TodoUpdate{Items: convertACPPlanEntriesToTodos(content.Items.Entries)}
+	case content.File != nil:
+		return types.EventTypePlanUpdate, types.PlanUpdate{
+			ID:      string(content.File.Id),
+			Content: strings.TrimSpace("Plan file: " + content.File.Uri),
+		}
+	default:
+		return types.EventTypePlanUpdate, types.PlanUpdate{}
+	}
+}
+
+func acpPlanUpdateID(update acpsdk.SessionPlanUpdate) string {
+	content := update.Plan
+	switch {
+	case content.Markdown != nil:
+		return string(content.Markdown.Id)
+	case content.Items != nil:
+		return string(content.Items.Id)
+	case content.File != nil:
+		return string(content.File.Id)
+	default:
+		return ""
+	}
+}
+
+func convertACPPlanEntriesToTodos(entries []acpsdk.PlanEntry) []types.TodoItem {
+	if len(entries) == 0 {
+		return nil
+	}
+	items := make([]types.TodoItem, 0, len(entries))
+	for _, entry := range entries {
+		content := strings.TrimSpace(entry.Content)
+		if content == "" {
+			continue
+		}
+		items = append(items, types.TodoItem{
+			Content: content,
+			Status:  normalizeACPPlanStatus(entry.Status),
+		})
+	}
+	return items
+}
+
+func normalizeACPPlanStatus(status acpsdk.PlanEntryStatus) string {
+	switch status {
+	case acpsdk.PlanEntryStatusCompleted:
+		return "completed"
+	case acpsdk.PlanEntryStatusInProgress:
+		return "in_progress"
+	default:
+		return "pending"
+	}
 }
 
 func logUnhandledConvertEvent(update SessionUpdate, scope string) {

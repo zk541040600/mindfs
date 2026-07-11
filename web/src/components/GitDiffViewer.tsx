@@ -5,6 +5,7 @@ import { rootBadgeStyle } from "./rootBadgeStyle";
 type GitDiffViewerProps = {
   diff: GitDiffPayload;
   root?: string | null;
+  sideBySide?: boolean;
   onPathClick?: (path: string) => void;
   onSessionClick?: (sessionKey: string) => void;
   onSelectionChange?: (selection: {
@@ -93,6 +94,13 @@ type DiffLine = {
   newLine?: number;
 };
 
+type SideBySideDiffRow = {
+  kind: "hunk" | "change" | "ctx";
+  hunkText?: string;
+  left?: DiffLine;
+  right?: DiffLine;
+};
+
 function buildDiffLines(content: string): DiffLine[] {
   const source = String(content || "").split("\n");
   const filtered = source.filter((line) => !/^(diff --git|index |--- |\+\+\+ )/.test(line));
@@ -135,6 +143,50 @@ function buildDiffLines(content: string): DiffLine[] {
   return lines;
 }
 
+function buildSideBySideRows(lines: DiffLine[]): SideBySideDiffRow[] {
+  const rows: SideBySideDiffRow[] = [];
+  let index = 0;
+
+  while (index < lines.length) {
+    const line = lines[index];
+    if (line.kind === "hunk") {
+      rows.push({ kind: "hunk", hunkText: line.text });
+      index += 1;
+      continue;
+    }
+    if (line.kind === "ctx") {
+      rows.push({ kind: "ctx", left: line, right: line });
+      index += 1;
+      continue;
+    }
+    if (line.kind === "del" || line.kind === "add") {
+      const deleted: DiffLine[] = [];
+      const added: DiffLine[] = [];
+      while (index < lines.length && (lines[index].kind === "del" || lines[index].kind === "add")) {
+        const current = lines[index];
+        if (current.kind === "del") {
+          deleted.push(current);
+        } else {
+          added.push(current);
+        }
+        index += 1;
+      }
+      const count = Math.max(deleted.length, added.length);
+      for (let rowIndex = 0; rowIndex < count; rowIndex += 1) {
+        rows.push({
+          kind: "change",
+          left: deleted[rowIndex],
+          right: added[rowIndex],
+        });
+      }
+      continue;
+    }
+    index += 1;
+  }
+
+  return rows;
+}
+
 function lineBackground(kind: DiffLine["kind"]): string {
   switch (kind) {
     case "add":
@@ -166,6 +218,14 @@ function displayLineNumber(line: DiffLine): string {
     return String(line.newLine);
   }
   return "";
+}
+
+function displayOldLineNumber(line?: DiffLine): string {
+  return line && typeof line.oldLine === "number" ? String(line.oldLine) : "";
+}
+
+function displayNewLineNumber(line?: DiffLine): string {
+  return line && typeof line.newLine === "number" ? String(line.newLine) : "";
 }
 
 function normalizeRelatedSessions(raw: unknown): RelatedSession[] {
@@ -207,9 +267,11 @@ function normalizeRelatedSessions(raw: unknown): RelatedSession[] {
   });
 }
 
-export function GitDiffViewer({ diff, root, onPathClick, onSessionClick, onSelectionChange }: GitDiffViewerProps) {
+export function GitDiffViewer({ diff, root, sideBySide = false, onPathClick, onSessionClick, onSelectionChange }: GitDiffViewerProps) {
   const lines = React.useMemo(() => buildDiffLines(diff.content), [diff.content]);
+  const sideBySideRows = React.useMemo(() => buildSideBySideRows(lines), [lines]);
   const relatedSessions = React.useMemo(() => normalizeRelatedSessions(diff.file_meta), [diff.file_meta]);
+  const displayPath = diff.display_path || diff.path;
   const contentRootRef = React.useRef<HTMLDivElement | null>(null);
   const [isMobile, setIsMobile] = React.useState(() => {
     if (typeof window === "undefined") return false;
@@ -286,7 +348,7 @@ export function GitDiffViewer({ diff, root, onPathClick, onSessionClick, onSelec
     <div style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0 }}>
       <header style={{ height: "36px", padding: "0 16px", borderBottom: "1px solid var(--border-color)", display: "flex", alignItems: "center", gap: "10px", background: "var(--mindfs-topbar-bg, transparent)", boxSizing: "border-box", flexShrink: 0 }}>
         <div style={{ display: "flex", alignItems: "center", overflow: "hidden", flex: 1, minWidth: 0 }}>
-          <Breadcrumbs root={root} path={diff.path} onPathClick={onPathClick} />
+          <Breadcrumbs root={root} path={displayPath} onPathClick={onPathClick} />
 
           {relatedSessions.length > 0 ? (
             <div style={{ marginLeft: "16px", display: "flex", alignItems: "center", gap: "6px", minWidth: 0, flexShrink: 0 }}>
@@ -376,39 +438,125 @@ export function GitDiffViewer({ diff, root, onPathClick, onSessionClick, onSelec
         >
           <div ref={contentRootRef} style={{ position: "relative" }}>
             <div style={{ padding: "24px 8px 24px 4px" }}>
-              <div style={{ color: "var(--text-primary)" }}>
-                {lines.map((line, index) => (
-                  <div
-                    key={`${index}-${line.kind}-${line.oldLine || 0}-${line.newLine || 0}`}
-                    data-line-number={line.kind === "add" && typeof line.newLine === "number" ? line.newLine : undefined}
-                    style={{
-                      display: "grid",
-                      gridTemplateColumns: "34px 14px minmax(0, 1fr)",
-                      alignItems: "stretch",
-                      background: lineBackground(line.kind),
-                      color: lineColor(line.kind),
-                    }}
-                  >
+              <div style={{ color: "var(--text-primary)", minWidth: sideBySide ? "960px" : 0 }}>
+                {sideBySide ? (
+                  sideBySideRows.map((row, index) => {
+                    if (row.kind === "hunk") {
+                      return (
+                        <div
+                          key={`${index}-hunk`}
+                          style={{
+                            display: "grid",
+                            gridTemplateColumns: "minmax(0, 1fr)",
+                            background: lineBackground("hunk"),
+                            color: lineColor("hunk"),
+                          }}
+                        >
+                          <div style={{ padding: "0 12px", whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+                            {row.hunkText || " "}
+                          </div>
+                        </div>
+                      );
+                    }
+                    const leftKind = row.left?.kind || "ctx";
+                    const rightKind = row.right?.kind || "ctx";
+                    return (
+                      <div
+                        key={`${index}-${row.left?.oldLine || 0}-${row.right?.newLine || 0}`}
+                        data-line-number={typeof row.right?.newLine === "number" ? row.right.newLine : undefined}
+                        style={{
+                          display: "grid",
+                          gridTemplateColumns: "48px minmax(0, 1fr) 48px minmax(0, 1fr)",
+                          alignItems: "stretch",
+                          borderBottom: "1px solid rgba(148, 163, 184, 0.08)",
+                        }}
+                      >
+                        <div
+                          style={{
+                            padding: "0 6px 0 0",
+                            textAlign: "right",
+                            color: "var(--text-secondary)",
+                            opacity: 0.55,
+                            userSelect: "none",
+                            fontVariantNumeric: "tabular-nums",
+                            background: row.left ? lineBackground(leftKind) : "rgba(148, 163, 184, 0.05)",
+                          }}
+                        >
+                          {displayOldLineNumber(row.left)}
+                        </div>
+                        <div
+                          style={{
+                            padding: "0 12px 0 6px",
+                            whiteSpace: "pre-wrap",
+                            wordBreak: "break-word",
+                            background: row.left ? lineBackground(leftKind) : "rgba(148, 163, 184, 0.05)",
+                            color: row.left ? lineColor(leftKind) : "var(--text-secondary)",
+                            borderRight: "1px solid var(--border-color)",
+                          }}
+                        >
+                          {row.left ? `${row.left.kind === "del" ? "-" : " "}${row.left.text || " "}` : " "}
+                        </div>
+                        <div
+                          style={{
+                            padding: "0 6px 0 0",
+                            textAlign: "right",
+                            color: "var(--text-secondary)",
+                            opacity: 0.55,
+                            userSelect: "none",
+                            fontVariantNumeric: "tabular-nums",
+                            background: row.right ? lineBackground(rightKind) : "rgba(148, 163, 184, 0.05)",
+                          }}
+                        >
+                          {displayNewLineNumber(row.right)}
+                        </div>
+                        <div
+                          style={{
+                            padding: "0 12px 0 6px",
+                            whiteSpace: "pre-wrap",
+                            wordBreak: "break-word",
+                            background: row.right ? lineBackground(rightKind) : "rgba(148, 163, 184, 0.05)",
+                            color: row.right ? lineColor(rightKind) : "var(--text-secondary)",
+                          }}
+                        >
+                          {row.right ? `${row.right.kind === "add" ? "+" : " "}${row.right.text || " "}` : " "}
+                        </div>
+                      </div>
+                    );
+                  })
+                ) : (
+                  lines.map((line, index) => (
                     <div
+                      key={`${index}-${line.kind}-${line.oldLine || 0}-${line.newLine || 0}`}
+                      data-line-number={line.kind === "add" && typeof line.newLine === "number" ? line.newLine : undefined}
                       style={{
-                        padding: "0 4px 0 0",
-                        textAlign: "right",
-                        color: "var(--text-secondary)",
-                        opacity: 0.55,
-                        userSelect: "none",
-                        fontVariantNumeric: "tabular-nums",
+                        display: "grid",
+                        gridTemplateColumns: "34px 14px minmax(0, 1fr)",
+                        alignItems: "stretch",
+                        background: lineBackground(line.kind),
+                        color: lineColor(line.kind),
                       }}
                     >
-                      {line.kind === "add" ? displayLineNumber(line) : ""}
+                      <div
+                        style={{
+                          padding: "0 4px 0 0",
+                          textAlign: "right",
+                          color: "var(--text-secondary)",
+                          opacity: 0.55,
+                          userSelect: "none",
+                          fontVariantNumeric: "tabular-nums",
+                        }}
+                      >
+                        {line.kind === "add" ? displayLineNumber(line) : ""}
+                      </div>
+                      <div style={{ padding: "0", userSelect: "none", fontWeight: 700 }}>
+                        {line.kind === "add" ? "+" : line.kind === "del" ? "-" : line.kind === "ctx" ? " " : ""}
+                      </div>
+                      <div style={{ padding: "0 12px 0 4px", whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+                        {line.text || " "}
+                      </div>
                     </div>
-                    <div style={{ padding: "0", userSelect: "none", fontWeight: 700 }}>
-                      {line.kind === "add" ? "+" : line.kind === "del" ? "-" : line.kind === "ctx" ? " " : ""}
-                    </div>
-                    <div style={{ padding: "0 12px 0 4px", whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
-                      {line.text || " "}
-                    </div>
-                  </div>
-                ))}
+                  ))
+                )}
               </div>
             </div>
           </div>

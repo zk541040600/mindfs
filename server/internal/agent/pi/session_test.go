@@ -297,8 +297,11 @@ func TestListCommandsModelsAndModes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if modes.CurrentModeID != "off" || len(modes.Modes) < 6 {
+	if modes.CurrentModeID != "off" || len(modes.Modes) < 7 {
 		t.Fatalf("unexpected modes: %+v", modes)
+	}
+	if modes.Modes[len(modes.Modes)-1].ID != "max" {
+		t.Fatalf("last mode = %+v, want max", modes.Modes[len(modes.Modes)-1])
 	}
 	if err := s.SetModel(ctx, "bad-provider/bad-model"); err == nil || !strings.Contains(err.Error(), "unknown model") {
 		t.Fatalf("expected model error, got %v", err)

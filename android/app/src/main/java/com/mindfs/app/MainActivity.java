@@ -553,13 +553,17 @@ public class MainActivity extends BridgeActivity {
         }
 
         @JavascriptInterface
-        public String downloadBase64(String data, String filename) {
+        public String saveBase64(String dataBase64, String filename, String mimeType) {
             try {
                 String safeFilename = NativeDownloadPlugin.sanitizeFilename(filename);
                 if (safeFilename.isEmpty()) {
                     safeFilename = "download";
                 }
-                NativeDownloadPlugin.saveBase64ToDownloads(MainActivity.this, data, safeFilename);
+                String safeMimeType = mimeType == null || mimeType.trim().isEmpty()
+                    ? "application/octet-stream"
+                    : mimeType.trim();
+                byte[] data = android.util.Base64.decode(dataBase64, android.util.Base64.DEFAULT);
+                NativeDownloadPlugin.saveBytesToDownloads(MainActivity.this, data, safeFilename, safeMimeType);
                 return "";
             } catch (Exception ex) {
                 return "Failed to save download: " + ex.getMessage();

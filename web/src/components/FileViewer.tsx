@@ -339,7 +339,7 @@ export function FileViewer({ file, onSessionClick, onPathClick, onFileClick, onS
         path: file.path,
         name: file.name,
       });
-      showToast(isNativeShellRuntime() ? "已加入系统下载队列，请查看通知栏或下载目录" : "下载已开始，请查看浏览器下载栏", true);
+      showToast(isNativeShellRuntime() ? "已保存到系统下载目录" : "下载已开始，请查看浏览器下载栏", true);
     } catch (error) {
       const message = error instanceof Error ? error.message : "下载失败";
       showToast(message, false);

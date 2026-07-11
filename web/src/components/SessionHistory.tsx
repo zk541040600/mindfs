@@ -6,6 +6,7 @@ type SessionInfo = {
   key: string;
   name: string;
   type: "chat" | "plugin" | "command";
+  task_id?: string;
   agent: string;
   model?: string;
   mode?: string;
@@ -22,9 +23,9 @@ type Exchange = {
 type SessionHistoryProps = {
   session: SessionInfo | null;
   exchanges?: Exchange[];
-  relatedFiles?: { path: string; name: string }[];
+  relatedFiles?: { path: string; name: string; head?: string; repo_path?: string; repo_name?: string; repo_kind?: string }[];
   onRestore?: () => void;
-  onFileClick?: (path: string) => void;
+  onFileClick?: (file: { path: string; head?: string; repo_path?: string; repo_name?: string; repo_kind?: string }) => void;
   onClose?: () => void;
 };
 
@@ -32,6 +33,7 @@ const typeLabels: Record<string, string> = {
   chat: "对话",
   plugin: "视图插件",
   command: "命令执行",
+  task: "任务",
   skill: "对话",
 };
 
@@ -44,6 +46,60 @@ export function SessionHistory({
   onClose,
 }: SessionHistoryProps) {
   if (!session) return null;
+  const relatedFileGroups = (() => {
+    const repoGroups = relatedFiles.reduce<
+      Array<{
+        key: string;
+        repoPath: string;
+        repoName: string;
+        repoKind: string;
+        headGroups: Array<{ key: string; head: string; files: typeof relatedFiles }>;
+      }>
+    >((groups, file) => {
+    const head = file.head || "";
+    const rawRepoPath = file.repo_path || "";
+    const isCurrentRepoRecord = !rawRepoPath || file.repo_name === "当前项目";
+    const repoPath = isCurrentRepoRecord ? "" : rawRepoPath;
+    const rawRepoKind = file.repo_kind || "";
+    const repoKind = isCurrentRepoRecord && rawRepoKind !== "plain" ? "" : rawRepoKind;
+    const repoKey = `${repoKind}\0${repoPath}`;
+    let repoGroup = groups.find((group) => group.key === repoKey);
+    if (!repoGroup) {
+      repoGroup = {
+        key: repoKey,
+        repoPath,
+        repoName: isCurrentRepoRecord
+          ? "当前项目"
+          : file.repo_name || repoPath.split(/[\\/]/).filter(Boolean).pop() || "当前项目",
+        repoKind,
+        headGroups: [],
+      };
+      groups.push(repoGroup);
+    }
+    const headKey = `${repoKey}\0${head}`;
+    const existing = repoGroup.headGroups.find((group) => group.key === headKey);
+    if (existing) {
+      existing.files.push(file);
+    } else {
+      repoGroup.headGroups.push({
+        key: headKey,
+        head,
+        files: [file],
+      });
+    }
+    return groups;
+    }, []);
+    return repoGroups.flatMap((repoGroup) =>
+      repoGroup.headGroups.map((headGroup) => ({
+        key: headGroup.key,
+        head: headGroup.head,
+        repoPath: repoGroup.repoPath,
+        repoName: repoGroup.repoName,
+        repoKind: repoGroup.repoKind,
+        files: headGroup.files,
+      })),
+    );
+  })();
 
   return (
     <div
@@ -66,13 +122,13 @@ export function SessionHistory({
           background: "rgba(0,0,0,0.02)",
         }}
       >
-        <ModeIcon type={session.type || "chat"} size={20} />
+        <ModeIcon type={session.task_id ? "task" : session.type || "chat"} size={20} />
         <div style={{ flex: 1 }}>
           <div style={{ fontSize: "16px", fontWeight: 600 }}>
             {session.name || `Session ${session.key.slice(0, 8)}`}
           </div>
           <div style={{ fontSize: "12px", color: "var(--text-secondary)" }}>
-            {typeLabels[session.type]} · {session.agent || "-"} · 已关闭
+            {typeLabels[session.task_id ? "task" : session.type]} · {session.agent || "-"} · 已关闭
           </div>
         </div>
         <button
@@ -189,10 +245,33 @@ export function SessionHistory({
               关联文件
             </div>
             <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
-              {relatedFiles.map((file, i) => (
+              {relatedFileGroups.map((group) => {
+                const isCurrentRepo = !group.repoPath || group.repoName === "当前项目";
+                const showGroupHeader = group.repoKind === "plain" || group.head || !isCurrentRepo;
+                return (
+                  <div key={group.key} style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+                    {showGroupHeader ? (
+                      <div
+                        title={[group.repoPath, group.head].filter(Boolean).join(" · ") || group.repoName || "当前项目"}
+                        style={{
+                          fontSize: "11px",
+                          color: "var(--text-secondary)",
+                          fontFamily: group.head ? "var(--mono-font, monospace)" : undefined,
+                        }}
+                      >
+                        {group.repoKind === "plain"
+                          ? `${group.repoName || "当前项目"} · 非 Git`
+                          : group.head
+                            ? isCurrentRepo
+                              ? `HEAD ${group.head.slice(0, 8)}`
+                              : `${group.repoName || "当前项目"} · HEAD ${group.head.slice(0, 8)}`
+                            : group.repoName || "当前项目"}
+                      </div>
+                    ) : null}
+                    {group.files.map((file) => (
                 <button
-                  key={i}
-                  onClick={() => onFileClick?.(file.path)}
+                  key={`${file.head || "legacy"}:${file.path}`}
+                  onClick={() => onFileClick?.(file)}
                   style={{
                     display: "flex",
                     alignItems: "center",
@@ -239,7 +318,10 @@ export function SessionHistory({
                   </div>
                   <span style={{ fontSize: "12px", color: "var(--text-secondary)" }}>→</span>
                 </button>
-              ))}
+                    ))}
+                  </div>
+                );
+              })}
             </div>
           </div>
         )}

@@ -1103,6 +1103,7 @@ func (s *session) ListModes(ctx context.Context) (agenttypes.ModeList, error) {
 		{ID: "medium", Name: "Thinking: medium"},
 		{ID: "high", Name: "Thinking: high"},
 		{ID: "xhigh", Name: "Thinking: xhigh"},
+		{ID: "max", Name: "Thinking: max"},
 	}
 	s.mu.RLock()
 	current := s.mode

@@ -21,6 +21,7 @@ type StatusItem struct {
 	Path      string `json:"path"`
 	OldPath   string `json:"old_path,omitempty"`
 	Status    string `json:"status"`
+	Staged    bool   `json:"staged,omitempty"`
 	Additions int    `json:"additions"`
 	Deletions int    `json:"deletions"`
 	IsDir     bool   `json:"is_dir,omitempty"`
@@ -54,6 +55,11 @@ type WorktreeListResult struct {
 	Items []WorktreeItem `json:"items"`
 }
 
+type RepositoryInfo struct {
+	Path string `json:"path"`
+	Head string `json:"head,omitempty"`
+}
+
 type DiffResult struct {
 	Path      string             `json:"path"`
 	OldPath   string             `json:"old_path,omitempty"`
@@ -62,6 +68,13 @@ type DiffResult struct {
 	Deletions int                `json:"deletions"`
 	Content   string             `json:"content"`
 	FileMeta  []fs.FileMetaEntry `json:"file_meta,omitempty"`
+}
+
+type RelatedFileDiffResult struct {
+	DiffResult
+	BaseHead   string `json:"base_head,omitempty"`
+	TargetHead string `json:"target_head,omitempty"`
+	Source     string `json:"source,omitempty"`
 }
 
 type HistoryItem struct {
@@ -82,6 +95,11 @@ type HistoryResult struct {
 type CommitFilesResult struct {
 	Commit string       `json:"commit"`
 	Items  []StatusItem `json:"items"`
+}
+
+type ActionResult struct {
+	Output string       `json:"output"`
+	Status StatusResult `json:"status"`
 }
 
 type repoContext struct {
@@ -138,6 +156,20 @@ func IsWorktree(rootPath string) (bool, error) {
 		return false, err
 	}
 	return info.Mode().IsRegular(), nil
+}
+
+func IsInsideWorktree(ctx context.Context, path string) (bool, error) {
+	repo, err := loadRepoContext(ctx, path)
+	if err != nil {
+		if errors.Is(err, exec.ErrNotFound) {
+			return false, err
+		}
+		if isNotRepoError(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return IsWorktree(repo.repoRoot)
 }
 
 func ListBranches(ctx context.Context, rootPath string) (BranchListResult, error) {
@@ -199,6 +231,133 @@ func CheckoutBranch(ctx context.Context, rootPath, branch string) error {
 	return err
 }
 
+func Pull(ctx context.Context, rootPath string) (ActionResult, error) {
+	repo, err := loadRepoContext(ctx, rootPath)
+	if err != nil {
+		return ActionResult{}, err
+	}
+	output, err := runGit(ctx, repo.repoRoot, "pull", "--ff-only")
+	if err != nil {
+		return ActionResult{}, err
+	}
+	status, err := InspectStatus(ctx, rootPath)
+	if err != nil {
+		return ActionResult{}, err
+	}
+	return ActionResult{Output: strings.TrimSpace(output), Status: status}, nil
+}
+
+func Push(ctx context.Context, rootPath string) (ActionResult, error) {
+	repo, err := loadRepoContext(ctx, rootPath)
+	if err != nil {
+		return ActionResult{}, err
+	}
+	output, err := runGit(ctx, repo.repoRoot, "push")
+	if err != nil {
+		return ActionResult{}, err
+	}
+	status, err := InspectStatus(ctx, rootPath)
+	if err != nil {
+		return ActionResult{}, err
+	}
+	return ActionResult{Output: strings.TrimSpace(output), Status: status}, nil
+}
+
+func Commit(ctx context.Context, rootPath, message string) (ActionResult, error) {
+	repo, err := loadRepoContext(ctx, rootPath)
+	if err != nil {
+		return ActionResult{}, err
+	}
+	message = strings.TrimSpace(message)
+	if message == "" {
+		return ActionResult{}, errors.New("commit message required")
+	}
+	if strings.ContainsAny(message, "\x00\r\n") {
+		return ActionResult{}, errors.New("invalid commit message")
+	}
+	output, err := runGit(ctx, repo.repoRoot, "commit", "-am", message)
+	if err != nil {
+		return ActionResult{}, err
+	}
+	status, err := InspectStatus(ctx, rootPath)
+	if err != nil {
+		return ActionResult{}, err
+	}
+	return ActionResult{Output: strings.TrimSpace(output), Status: status}, nil
+}
+
+func StagePath(ctx context.Context, rootPath, relPath string) (ActionResult, error) {
+	repo, repoPath, err := resolveActionPath(ctx, rootPath, relPath)
+	if err != nil {
+		return ActionResult{}, err
+	}
+	output, err := runGit(ctx, repo.repoRoot, "add", "--", repoPath)
+	if err != nil {
+		return ActionResult{}, err
+	}
+	status, err := InspectStatus(ctx, rootPath)
+	if err != nil {
+		return ActionResult{}, err
+	}
+	return ActionResult{Output: strings.TrimSpace(output), Status: status}, nil
+}
+
+func UnstagePath(ctx context.Context, rootPath, relPath string) (ActionResult, error) {
+	repo, repoPath, err := resolveActionPath(ctx, rootPath, relPath)
+	if err != nil {
+		return ActionResult{}, err
+	}
+	output, err := runGit(ctx, repo.repoRoot, "restore", "--staged", "--", repoPath)
+	if err != nil {
+		return ActionResult{}, err
+	}
+	status, err := InspectStatus(ctx, rootPath)
+	if err != nil {
+		return ActionResult{}, err
+	}
+	return ActionResult{Output: strings.TrimSpace(output), Status: status}, nil
+}
+
+func DiscardPath(ctx context.Context, rootPath, relPath, statusCode string) (ActionResult, error) {
+	repo, repoPath, err := resolveActionPath(ctx, rootPath, relPath)
+	if err != nil {
+		return ActionResult{}, err
+	}
+	var output string
+	if strings.TrimSpace(statusCode) == "??" {
+		output, err = runGit(ctx, repo.repoRoot, "clean", "-fd", "--", repoPath)
+	} else {
+		output, err = runGit(ctx, repo.repoRoot, "restore", "--staged", "--worktree", "--", repoPath)
+	}
+	if err != nil {
+		return ActionResult{}, err
+	}
+	status, err := InspectStatus(ctx, rootPath)
+	if err != nil {
+		return ActionResult{}, err
+	}
+	return ActionResult{Output: strings.TrimSpace(output), Status: status}, nil
+}
+
+func resolveActionPath(ctx context.Context, rootPath, relPath string) (repoContext, string, error) {
+	repo, err := loadRepoContext(ctx, rootPath)
+	if err != nil {
+		return repoContext{}, "", err
+	}
+	relPath = strings.TrimSpace(filepath.ToSlash(relPath))
+	if relPath == "" {
+		return repoContext{}, "", errors.New("path required")
+	}
+	if strings.ContainsAny(relPath, "\x00\r\n") {
+		return repoContext{}, "", errors.New("invalid path")
+	}
+	cleanPath := filepath.ToSlash(filepath.Clean(relPath))
+	if cleanPath == "." || strings.HasPrefix(cleanPath, "../") || cleanPath == ".." {
+		return repoContext{}, "", errors.New("invalid path")
+	}
+	return repo, repo.toRepoPath(cleanPath), nil
+}
+
 func ListWorktrees(ctx context.Context, rootPath string) (WorktreeListResult, error) {
 	if _, err := loadRepoContext(ctx, rootPath); err != nil {
 		return WorktreeListResult{}, err
@@ -254,6 +413,63 @@ func ListWorktrees(ctx context.Context, rootPath string) (WorktreeListResult, er
 	}
 	flush()
 	return WorktreeListResult{Items: items}, nil
+}
+
+func ResolveRepositoryForPath(ctx context.Context, filePath string) (RepositoryInfo, error) {
+	dir := nearestExistingDir(filePath)
+	if dir == "" {
+		return RepositoryInfo{}, errors.New("path required")
+	}
+	repoRootOutput, err := runGit(ctx, dir, "rev-parse", "--show-toplevel")
+	if err != nil {
+		return RepositoryInfo{}, err
+	}
+	repoRoot := strings.TrimSpace(repoRootOutput)
+	if repoRoot == "" {
+		return RepositoryInfo{}, errors.New("empty git repo root")
+	}
+	if resolvedRepoRoot, err := filepath.EvalSymlinks(repoRoot); err == nil {
+		repoRoot = filepath.Clean(resolvedRepoRoot)
+	} else {
+		repoRoot = filepath.Clean(repoRoot)
+	}
+	headOutput, err := runGit(ctx, repoRoot, "rev-parse", "HEAD")
+	if err != nil {
+		headOutput = ""
+	}
+	return RepositoryInfo{
+		Path: repoRoot,
+		Head: strings.TrimSpace(headOutput),
+	}, nil
+}
+
+func nearestExistingDir(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return ""
+	}
+	path = filepath.Clean(path)
+	if info, err := os.Stat(path); err == nil {
+		if info.IsDir() {
+			return path
+		}
+		return filepath.Dir(path)
+	}
+	dir := filepath.Dir(path)
+	for dir != "" && dir != "." && dir != string(filepath.Separator) {
+		if info, err := os.Stat(dir); err == nil && info.IsDir() {
+			return dir
+		}
+		next := filepath.Dir(dir)
+		if next == dir {
+			break
+		}
+		dir = next
+	}
+	if info, err := os.Stat(dir); err == nil && info.IsDir() {
+		return dir
+	}
+	return ""
 }
 
 func AddWorktree(ctx context.Context, rootPath, targetPath, branchMode, branch string) error {
@@ -481,6 +697,56 @@ func ReadCommitDiff(ctx context.Context, rootPath, commit, relPath string) (Diff
 	}, nil
 }
 
+func ReadRelatedFileDiff(ctx context.Context, rootPath, baseHead, relPath string) (RelatedFileDiffResult, error) {
+	repo, err := loadRepoContext(ctx, rootPath)
+	if err != nil {
+		return RelatedFileDiffResult{}, err
+	}
+	baseHead = strings.TrimSpace(baseHead)
+	if baseHead == "" {
+		diff, err := ReadDiff(ctx, rootPath, relPath)
+		if err != nil {
+			return RelatedFileDiffResult{}, err
+		}
+		return RelatedFileDiffResult{DiffResult: diff, Source: "worktree"}, nil
+	}
+	if !repo.commitExists(ctx, baseHead) {
+		return RelatedFileDiffResult{}, errors.New("记录的提交不存在或不在当前分支历史中")
+	}
+	if !repo.commitInCurrentHistory(ctx, baseHead) {
+		return RelatedFileDiffResult{}, errors.New("记录的提交不存在或不在当前分支历史中")
+	}
+	path := strings.TrimSpace(relPath)
+	if path == "" {
+		return RelatedFileDiffResult{}, errors.New("path required")
+	}
+	nextHead, err := repo.nextCommitAfter(ctx, baseHead)
+	if err != nil {
+		return RelatedFileDiffResult{}, err
+	}
+	if strings.TrimSpace(nextHead) == "" {
+		diff, err := ReadDiff(ctx, rootPath, path)
+		if err != nil {
+			return RelatedFileDiffResult{}, err
+		}
+		return RelatedFileDiffResult{
+			DiffResult: diff,
+			BaseHead:   baseHead,
+			Source:     "worktree",
+		}, nil
+	}
+	diff, err := repo.diffBetweenCommits(ctx, baseHead, nextHead, path)
+	if err != nil {
+		return RelatedFileDiffResult{}, err
+	}
+	return RelatedFileDiffResult{
+		DiffResult: diff,
+		BaseHead:   baseHead,
+		TargetHead: nextHead,
+		Source:     "commit_range",
+	}, nil
+}
+
 func loadRepoContext(ctx context.Context, rootPath string) (repoContext, error) {
 	rootPath = filepath.Clean(rootPath)
 	if resolvedRootPath, err := filepath.EvalSymlinks(rootPath); err == nil {
@@ -583,6 +849,7 @@ func (r repoContext) statusItems(ctx context.Context) ([]StatusItem, error) {
 			Path:      path,
 			OldPath:   oldPath,
 			Status:    item.Status,
+			Staged:    item.Staged,
 			Additions: additions,
 			Deletions: deletions,
 			IsDir:     isDir,
@@ -691,6 +958,68 @@ func (r repoContext) commitExists(ctx context.Context, commit string) bool {
 	return err == nil
 }
 
+func (r repoContext) commitInCurrentHistory(ctx context.Context, commit string) bool {
+	if strings.TrimSpace(commit) == "" {
+		return false
+	}
+	_, err := runGit(ctx, r.repoRoot, "merge-base", "--is-ancestor", commit, "HEAD")
+	return err == nil
+}
+
+func (r repoContext) nextCommitAfter(ctx context.Context, commit string) (string, error) {
+	output, err := runGit(ctx, r.repoRoot, "rev-list", "--reverse", "--ancestry-path", commit+"..HEAD")
+	if err != nil {
+		return "", err
+	}
+	for _, line := range strings.Split(output, "\n") {
+		value := strings.TrimSpace(line)
+		if value != "" {
+			return value, nil
+		}
+	}
+	return "", nil
+}
+
+func (r repoContext) diffBetweenCommits(ctx context.Context, base, target, relPath string) (DiffResult, error) {
+	path := strings.TrimSpace(relPath)
+	if path == "" {
+		return DiffResult{}, errors.New("path required")
+	}
+	repoPath := r.toRepoPath(path)
+	files, err := r.nameStatusBetween(ctx, base, target)
+	if err != nil {
+		return DiffResult{}, err
+	}
+	stats, err := r.numstatBetween(ctx, base, target)
+	if err != nil {
+		return DiffResult{}, err
+	}
+	var matched *porcelainItem
+	for i := range files {
+		if files[i].Path == repoPath || files[i].OldPath == repoPath {
+			matched = &files[i]
+			break
+		}
+	}
+	if matched == nil {
+		return DiffResult{}, errors.New("git related file diff not found for path")
+	}
+	contentBytes, err := runGitBytes(ctx, r.repoRoot, "diff", "--no-ext-diff", "--find-renames", base, target, "--", repoPath)
+	if err != nil {
+		return DiffResult{}, err
+	}
+	content := decodeGitDiffOutput(contentBytes, filepath.Ext(matched.Path))
+	stat := stats[matched.Path]
+	return DiffResult{
+		Path:      r.fromRepoPath(matched.Path),
+		OldPath:   r.fromRepoPath(matched.OldPath),
+		Status:    matched.Status,
+		Additions: stat[0],
+		Deletions: stat[1],
+		Content:   content,
+	}, nil
+}
+
 func (r repoContext) commitParents(ctx context.Context, commit string) ([]string, error) {
 	output, err := runGit(ctx, r.repoRoot, "rev-list", "--parents", "-n", "1", commit)
 	if err != nil {
@@ -745,6 +1074,18 @@ func (r repoContext) commitNameStatus(ctx context.Context, commit string) ([]por
 	if err != nil {
 		return nil, err
 	}
+	return parseNameStatusZ(output), nil
+}
+
+func (r repoContext) nameStatusBetween(ctx context.Context, base, target string) ([]porcelainItem, error) {
+	output, err := runGit(ctx, r.repoRoot, "diff", "--name-status", "-z", "-M", base, target)
+	if err != nil {
+		return nil, err
+	}
+	return parseNameStatusZ(output), nil
+}
+
+func parseNameStatusZ(output string) []porcelainItem {
 	parts := strings.Split(output, "\x00")
 	items := make([]porcelainItem, 0)
 	for i := 0; i < len(parts); {
@@ -787,7 +1128,7 @@ func (r repoContext) commitNameStatus(ctx context.Context, commit string) ([]por
 			items = append(items, porcelainItem{Path: path, Status: normalized})
 		}
 	}
-	return items, nil
+	return items
 }
 
 func (r repoContext) commitNumstat(ctx context.Context, commit string) (map[string][2]int, error) {
@@ -795,6 +1136,18 @@ func (r repoContext) commitNumstat(ctx context.Context, commit string) (map[stri
 	if err != nil {
 		return nil, err
 	}
+	return parseNumstat(output)
+}
+
+func (r repoContext) numstatBetween(ctx context.Context, base, target string) (map[string][2]int, error) {
+	output, err := runGit(ctx, r.repoRoot, "diff", "--numstat", "-M", base, target)
+	if err != nil {
+		return nil, err
+	}
+	return parseNumstat(output)
+}
+
+func parseNumstat(output string) (map[string][2]int, error) {
 	result := make(map[string][2]int)
 	scanner := bufio.NewScanner(strings.NewReader(output))
 	for scanner.Scan() {
@@ -864,6 +1217,7 @@ type porcelainItem struct {
 	Path    string
 	OldPath string
 	Status  string
+	Staged  bool
 }
 
 func parsePorcelainV1Z(data []byte) ([]porcelainItem, error) {
@@ -882,7 +1236,7 @@ func parsePorcelainV1Z(data []byte) ([]porcelainItem, error) {
 		}
 		path := string(data[index : index+next])
 		index += next + 1
-		item := porcelainItem{Path: path, Status: normalizeStatus(x, y)}
+		item := porcelainItem{Path: path, Status: normalizeStatus(x, y), Staged: x != ' ' && x != '?'}
 		if x == 'R' || y == 'R' || x == 'C' || y == 'C' {
 			oldNext := bytes.IndexByte(data[index:], 0)
 			if oldNext < 0 {

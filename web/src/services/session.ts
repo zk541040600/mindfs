@@ -60,9 +60,23 @@ function estimateCommandTerminalCols(): number | undefined {
 }
 
 export type RelatedFile = {
+  root_id?: string;
+  repo_path?: string;
+  repo_name?: string;
+  repo_kind?: "git" | "plain" | string;
   path: string;
+  head?: string;
   relation?: string;
   created_by_session?: boolean;
+};
+
+export type RelatedWorktree = {
+  root_id: string;
+  path: string;
+  branch?: string;
+  head?: string;
+  current?: boolean;
+  updated_at?: string;
 };
 
 export type ExchangeAux = {
@@ -71,13 +85,20 @@ export type ExchangeAux = {
   toolcall?: ToolCall | null;
   thought?: string | null;
   thought_id?: string;
+  todo?: TodoUpdate | null;
+  plan?: PlanUpdate | null;
+  compact?: CompactNotice | null;
 };
 
 export type Session = {
   key: string;
+  session_key?: string;
+  root_id?: string;
   type: SessionType;
   parent_session_key?: string;
   parent_tool_call_id?: string;
+  source?: string;
+  task_id?: string;
   agent?: string;
   model?: string;
   shell?: string;
@@ -94,12 +115,14 @@ export type Session = {
     modelContextWindow: number;
   };
   related_files?: RelatedFile[];
+  related_worktree?: RelatedWorktree | null;
   exchange_aux?: Record<string, ExchangeAux[]>;
   exchanges?: Array<{
     seq?: number;
     role?: string;
     agent?: string;
     model?: string;
+    model_display_name?: string;
     mode?: string;
     effort?: string;
     fast_service?: string;
@@ -111,15 +134,19 @@ export type Session = {
     timestamp?: string;
     toolCall?: ToolCall;
     todoUpdate?: TodoUpdate;
+    planUpdate?: PlanUpdate;
+    compactNotice?: CompactNotice;
     pending_ack?: boolean;
   }>;
 };
 
 export type SessionSearchHit = {
+  root_id?: string;
   key: string;
   type: SessionType;
   parent_session_key?: string;
   parent_tool_call_id?: string;
+  source?: string;
   agent?: string;
   model?: string;
   shell?: string;
@@ -195,6 +222,18 @@ export type ExtensionUIResponse = {
   cancelled?: boolean;
 };
 
+export type PlanUpdate = {
+  id?: string;
+  content: string;
+  delta?: boolean;
+};
+
+export type CompactNotice = {
+  id?: string;
+  status?: string;
+  summary?: string;
+};
+
 export type StreamEvent =
   | { type: "message_chunk"; data: { content: string } }
   | { type: "thought_chunk"; data: { id?: string; content: string } }
@@ -202,6 +241,8 @@ export type StreamEvent =
   | { type: "tool_call_update"; data: ToolCall }
   | { type: "todo_update"; data: TodoUpdate }
   | { type: "extension_ui"; data: ExtensionUIRequest }
+  | { type: "plan_update"; data: PlanUpdate }
+  | { type: "compact_notice"; data: CompactNotice }
   | { type: "recovery"; data: { message: string } }
   | {
       type: "message_done";
@@ -242,6 +283,22 @@ function isSessionTerminalEvent(type: string): boolean {
 type FetchSessionsOptions = {
   beforeTime?: string;
   afterTime?: string;
+  limit?: number;
+  topLevel?: boolean;
+  includeChildren?: boolean;
+};
+
+export type SessionListPayload = {
+  items: Session[];
+  totalCount: number;
+};
+
+export type MultiRootSessionGroup = {
+  rootId: string;
+  rootName: string;
+  latestSessionTime: string;
+  items: Session[];
+  totalCount: number;
 };
 
 export type FetchExternalSessionsOptions = {
@@ -275,6 +332,7 @@ class SessionService {
   private ws: WebSocket | null = null;
   private handlers = new Map<string, Set<SessionEventHandler>>();
   private pendingStreams = new Map<string, StreamEvent[]>();
+  private activeStreams = new Set<string>();
   private pendingMessages = new Map<string, PendingMessage>();
   private listeners = new Set<(event: SessionServiceEvent) => void>();
   private reconnectTimer: number | null = null;
@@ -656,6 +714,7 @@ class SessionService {
     this.emit({ type, sessionKey, payload: nextPayload });
 
     if (!sessionKey) return;
+    this.updateActiveStreamState(type, sessionKey, nextPayload);
 
     if (isSessionTerminalEvent(type)) {
       this.pendingStreams.delete(sessionKey);
@@ -734,6 +793,31 @@ class SessionService {
     for (const listener of this.listeners) {
       listener(event);
     }
+  }
+
+  private updateActiveStreamState(
+    type: string,
+    sessionKey: string,
+    payload: Record<string, unknown>,
+  ) {
+    if (type === "session.done" || type === "session.error") {
+      this.activeStreams.delete(sessionKey);
+      return;
+    }
+    if (type !== "session.stream") return;
+    const event = payload.event as StreamEvent | undefined;
+    if (!event) return;
+    if (event.type === "error") {
+      this.activeStreams.delete(sessionKey);
+      return;
+    }
+    if (event.type !== "message_done") {
+      this.activeStreams.add(sessionKey);
+    }
+  }
+
+  isSessionStreaming(sessionKey: string) {
+    return this.activeStreams.has(sessionKey);
   }
 
   subscribe(sessionKey: string, handler: SessionEventHandler) {
@@ -843,6 +927,41 @@ class SessionService {
         enabled,
       },
     });
+  }
+
+  async runSlashCommand(
+    rootId: string,
+    sessionKey: string,
+    command: string,
+    agent: string,
+    model?: string,
+    agentMode?: string,
+    effort?: string,
+    fastService?: string,
+    requestId = this.createRequestId("slash"),
+  ): Promise<boolean> {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      return false;
+    }
+    if (!rootId || !sessionKey || !command || !agent) {
+      return false;
+    }
+    const msg = {
+      id: requestId,
+      type: "session.slash_command.run",
+      payload: {
+        root_id: rootId,
+        session_key: sessionKey,
+        command,
+        agent,
+        model,
+        agent_mode: agentMode,
+        effort,
+        fast_service: fastService,
+      },
+    };
+    this.pendingMessages.set(requestId, { id: requestId, message: msg });
+    return this.sendWSMessage(msg);
   }
 
   private resendPendingMessages() {
@@ -1012,7 +1131,7 @@ class SessionService {
   async fetchSessions(
     rootId: string,
     options?: FetchSessionsOptions,
-  ): Promise<Session[]> {
+  ): Promise<SessionListPayload> {
     try {
       const params = new URLSearchParams({ root: rootId });
       if (options?.beforeTime) {
@@ -1021,10 +1140,72 @@ class SessionService {
       if (options?.afterTime) {
         params.set("after_time", options.afterTime);
       }
-      const data = await protectedJSON<any[]>(appURL("/api/sessions", params));
-      return Array.isArray(data) ? data : [];
+      if (typeof options?.limit === "number" && options.limit > 0) {
+        params.set("limit", String(options.limit));
+      }
+      if (options?.topLevel) {
+        params.set("top_level", "1");
+      }
+      if (options?.includeChildren) {
+        params.set("include_children", "1");
+      }
+      const data = await protectedJSON<any>(appURL("/api/sessions", params));
+      if (Array.isArray(data)) {
+        return { items: data, totalCount: data.length };
+      }
+      const items = Array.isArray(data?.items) ? data.items : [];
+      const totalCount = Number(data?.total_count ?? data?.totalCount ?? items.length) || 0;
+      return { items, totalCount };
     } catch (err) {
       console.error("[Session] Failed to fetch sessions:", err);
+      return { items: [], totalCount: 0 };
+    }
+  }
+
+  async fetchMultiRootSessions(limitPerRoot = 6): Promise<MultiRootSessionGroup[]> {
+    try {
+      const params = new URLSearchParams({ multi_root: "1" });
+      if (limitPerRoot > 0) {
+        params.set("limit_per_root", String(limitPerRoot));
+      }
+      const data = await protectedJSON<any>(appURL("/api/sessions", params));
+      const groups = Array.isArray(data?.groups) ? data.groups : [];
+      return groups.map((group: any) => ({
+        rootId: String(group?.root_id || group?.rootId || ""),
+        rootName: String(group?.root_name || group?.rootName || ""),
+        latestSessionTime: String(group?.latest_session_time || group?.latestSessionTime || ""),
+        items: Array.isArray(group?.items) ? group.items : [],
+        totalCount: Number(group?.total_count ?? group?.totalCount ?? 0) || 0,
+      })).filter((group: MultiRootSessionGroup) => !!group.rootId);
+    } catch (err) {
+      if (err instanceof Error && err.message === "api_not_ready") {
+        return [];
+      }
+      console.error("[Session] Failed to fetch multi-root sessions:", err);
+      return [];
+    }
+  }
+
+  async fetchChildSessions(
+    rootId: string,
+    parentSessionKey: string,
+    options?: { beforeTime?: string; limit?: number },
+  ): Promise<Session[]> {
+    try {
+      const params = new URLSearchParams({
+        root: rootId,
+        parent_session_key: parentSessionKey,
+      });
+      if (options?.beforeTime) {
+        params.set("before_time", options.beforeTime);
+      }
+      if (typeof options?.limit === "number" && options.limit > 0) {
+        params.set("limit", String(options.limit));
+      }
+      const data = await protectedJSON<any[]>(appURL("/api/sessions/children", params));
+      return Array.isArray(data) ? data : [];
+    } catch (err) {
+      console.error("[Session] Failed to fetch child sessions:", err);
       return [];
     }
   }
@@ -1033,13 +1214,19 @@ class SessionService {
     rootId: string,
     query: string,
     limit?: number,
+    options?: { multiRoot?: boolean },
   ): Promise<SessionSearchHit[]> {
     try {
       const trimmed = query.trim();
-      if (!rootId || !trimmed) {
+      if ((!rootId && !options?.multiRoot) || !trimmed) {
         return [];
       }
-      const params = new URLSearchParams({ root: rootId, q: trimmed });
+      const params = new URLSearchParams({ q: trimmed });
+      if (options?.multiRoot) {
+        params.set("multi_root", "1");
+      } else {
+        params.set("root", rootId);
+      }
       if (typeof limit === "number" && limit > 0) {
         params.set("limit", String(limit));
       }
@@ -1081,6 +1268,27 @@ class SessionService {
       return Array.isArray(data?.sessions) ? data.sessions : [];
     } catch (err) {
       console.error("[Session] Failed to get replying sessions:", err);
+      return null;
+    }
+  }
+
+  async syncExternalSession(
+    rootId: string,
+    sessionKey: string,
+    seq?: number,
+  ): Promise<Session | null> {
+    try {
+      const params = new URLSearchParams({ root: rootId });
+      if (typeof seq === "number" && seq > 0) {
+        params.set("seq", String(seq));
+      }
+      const data = await protectedJSON<Session>(
+        appURL(`/api/sessions/${encodeURIComponent(sessionKey)}/sync`, params),
+        { method: "POST" },
+      );
+      return data as Session;
+    } catch (err) {
+      console.error("[Session] Failed to sync session:", err);
       return null;
     }
   }
@@ -1135,9 +1343,21 @@ class SessionService {
     rootId: string,
     sessionKey: string,
     path: string,
+    head = "",
+    repoPath = "",
+    repoKind = "",
   ): Promise<boolean> {
     try {
       const params = new URLSearchParams({ root: rootId, path });
+      if (head) {
+        params.set("head", head);
+      }
+      if (repoPath) {
+        params.set("repo_path", repoPath);
+      }
+      if (repoKind) {
+        params.set("repo_kind", repoKind);
+      }
       const res = await protectedFetch(
         appURL(
           `/api/sessions/${encodeURIComponent(sessionKey)}/related-files`,
@@ -1195,6 +1415,35 @@ class SessionService {
       return data as Session;
     } catch (err) {
       console.error("[Session] Failed to rename session:", err);
+      return null;
+    }
+  }
+
+  async forkSession(
+    rootId: string,
+    sessionKey: string,
+    seq: number,
+  ): Promise<{ session_key: string; session?: Session } | null> {
+    try {
+      if (!rootId || !sessionKey || !seq) {
+        return null;
+      }
+      return await protectedJSON<{ session_key: string; session?: Session }>(
+        appURL("/api/sessions/fork"),
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            root_id: rootId,
+            session_key: sessionKey,
+            seq,
+          }),
+        },
+      );
+    } catch (err) {
+      console.error("[Session] Failed to fork session:", err);
       return null;
     }
   }
@@ -1567,6 +1816,25 @@ export async function deleteCachedSession(
   } catch {}
 }
 
+export async function clearCachedSessionsForRoot(rootId: string): Promise<void> {
+  if (!rootId) {
+    return;
+  }
+  try {
+    await withSessionStore("readwrite", async (store) => {
+      const entries =
+        (await sessionRequestToPromise(
+          store.getAll() as IDBRequest<CachedSessionRecord[]>,
+        )) || [];
+      await Promise.all(
+        entries
+          .filter((record) => record.rootId === rootId)
+          .map((record) => sessionRequestToPromise(store.delete(record.cacheKey))),
+      );
+    });
+  } catch {}
+}
+
 function cloneSession(session: Session): Session {
   return {
     ...session,
@@ -1619,10 +1887,13 @@ export async function setCachedSessionRelatedFiles(
 export async function syncSession(
   rootId: string,
   sessionKey: string,
+  options?: { full?: boolean },
 ): Promise<SyncSessionResult> {
   const base = await getCachedSession(rootId, sessionKey);
   const seq = getSessionMaxSeq(base);
-  const incoming = await sessionService.getSession(rootId, sessionKey, seq);
+  const incoming = options?.full
+    ? await sessionService.syncExternalSession(rootId, sessionKey, seq)
+    : await sessionService.getSession(rootId, sessionKey, seq);
   if (!incoming) {
     return { session: base, hasDelta: false };
   }

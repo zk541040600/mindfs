@@ -1,6 +1,7 @@
 package fs
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -40,38 +41,90 @@ func TestRegistryUpsertRejectsSameNameDifferentPath(t *testing.T) {
 	}
 }
 
-func TestRegistrySaveUsesAtomicFileReplacement(t *testing.T) {
-	dir := t.TempDir()
-	registryPath := filepath.Join(dir, "registry.json")
-	registry := NewRegistry(registryPath)
-	rootDir := filepath.Join(dir, "project")
-	if err := os.Mkdir(rootDir, 0o755); err != nil {
-		t.Fatalf("Mkdir root returned error: %v", err)
+func TestSharedFileWatcherResolveRelatedFileRecordPlainRoot(t *testing.T) {
+	rootDir := t.TempDir()
+	root := NewRootInfo("root", "plain-root", rootDir)
+	watcher := &SharedFileWatcher{root: root}
+
+	record, ok := watcher.resolveRelatedFileRecord(context.Background(), filepath.Join(rootDir, "notes", "todo.txt"))
+	if !ok {
+		t.Fatal("resolveRelatedFileRecord returned false")
+	}
+	if record.repoKind != "plain" {
+		t.Fatalf("repoKind = %q, want plain", record.repoKind)
+	}
+	if record.repoPath != filepath.Clean(rootDir) {
+		t.Fatalf("repoPath = %q, want %q", record.repoPath, filepath.Clean(rootDir))
+	}
+	if record.repoName != "plain-root" {
+		t.Fatalf("repoName = %q, want plain-root", record.repoName)
+	}
+	if record.path != "notes/todo.txt" {
+		t.Fatalf("path = %q, want notes/todo.txt", record.path)
+	}
+}
+
+func TestSharedFileWatcherResolveRelatedFileRecordSiblingGitWorktree(t *testing.T) {
+	rootDir := t.TempDir()
+	worktreeDir := t.TempDir()
+	root := NewRootInfo("root", "main-root", rootDir)
+	watcher := &SharedFileWatcher{
+		root: root,
+		worktreeResolver: func(ctx context.Context, root RootInfo, filePath string) (RelatedWorktreeMatch, bool) {
+			return RelatedWorktreeMatch{
+				Path: worktreeDir,
+				Head: "abc123",
+			}, true
+		},
 	}
 
-	if _, err := registry.Upsert(rootDir); err != nil {
-		t.Fatalf("Upsert returned error: %v", err)
+	record, ok := watcher.resolveRelatedFileRecord(context.Background(), filepath.Join(worktreeDir, "src", "main.go"))
+	if !ok {
+		t.Fatal("resolveRelatedFileRecord returned false")
 	}
-	payload, err := os.ReadFile(registryPath)
-	if err != nil {
-		t.Fatalf("ReadFile registry returned error: %v", err)
+	if record.repoKind != "git" {
+		t.Fatalf("repoKind = %q, want git", record.repoKind)
 	}
-	if !strings.Contains(string(payload), "project") {
-		t.Fatalf("registry payload = %q, want project entry", string(payload))
+	if record.repoPath != filepath.Clean(worktreeDir) {
+		t.Fatalf("repoPath = %q, want %q", record.repoPath, filepath.Clean(worktreeDir))
 	}
-	info, err := os.Stat(registryPath)
-	if err != nil {
-		t.Fatalf("Stat registry returned error: %v", err)
+	if record.repoName != filepath.Base(filepath.Clean(worktreeDir)) {
+		t.Fatalf("repoName = %q, want %q", record.repoName, filepath.Base(filepath.Clean(worktreeDir)))
 	}
-	if got := info.Mode().Perm(); got != 0o644 {
-		t.Fatalf("registry mode = %v, want 0644", got)
+	if record.path != "src/main.go" {
+		t.Fatalf("path = %q, want src/main.go", record.path)
 	}
-	temps, err := filepath.Glob(filepath.Join(dir, "registry.json.tmp-*"))
-	if err != nil {
-		t.Fatalf("Glob temp files returned error: %v", err)
+	if record.head != "abc123" {
+		t.Fatalf("head = %q, want abc123", record.head)
 	}
-	if len(temps) != 0 {
-		t.Fatalf("registry temp files left behind: %#v", temps)
+}
+
+func TestSharedFileWatcherResolveRelatedFileRecordTaskWorktreeAbsolutePath(t *testing.T) {
+	rootDir := t.TempDir()
+	worktreeDir := filepath.Join(rootDir, ".worktree", "task-55")
+	root := NewRootInfo("root", "main-root", rootDir)
+	watcher := &SharedFileWatcher{
+		root: root,
+		worktreeResolver: func(ctx context.Context, root RootInfo, filePath string) (RelatedWorktreeMatch, bool) {
+			return RelatedWorktreeMatch{
+				Path: worktreeDir,
+				Head: "task-head",
+			}, true
+		},
+	}
+
+	record, ok := watcher.resolveRelatedFileRecord(context.Background(), filepath.Join(worktreeDir, "test.json"))
+	if !ok {
+		t.Fatal("resolveRelatedFileRecord returned false")
+	}
+	if record.repoPath != filepath.Clean(worktreeDir) {
+		t.Fatalf("repoPath = %q, want %q", record.repoPath, filepath.Clean(worktreeDir))
+	}
+	if record.path != "test.json" {
+		t.Fatalf("path = %q, want test.json", record.path)
+	}
+	if record.head != "task-head" {
+		t.Fatalf("head = %q, want task-head", record.head)
 	}
 }
 
@@ -96,36 +149,6 @@ func TestRootInfoNormalizePathStripsFragment(t *testing.T) {
 	}
 	if got != "design/test.md" {
 		t.Fatalf("NormalizePath = %q, want %q", got, "design/test.md")
-	}
-}
-
-func TestRootInfoNormalizePathAcceptsDotDotPrefixInsideRoot(t *testing.T) {
-	rootDir := t.TempDir()
-	root := NewRootInfo("mindfs", "mindfs", rootDir)
-
-	got, err := root.NormalizePath("..notes/file.txt")
-	if err != nil {
-		t.Fatalf("NormalizePath relative returned error: %v", err)
-	}
-	if got != "..notes/file.txt" {
-		t.Fatalf("NormalizePath relative = %q, want %q", got, "..notes/file.txt")
-	}
-
-	got, err = root.NormalizePath(filepath.Join(rootDir, "..notes", "file.txt"))
-	if err != nil {
-		t.Fatalf("NormalizePath absolute returned error: %v", err)
-	}
-	if got != "..notes/file.txt" {
-		t.Fatalf("NormalizePath absolute = %q, want %q", got, "..notes/file.txt")
-	}
-}
-
-func TestRootInfoNormalizePathRejectsParentTraversal(t *testing.T) {
-	rootDir := t.TempDir()
-	root := NewRootInfo("mindfs", "mindfs", rootDir)
-
-	if _, err := root.NormalizePath("../escape.txt"); err == nil {
-		t.Fatal("NormalizePath should reject parent traversal")
 	}
 }
 
@@ -354,5 +377,71 @@ func TestRootInfoReadFileFullRejectsFilesLargerThanLimit(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "too large") {
 		t.Fatalf("ReadFile error = %v, want too large", err)
+	}
+}
+
+// Local fork registry and path normalization regressions retained while merging upstream.
+func TestRegistrySaveUsesAtomicFileReplacement(t *testing.T) {
+	dir := t.TempDir()
+	registryPath := filepath.Join(dir, "registry.json")
+	registry := NewRegistry(registryPath)
+	rootDir := filepath.Join(dir, "project")
+	if err := os.Mkdir(rootDir, 0o755); err != nil {
+		t.Fatalf("Mkdir root returned error: %v", err)
+	}
+
+	if _, err := registry.Upsert(rootDir); err != nil {
+		t.Fatalf("Upsert returned error: %v", err)
+	}
+	payload, err := os.ReadFile(registryPath)
+	if err != nil {
+		t.Fatalf("ReadFile registry returned error: %v", err)
+	}
+	if !strings.Contains(string(payload), "project") {
+		t.Fatalf("registry payload = %q, want project entry", string(payload))
+	}
+	info, err := os.Stat(registryPath)
+	if err != nil {
+		t.Fatalf("Stat registry returned error: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o644 {
+		t.Fatalf("registry mode = %v, want 0644", got)
+	}
+	temps, err := filepath.Glob(filepath.Join(dir, "registry.json.tmp-*"))
+	if err != nil {
+		t.Fatalf("Glob temp files returned error: %v", err)
+	}
+	if len(temps) != 0 {
+		t.Fatalf("registry temp files left behind: %#v", temps)
+	}
+}
+
+func TestRootInfoNormalizePathAcceptsDotDotPrefixInsideRoot(t *testing.T) {
+	rootDir := t.TempDir()
+	root := NewRootInfo("mindfs", "mindfs", rootDir)
+
+	got, err := root.NormalizePath("..notes/file.txt")
+	if err != nil {
+		t.Fatalf("NormalizePath relative returned error: %v", err)
+	}
+	if got != "..notes/file.txt" {
+		t.Fatalf("NormalizePath relative = %q, want %q", got, "..notes/file.txt")
+	}
+
+	got, err = root.NormalizePath(filepath.Join(rootDir, "..notes", "file.txt"))
+	if err != nil {
+		t.Fatalf("NormalizePath absolute returned error: %v", err)
+	}
+	if got != "..notes/file.txt" {
+		t.Fatalf("NormalizePath absolute = %q, want %q", got, "..notes/file.txt")
+	}
+}
+
+func TestRootInfoNormalizePathRejectsParentTraversal(t *testing.T) {
+	rootDir := t.TempDir()
+	root := NewRootInfo("mindfs", "mindfs", rootDir)
+
+	if _, err := root.NormalizePath("../escape.txt"); err == nil {
+		t.Fatal("NormalizePath should reject parent traversal")
 	}
 }

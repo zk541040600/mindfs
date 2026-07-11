@@ -68,6 +68,7 @@ type ImportExternalSessionsBatchOutput struct {
 type SyncExternalSessionDeltaInput struct {
 	RootID string
 	Key    string
+	Full   bool
 }
 
 type SyncExternalSessionDeltaOutput struct {
@@ -313,20 +314,32 @@ func (s *Service) SyncExternalSessionDelta(ctx context.Context, in SyncExternalS
 	if err != nil {
 		return out, err
 	}
-	imported, err := importer.ImportExternalSession(ctx, agenttypes.ImportExternalSessionInput{
+	importInput := agenttypes.ImportExternalSessionInput{
 		RootPath:       root.RootPath,
 		Agent:          agentName,
 		AgentSessionID: binding.AgentSessionID,
-		AfterTimestamp: lastTimestamp,
-	})
+	}
+	if !in.Full {
+		importInput.AfterTimestamp = lastTimestamp
+	}
+	imported, err := importer.ImportExternalSession(ctx, importInput)
 	if err != nil {
 		return out, err
 	}
 
+	delta := imported.Exchanges
+	if in.Full {
+		delta = externalSessionDeltaAfterCtxSeq(imported.Exchanges, binding.AgentCtxSeq)
+	}
 	importedCount := 0
-	for _, exchange := range validImportedExchanges(imported.Exchanges) {
-		if exchange.Timestamp.IsZero() || !exchange.Timestamp.After(lastTimestamp) {
-			continue
+	for _, exchange := range validImportedExchanges(delta) {
+		if !in.Full {
+			if exchange.Timestamp.IsZero() {
+				continue
+			}
+			if !exchange.Timestamp.After(lastTimestamp) {
+				continue
+			}
 		}
 		if err := manager.AddExchangeForAgentAt(ctx, current, exchange.Role, exchange.Content, agentName, "", "", "", exchange.Timestamp); err != nil {
 			return out, err
@@ -352,6 +365,16 @@ func (s *Service) SyncExternalSessionDelta(ctx context.Context, in SyncExternalS
 	out.LastTimestamp = lastExternalSyncTimestamp(latest.Exchanges)
 	log.Printf("[session/sync] external delta imported root=%s session=%s agent=%s agent_session_id=%s count=%d", strings.TrimSpace(in.RootID), strings.TrimSpace(in.Key), agentName, agentSessionID, importedCount)
 	return out, nil
+}
+
+func externalSessionDeltaAfterCtxSeq(exchanges []agenttypes.ImportedExchange, agentCtxSeq int) []agenttypes.ImportedExchange {
+	if agentCtxSeq <= 0 {
+		return exchanges
+	}
+	if agentCtxSeq >= len(exchanges) {
+		return nil
+	}
+	return exchanges[agentCtxSeq:]
 }
 
 func (s *Service) resolveExternalSessionImporter(agentName string) (agenttypes.ExternalSessionImporter, error) {

@@ -17,7 +17,7 @@ import (
 )
 
 func TestSessionDoneResponseIncludesRequestIDPayload(t *testing.T) {
-	resp := buildSessionDoneResponse("root", "session", "msg-123")
+	resp := buildSessionDoneResponse("root", "session", "msg-123", false)
 	if resp.ID != "msg-123" {
 		t.Fatalf("ID = %q, want request id", resp.ID)
 	}
@@ -50,6 +50,45 @@ func TestParseClientContext(t *testing.T) {
 	got = parseClientContext(map[string]any{}, "fallback-root")
 	if got.CurrentRoot != "fallback-root" {
 		t.Fatalf("expected fallback root, got %q", got.CurrentRoot)
+	}
+}
+
+func TestAppendReplyEventPrefixesTruncatedSummary(t *testing.T) {
+	hub := NewStreamHub(nil)
+
+	hub.AppendReplyEvent("sess-1", StreamEvent{
+		Type: "message_chunk",
+		Data: agenttypes.MessageChunk{Content: strings.Repeat("前", 601) + "后"},
+	})
+
+	snapshot := hub.PendingSessionSnapshot("sess-1")
+	if !strings.HasPrefix(snapshot.Summary, "...") {
+		t.Fatalf("summary should start with ellipsis when truncated, got %q", snapshot.Summary)
+	}
+	if !strings.HasSuffix(snapshot.Summary, "后") {
+		t.Fatalf("summary should keep the end of the content, got %q", snapshot.Summary)
+	}
+}
+
+func TestAppendReplyEventResetsSummaryAfterAuxiliaryEvent(t *testing.T) {
+	hub := NewStreamHub(nil)
+
+	hub.AppendReplyEvent("sess-1", StreamEvent{
+		Type: string(agenttypes.EventTypeMessageChunk),
+		Data: agenttypes.MessageChunk{Content: "before aux"},
+	})
+	hub.AppendReplyEvent("sess-1", StreamEvent{
+		Type: string(agenttypes.EventTypePlanUpdate),
+		Data: agenttypes.PlanUpdate{Content: "- inspect"},
+	})
+	hub.AppendReplyEvent("sess-1", StreamEvent{
+		Type: string(agenttypes.EventTypeMessageChunk),
+		Data: agenttypes.MessageChunk{Content: "after aux"},
+	})
+
+	snapshot := hub.PendingSessionSnapshot("sess-1")
+	if snapshot.Summary != "after aux" {
+		t.Fatalf("summary = %q, want aux boundary to discard previous content", snapshot.Summary)
 	}
 }
 
@@ -226,7 +265,7 @@ func TestAcknowledgeStaleSessionCancelKeepsActiveTurnAndUnfreezesQueue(t *testin
 	hub := NewStreamHub(nil)
 	rootID := "root"
 	sessionKey := "session"
-	hub.SetPendingUser(rootID, sessionKey, "Session", "pi", "", "", "", "", "new turn")
+	hub.SetPendingUser(rootID, sessionKey, "Session", "pi", "", "", "", "", false, "new turn")
 	hub.EnqueueSessionMessage(rootID, sessionKey, "Session", QueuedUserMessage{
 		ID: "queued",
 		PendingUserMessage: PendingUserMessage{

@@ -20,6 +20,7 @@ import (
 
 type Status struct {
 	Name                string                   `json:"name"`
+	Protocol            Protocol                 `json:"protocol,omitempty"`
 	Installed           bool                     `json:"installed"`
 	Available           bool                     `json:"available"`
 	Version             string                   `json:"version,omitempty"`
@@ -801,6 +802,7 @@ func unavailableStatus(name string, installed bool, errMsg string, ts time.Time)
 
 func probeInstallStatus(name string, def Definition, ts time.Time) Status {
 	status := unavailableStatus(name, false, "", ts)
+	status.Protocol = agentDefinitionProtocol(name, def)
 	status.Brief = strings.TrimSpace(def.Brief)
 	status.InstallCommands = append([]string(nil), def.InstallCommands...)
 	status.UpdateCommands = append([]string(nil), def.UpdateCommands...)
@@ -815,6 +817,14 @@ func probeInstallStatus(name string, def Definition, ts time.Time) Status {
 	status.Installed = true
 	status.ProbeError = "probe pending"
 	return status
+}
+
+func agentDefinitionProtocol(name string, def Definition) Protocol {
+	protocol := def.Protocol
+	if protocol == "" {
+		protocol = DefaultProtocol(name)
+	}
+	return protocol
 }
 
 func resolveProbePool(def Definition, shared *Pool) (*Pool, bool) {
@@ -1117,6 +1127,7 @@ func (p *Prober) probeInstalledAgents(ctx context.Context, defs []Definition) {
 
 	p.runDefinitionsConcurrently(defs, func(_ int, def Definition) {
 		status := unavailableStatus(def.Name, true, "probe pending", time.Now().UTC())
+		status.Protocol = agentDefinitionProtocol(def.Name, def)
 		status = safeProbeInstalledAgentWithPool(ctx, def.Name, def, p.pool, p.probeSessions, status, probePhaseBackground)
 		p.setStatus(status)
 	})

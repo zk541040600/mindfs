@@ -5,6 +5,7 @@ import { protectedAPIReady, protectedJSON } from "./api";
 
 export type AgentStatus = {
   name: string;
+  protocol?: string;
   brief?: string;
   installed: boolean;
   available: boolean;

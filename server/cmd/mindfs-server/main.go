@@ -18,8 +18,10 @@ var version = "dev"
 func main() {
 	addr := flag.String("addr", "127.0.0.1:7331", "listen address")
 	noRelayer := flag.Bool("no-relayer", false, "disable relay integration")
+	webPushFlag := flag.Bool("web-push", true, "enable PWA Web Push notifications")
 	configFlag := flag.String("config", "", "mindfs startup config file; command-line flags override file values")
 	agentConfigFlag := flag.String("agent-config", "", "extra agents.json file")
+	notifyScriptFlag := flag.String("notify-script", "", "executable script for notification events; receives JSON payload on stdin")
 	flag.Parse()
 	explicitFlags := visitedFlags(flag.CommandLine)
 	startupCfg, err := loadStartupConfig(*configFlag)
@@ -27,7 +29,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, err.Error())
 		os.Exit(1)
 	}
-	applyStartupConfig(startupCfg, explicitFlags, addr, noRelayer, agentConfigFlag)
+	applyStartupConfig(startupCfg, explicitFlags, addr, noRelayer, webPushFlag, agentConfigFlag, notifyScriptFlag)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
@@ -37,6 +39,8 @@ func main() {
 		Version:         version,
 		Args:            os.Args[1:],
 		AgentConfigPath: *agentConfigFlag,
+		WebPushEnabled:  *webPushFlag,
+		NotifyScript:    *notifyScriptFlag,
 	}); err != nil {
 		fmt.Fprintln(os.Stderr, err.Error())
 		os.Exit(1)
@@ -47,7 +51,10 @@ type startupConfig struct {
 	Addr          *string `json:"addr"`
 	NoRelayer     *bool   `json:"noRelayer"`
 	NoRelayerFlag *bool   `json:"no-relayer"`
+	WebPush       *bool   `json:"webPush"`
+	WebPushFlag   *bool   `json:"web-push"`
 	AgentConfig   *string `json:"agent-config"`
+	NotifyScript  *string `json:"notify-script"`
 }
 
 func loadStartupConfig(path string) (startupConfig, error) {
@@ -74,15 +81,21 @@ func visitedFlags(flags *flag.FlagSet) map[string]bool {
 	return visited
 }
 
-func applyStartupConfig(cfg startupConfig, explicit map[string]bool, addr *string, noRelayer *bool, agentConfig *string) {
+func applyStartupConfig(cfg startupConfig, explicit map[string]bool, addr *string, noRelayer *bool, webPush *bool, agentConfig *string, notifyScript *string) {
 	if cfg.Addr != nil && !explicit["addr"] {
 		*addr = strings.TrimSpace(*cfg.Addr)
 	}
 	if value := firstBool(cfg.NoRelayer, cfg.NoRelayerFlag); value != nil && !explicit["no-relayer"] {
 		*noRelayer = *value
 	}
+	if value := firstBool(cfg.WebPush, cfg.WebPushFlag); value != nil && !explicit["web-push"] {
+		*webPush = *value
+	}
 	if cfg.AgentConfig != nil && !explicit["agent-config"] {
 		*agentConfig = strings.TrimSpace(*cfg.AgentConfig)
+	}
+	if cfg.NotifyScript != nil && !explicit["notify-script"] {
+		*notifyScript = strings.TrimSpace(*cfg.NotifyScript)
 	}
 }
 

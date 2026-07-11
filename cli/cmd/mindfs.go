@@ -57,11 +57,14 @@ func main() {
 		fmt.Fprintf(out, "  mindfs --stop\n")
 		fmt.Fprintf(out, "  mindfs -addr :9000 /path/to/project\n")
 		fmt.Fprintf(out, "  mindfs -remove /path/to/project\n")
+		fmt.Fprintf(out, "  mindfs <rootid> -task 12\n")
+		fmt.Fprintf(out, "  mindfs <rootid> -task 12 -next\n")
 	}
 
 	addr := flag.String("addr", "127.0.0.1:7331", "listen address")
 	noRelayer := flag.Bool("no-relayer", false, "disable relay integration")
 	e2eeFlag := flag.Bool("e2ee", false, "enable end-to-end encryption for sensitive data")
+	webPushFlag := flag.Bool("web-push", true, "enable PWA Web Push notifications")
 	foreground := flag.Bool("foreground", false, "run in the foreground instead of as a background service")
 	stop := flag.Bool("stop", false, "stop the background mindfs service")
 	restart := flag.Bool("restart", false, "restart the background mindfs service")
@@ -72,20 +75,36 @@ func main() {
 	bindRelay := flag.Bool("bind-relay", false, "start relay binding and print the relayer bind URL")
 	configFlag := flag.String("config", "", "mindfs startup config file; command-line flags override file values")
 	agentConfigFlag := flag.String("agent-config", "", "extra agents.json file for customizable agent(ACP-protocol) and shell")
+	notifyScriptFlag := flag.String("notify-script", "", "executable script for notification events; receives JSON payload on stdin")
 	remove := flag.Bool("remove", false, "remove the managed directory")
+	taskNumber := flag.String("task", "", "task number for task stage control; defaults to status when set")
+	taskNext := flag.Bool("next", false, "advance task to next stage")
+	taskPrev := flag.Bool("prev", false, "move task to previous stage")
 	tlsFlag := flag.Bool("tls", false, "enable HTTPS (auto-generates self-signed cert if -cert/-key not provided)")
 	certFlag := flag.String("cert", "", "TLS certificate file (PEM); auto-generated if empty with -tls")
 	keyFlag := flag.String("key", "", "TLS private key file (PEM); auto-generated if empty with -tls")
-	flag.Parse()
+	_ = flag.CommandLine.Parse(normalizeTaskRootFirstArgs(os.Args[1:]))
 	explicitFlags := visitedFlags(flag.CommandLine)
 	startupCfg, err := loadStartupConfig(*configFlag)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err.Error())
 		os.Exit(1)
 	}
-	applyStartupConfig(startupCfg, explicitFlags, addr, noRelayer, e2eeFlag, foreground, bindRelay, tlsFlag, certFlag, keyFlag, agentConfigFlag)
+	applyStartupConfig(startupCfg, explicitFlags, addr, noRelayer, e2eeFlag, webPushFlag, foreground, bindRelay, tlsFlag, certFlag, keyFlag, agentConfigFlag, notifyScriptFlag)
 	if *versionFlag {
 		printVersion()
+		return
+	}
+	if strings.TrimSpace(*taskNumber) != "" {
+		rootID := ""
+		if flag.NArg() > 0 {
+			rootID = flag.Arg(0)
+		}
+		action := taskCLIAction(*statusFlag, *taskNext, *taskPrev)
+		if err := handleTaskCommand(*addr, *tlsFlag, rootID, strings.TrimSpace(*taskNumber), action); err != nil {
+			fmt.Fprintln(os.Stderr, err.Error())
+			os.Exit(1)
+		}
 		return
 	}
 	if *uninstallFlag {
@@ -264,6 +283,8 @@ func main() {
 			Args:            os.Args[1:],
 			AgentConfigPath: *agentConfigFlag,
 			E2EEConfig:      e2eeResult.Config,
+			WebPushEnabled:  *webPushFlag,
+			NotifyScript:    *notifyScriptFlag,
 			UseTLS:          *tlsFlag,
 			CertFile:        resolvedCert,
 			KeyFile:         resolvedKey,
@@ -360,6 +381,8 @@ type startupConfig struct {
 	NoRelayer     *bool   `json:"noRelayer"`
 	NoRelayerFlag *bool   `json:"no-relayer"`
 	E2EE          *bool   `json:"e2ee"`
+	WebPush       *bool   `json:"webPush"`
+	WebPushFlag   *bool   `json:"web-push"`
 	Foreground    *bool   `json:"foreground"`
 	BindRelay     *bool   `json:"bindRelay"`
 	BindRelayFlag *bool   `json:"bind-relay"`
@@ -367,6 +390,7 @@ type startupConfig struct {
 	Cert          *string `json:"cert"`
 	Key           *string `json:"key"`
 	AgentConfig   *string `json:"agent-config"`
+	NotifyScript  *string `json:"notify-script"`
 }
 
 func loadStartupConfig(path string) (startupConfig, error) {
@@ -399,12 +423,14 @@ func applyStartupConfig(
 	addr *string,
 	noRelayer *bool,
 	e2ee *bool,
+	webPush *bool,
 	foreground *bool,
 	bindRelay *bool,
 	tlsFlag *bool,
 	cert *string,
 	key *string,
 	agentConfig *string,
+	notifyScript *string,
 ) {
 	if cfg.Addr != nil && !explicit["addr"] {
 		*addr = strings.TrimSpace(*cfg.Addr)
@@ -414,6 +440,9 @@ func applyStartupConfig(
 	}
 	if cfg.E2EE != nil && !explicit["e2ee"] {
 		*e2ee = *cfg.E2EE
+	}
+	if value := firstBool(cfg.WebPush, cfg.WebPushFlag); value != nil && !explicit["web-push"] {
+		*webPush = *value
 	}
 	if cfg.Foreground != nil && !explicit["foreground"] {
 		*foreground = *cfg.Foreground
@@ -432,6 +461,9 @@ func applyStartupConfig(
 	}
 	if cfg.AgentConfig != nil && !explicit["agent-config"] {
 		*agentConfig = strings.TrimSpace(*cfg.AgentConfig)
+	}
+	if cfg.NotifyScript != nil && !explicit["notify-script"] {
+		*notifyScript = strings.TrimSpace(*cfg.NotifyScript)
 	}
 }
 
@@ -770,6 +802,147 @@ func removeManagedDir(addr string, useTLS bool, path string) error {
 	}
 	message := httpErrorMessage(resp)
 	return fmt.Errorf("failed to remove managed directory: %s", message)
+}
+
+func normalizeTaskRootFirstArgs(args []string) []string {
+	if len(args) < 2 || strings.HasPrefix(args[0], "-") || !containsTaskFlag(args[1:]) {
+		return args
+	}
+	out := make([]string, 0, len(args))
+	out = append(out, args[1:]...)
+	out = append(out, args[0])
+	return out
+}
+
+func containsTaskFlag(args []string) bool {
+	for _, arg := range args {
+		if arg == "-task" || arg == "--task" || strings.HasPrefix(arg, "-task=") || strings.HasPrefix(arg, "--task=") {
+			return true
+		}
+	}
+	return false
+}
+
+func taskCLIAction(status, next, prev bool) string {
+	actions := []string{}
+	if status {
+		actions = append(actions, "status")
+	}
+	if next {
+		actions = append(actions, "next")
+	}
+	if prev {
+		actions = append(actions, "prev")
+	}
+	if len(actions) == 0 {
+		return "status"
+	}
+	if len(actions) > 1 {
+		return ""
+	}
+	return actions[0]
+}
+
+type taskCLIListResponse struct {
+	Items []json.RawMessage `json:"items"`
+}
+
+type taskCLIDetailHeader struct {
+	Task struct {
+		ID         string `json:"id"`
+		TaskNumber int    `json:"task_number"`
+	} `json:"task"`
+}
+
+func handleTaskCommand(addr string, useTLS bool, rootID, taskNumberRaw, action string) error {
+	rootID = strings.TrimSpace(rootID)
+	taskNumberRaw = strings.TrimSpace(strings.TrimPrefix(taskNumberRaw, "#"))
+	if rootID == "" {
+		return errors.New("root id argument required: mindfs <rootid> -task <task_number>")
+	}
+	taskNumber, err := strconv.Atoi(taskNumberRaw)
+	if err != nil || taskNumber <= 0 {
+		return errors.New("task number must be a positive integer")
+	}
+	if action == "" {
+		return errors.New("at most one task action allowed: -status, -next, or -prev")
+	}
+	token, err := app.ReadLocalCLIToken(addr)
+	if err != nil {
+		return err
+	}
+	taskID, detail, err := fetchTaskDetailByNumber(addr, useTLS, token, rootID, taskNumber)
+	if err != nil {
+		return err
+	}
+	if action == "status" {
+		_, err = os.Stdout.Write(detail)
+		if err == nil {
+			fmt.Fprintln(os.Stdout)
+		}
+		return err
+	}
+	payload, err := json.Marshal(map[string]any{"root_id": rootID})
+	if err != nil {
+		return err
+	}
+	path := "/api/tasks/" + url.PathEscape(taskID) + "/" + action
+	req, err := http.NewRequest(http.MethodPost, addrToURL(addr, path, useTLS), bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("X-MindFS-Local-CLI-Token", token)
+	req.Header.Set("Content-Type", "application/json")
+	client := newHTTPClient(useTLS, 10*time.Second)
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("task command failed: %s", httpErrorMessage(resp))
+	}
+	_, err = io.Copy(os.Stdout, resp.Body)
+	if err == nil {
+		fmt.Fprintln(os.Stdout)
+	}
+	return err
+}
+
+func fetchTaskDetailByNumber(addr string, useTLS bool, token, rootID string, taskNumber int) (string, json.RawMessage, error) {
+	query := url.Values{}
+	query.Set("root", rootID)
+	query.Set("task_number", strconv.Itoa(taskNumber))
+	query.Set("limit", "1")
+	req, err := http.NewRequest(http.MethodGet, addrToURL(addr, "/api/tasks?"+query.Encode(), useTLS), nil)
+	if err != nil {
+		return "", nil, err
+	}
+	req.Header.Set("X-MindFS-Local-CLI-Token", token)
+	client := newHTTPClient(useTLS, 10*time.Second)
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", nil, fmt.Errorf("task lookup failed: %s", httpErrorMessage(resp))
+	}
+	var list taskCLIListResponse
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		return "", nil, err
+	}
+	if len(list.Items) == 0 {
+		return "", nil, fmt.Errorf("task #%d not found in root %s", taskNumber, rootID)
+	}
+	var header taskCLIDetailHeader
+	if err := json.Unmarshal(list.Items[0], &header); err != nil {
+		return "", nil, err
+	}
+	if strings.TrimSpace(header.Task.ID) == "" || header.Task.TaskNumber != taskNumber {
+		return "", nil, fmt.Errorf("invalid task lookup response for #%d", taskNumber)
+	}
+	return header.Task.ID, list.Items[0], nil
 }
 
 func httpErrorMessage(resp *http.Response) string {

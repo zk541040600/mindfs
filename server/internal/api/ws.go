@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -17,6 +18,7 @@ import (
 	"mindfs/server/internal/e2ee"
 	"mindfs/server/internal/fs"
 	"mindfs/server/internal/githubimport"
+	"mindfs/server/internal/kanban"
 	"mindfs/server/internal/session"
 	"mindfs/server/internal/update"
 
@@ -348,13 +350,23 @@ func (h *WSHandler) broadcastFileChangeBatch(change fs.FileChangeBatchEvent) {
 }
 
 func (h *WSHandler) broadcastRelatedFileChange(change fs.RelatedFileEvent) {
+	payload := map[string]any{
+		"root_id":     change.RootID,
+		"session_key": change.SessionKey,
+		"path":        change.Path,
+	}
 	resp := WSResponse{
-		Type: "session.related_files.updated",
-		Payload: map[string]any{
-			"root_id":     change.RootID,
-			"session_key": change.SessionKey,
-			"path":        change.Path,
-		},
+		Type:    "session.related_files.updated",
+		Payload: payload,
+	}
+	if change.RelatedWorktree != nil {
+		payload["related_worktree"] = map[string]any{
+			"root_id": change.RootID,
+			"path":    change.RelatedWorktree.Path,
+			"branch":  change.RelatedWorktree.Branch,
+			"head":    change.RelatedWorktree.Head,
+			"current": change.RelatedWorktree.Current,
+		}
 	}
 	h.broadcastWS(resp)
 }
@@ -373,12 +385,14 @@ func (h *WSHandler) broadcastSessionMetaUpdated(rootID string, sess *session.Ses
 				"type":                sess.Type,
 				"parent_session_key":  sess.ParentSessionKey,
 				"parent_tool_call_id": sess.ParentToolCallID,
+				"task_id":             sess.TaskID,
 				"name":                sess.Name,
 				"model":               sess.Model,
 				"mode":                session.InferModeFromSession(sess),
 				"effort":              session.InferEffortFromSession(sess),
 				"fast_service":        session.InferFastServiceFromSession(sess),
 				"plan_mode":           sess.PlanMode,
+				"related_worktree":    sess.RelatedWorktree,
 				"updated_at":          sess.UpdatedAt,
 			},
 		},
@@ -391,6 +405,7 @@ func (h *WSHandler) broadcastAgentStatusChange(status agent.Status) {
 		Type: "agent.status.changed",
 		Payload: map[string]any{
 			"name":                  status.Name,
+			"protocol":              status.Protocol,
 			"installed":             status.Installed,
 			"available":             status.Available,
 			"version":               status.Version,
@@ -465,6 +480,8 @@ func (h *WSHandler) handleWSRequest(ctx context.Context, conn *websocket.Conn, c
 		h.handleWSPing(conn, clientID, req)
 	case "session.message":
 		go h.handleSessionMessage(ctx, conn, clientID, req)
+	case "session.slash_command.run":
+		go h.handleSessionSlashCommandRun(ctx, conn, clientID, req)
 	case "session.plan_mode.set":
 		h.handleSessionPlanModeSet(ctx, conn, clientID, req)
 	case "session.answer_question":
@@ -510,6 +527,16 @@ func (h *WSHandler) handleSessionAnswerQuestion(ctx context.Context, conn *webso
 	}); err != nil {
 		h.sendWSError(conn, clientID, req.ID, "session.answer_question_failed", err.Error())
 		return
+	}
+	if manager, err := h.AppContext.GetSessionManager(rootID); err == nil {
+		if sess, getErr := manager.Get(ctx, key, 0); getErr == nil && sess != nil && strings.TrimSpace(sess.TaskID) != "" {
+			if svc, svcErr := h.AppContext.GetKanbanService(); svcErr == nil {
+				value := false
+				if _, clearErr := svc.UpdateTaskAuxFlags(ctx, rootID, sess.TaskID, kanban.TaskAuxFlagsPatch{AskUserWaiting: &value}, "aux_ask_user_answered"); clearErr != nil {
+					log.Printf("[kanban] ask_user.answered.flag_clear.error root=%s task=%s session=%s err=%v", rootID, sess.TaskID, key, clearErr)
+				}
+			}
+		}
 	}
 	_ = h.writeWSJSON(clientID, conn, WSResponse{
 		ID:      req.ID,
@@ -572,6 +599,7 @@ func (h *WSHandler) handleSessionMessage(ctx context.Context, conn *websocket.Co
 	if planRequested {
 		content = strippedContent
 	}
+	planMode := planRequested
 	sessionType := getString(req.Payload, "type")
 	agentName := getString(req.Payload, "agent")
 	model := getString(req.Payload, "model")
@@ -637,6 +665,7 @@ func (h *WSHandler) handleSessionMessage(ctx context.Context, conn *websocket.Co
 		}
 	} else if current, err := uc.GetSession(ctx, usecase.GetSessionInput{RootID: rootID, Key: key}); err == nil && current != nil {
 		sessionName = current.Name
+		planMode = current.PlanMode
 		if planRequested && !current.PlanMode {
 			if manager, managerErr := h.AppContext.GetSessionManager(rootID); managerErr == nil {
 				if updateErr := manager.UpdatePlanMode(ctx, current, true); updateErr != nil {
@@ -647,6 +676,7 @@ func (h *WSHandler) handleSessionMessage(ctx context.Context, conn *websocket.Co
 				updated, getErr := manager.Get(ctx, key, 0)
 				if getErr == nil && updated != nil {
 					current = updated
+					planMode = updated.PlanMode
 					h.broadcastSessionMetaUpdated(rootID, updated)
 				}
 			} else {
@@ -668,6 +698,7 @@ func (h *WSHandler) handleSessionMessage(ctx context.Context, conn *websocket.Co
 		Mode:        agentMode,
 		Effort:      effort,
 		FastService: fastService,
+		PlanMode:    planMode,
 		Content:     content,
 		Timestamp:   time.Now().UTC(),
 	}
@@ -697,6 +728,80 @@ func (h *WSHandler) handleSessionMessage(ctx context.Context, conn *websocket.Co
 		streamHub.BroadcastSessionQueueUpdated(rootID, key, queue)
 	}
 	h.runSessionMessage(job)
+}
+
+func (h *WSHandler) handleSessionSlashCommandRun(ctx context.Context, conn *websocket.Conn, clientID string, req WSRequest) {
+	rootID := getString(req.Payload, "root_id")
+	key := getString(req.Payload, "session_key")
+	requestID := strings.TrimSpace(req.ID)
+	agentName := getString(req.Payload, "agent")
+	model := getString(req.Payload, "model")
+	agentMode := getString(req.Payload, "agent_mode")
+	effort := getString(req.Payload, "effort")
+	fastService := normalizeFastServiceValue(getString(req.Payload, "fast_service"))
+	command := strings.TrimSpace(getString(req.Payload, "command"))
+	normalizedCommand := strings.TrimPrefix(strings.ToLower(command), "/")
+	if rootID == "" || agentName == "" || normalizedCommand == "" {
+		h.sendWSError(conn, clientID, req.ID, "invalid_request", "root_id, agent and command required")
+		return
+	}
+	if key == "" {
+		if requestID != "" {
+			key = "transient-" + requestID
+		} else {
+			key = "transient-" + normalizedCommand + "-" + strconv.FormatInt(time.Now().UnixNano(), 10)
+		}
+	}
+	if agentName != "codex" || (normalizedCommand != "status" && normalizedCommand != "login") {
+		h.sendWSError(conn, clientID, req.ID, "unsupported_slash_command", "only codex /status and /login are supported")
+		return
+	}
+	if requestID != "" {
+		if !h.reserveClientRequest(requestID) {
+			h.sendWSAccepted(conn, clientID, requestID, rootID, key)
+			return
+		}
+		h.sendWSAccepted(conn, clientID, requestID, rootID, key)
+	}
+	if h.AppContext != nil {
+		h.AppContext.GetSessionStreamHub().BindSessionClient(key, clientID)
+	}
+
+	uc := &usecase.Service{Registry: h.AppContext}
+	msgCtx, cancel := h.sessionMessageContext()
+	defer cancel()
+	updateTracker := newTurnUpdateTracker()
+	err := uc.RunTransientSlashCommand(msgCtx, usecase.RunTransientSlashCommandInput{
+		RootID:      rootID,
+		Key:         key,
+		Agent:       agentName,
+		Model:       model,
+		Mode:        agentMode,
+		Effort:      effort,
+		FastService: fastService,
+		Command:     normalizedCommand,
+		OnUpdate: func(update agenttypes.Event) {
+			updateTracker.Begin()
+			defer updateTracker.End()
+			event := updateToEvent(update)
+			if event == nil {
+				return
+			}
+			_ = h.writeWSJSON(clientID, conn, buildSlashCommandStreamResponse(rootID, key, normalizedCommand, requestID, event))
+		},
+	})
+	if err != nil {
+		log.Printf("[ws] session.slash_command.error root=%s session=%s command=%s request=%s err=%v", rootID, key, normalizedCommand, requestID, err)
+		event := &StreamEvent{
+			Type: "error",
+			Data: map[string]string{"message": normalizeAgentErrorMessage(err)},
+		}
+		_ = h.writeWSJSON(clientID, conn, buildSlashCommandStreamResponse(rootID, key, normalizedCommand, requestID, event))
+	}
+	if ok := updateTracker.WaitIdle(msgCtx, sessionDoneSettleWindow, sessionDoneMaxWait); !ok {
+		log.Printf("[ws] session.slash_command.done.wait_timeout root=%s session=%s command=%s request=%s", rootID, key, normalizedCommand, requestID)
+	}
+	_ = h.writeWSJSON(clientID, conn, buildSlashCommandDoneResponse(rootID, key, normalizedCommand, requestID))
 }
 
 func (h *WSHandler) handleSessionPlanModeSet(ctx context.Context, conn *websocket.Conn, clientID string, req WSRequest) {
@@ -733,7 +838,7 @@ func (h *WSHandler) handleSessionPlanModeSet(ctx context.Context, conn *websocke
 	}
 	h.sendWSAccepted(conn, clientID, requestID, rootID, key)
 	h.broadcastSessionMetaUpdated(rootID, updated)
-	_ = h.writeWSJSON(clientID, conn, buildSessionDoneResponse(rootID, key, requestID))
+	_ = h.writeWSJSON(clientID, conn, buildSessionDoneResponse(rootID, key, requestID, false))
 }
 
 func wsAgentPoolSessionKey(sessionKey, agentName string) string {
@@ -795,21 +900,22 @@ func (h *WSHandler) runSessionMessage(job sessionMessageJob) {
 		Mode:         job.User.Mode,
 		Effort:       job.User.Effort,
 		FastService:  job.User.FastService,
+		PlanMode:     &job.User.PlanMode,
 		Shell:        job.Shell,
 		TerminalCols: job.TerminalCols,
 		Content:      job.User.Content,
 		ClientCtx:    job.ClientCtx,
 		OnStart: func() {
-			streamHub.BroadcastSessionUserMessage(rootID, key, job.SessionType, job.SessionName, job.User.Agent, job.User.Model, job.User.Mode, job.User.Effort, job.User.FastService, job.User.Content, job.ExcludeClientID, job.Queued)
+			h.AppContext.ClearTaskAuxFlagsForSession(rootID, key)
+			streamHub.BroadcastSessionUserMessage(rootID, key, job.SessionType, job.SessionName, job.User.Agent, job.User.Model, job.User.Mode, job.User.Effort, job.User.FastService, job.User.PlanMode, job.User.Content, job.ExcludeClientID, job.Queued)
 		},
 		OnUpdate: func(update agenttypes.Event) {
 			updateTracker.Begin()
 			defer updateTracker.End()
-			event := updateToEvent(update)
-			if event == nil {
+			if updateToEvent(update) == nil {
 				return
 			}
-			streamHub.BroadcastSessionStream(rootID, key, event)
+			h.AppContext.BroadcastSessionUpdate(rootID, key, update)
 		},
 		OnSubSessionCreated: func(created *session.Session) {
 			h.broadcastSessionMetaUpdated(rootID, created)
@@ -820,19 +926,17 @@ func (h *WSHandler) runSessionMessage(job sessionMessageJob) {
 		OnSubSessionUpdate: func(sessionKey string, update agenttypes.Event) {
 			tracker := subTrackerFor(sessionKey)
 			tracker.Begin()
-			event := updateToEvent(update)
-			if event == nil {
+			if updateToEvent(update) == nil {
 				tracker.End()
 				return
 			}
-			streamHub.BroadcastSessionStream(rootID, sessionKey, event)
+			h.AppContext.BroadcastSessionUpdate(rootID, sessionKey, update)
 			if update.Type == agenttypes.EventTypeMessageDone {
 				tracker.End()
 				if ok := tracker.WaitIdle(msgCtx, sessionDoneSettleWindow, sessionDoneMaxWait); !ok {
 					log.Printf("[ws] sub-session.done.wait_timeout root=%s session=%s", rootID, sessionKey)
 				}
-				streamHub.ClearSessionPending(sessionKey)
-				streamHub.BroadcastSessionDone(rootID, sessionKey, "")
+				h.AppContext.BroadcastSessionDone(rootID, sessionKey, "")
 				return
 			}
 			tracker.End()
@@ -852,15 +956,14 @@ func (h *WSHandler) runSessionMessage(job sessionMessageJob) {
 				},
 			}
 			streamHub.BroadcastSessionStream(rootID, key, event)
+			h.AppContext.BroadcastSessionError(rootID, key, errorMessage)
 		}
 	}
 	if ok := updateTracker.WaitIdle(msgCtx, sessionDoneSettleWindow, sessionDoneMaxWait); !ok {
 		log.Printf("[ws] session.done.wait_timeout root=%s session=%s request=%s", rootID, key, requestID)
 	}
-	streamHub.ClearSessionPending(key)
-
 	log.Printf("[ws] session.done root=%s session=%s request=%s", rootID, key, requestID)
-	streamHub.BroadcastSessionDone(rootID, key, requestID)
+	h.AppContext.BroadcastSessionDone(rootID, key, requestID)
 	h.startNextQueuedSessionMessage(rootID, key)
 }
 
@@ -1145,6 +1248,18 @@ func updateToEvent(update agenttypes.Event) *StreamEvent {
 	case agenttypes.EventTypeTodoUpdate:
 		if todo, ok := update.Data.(agenttypes.TodoUpdate); ok {
 			return &StreamEvent{Type: "todo_update", Data: todo}
+		}
+	case agenttypes.EventTypePlanUpdate:
+		if plan, ok := update.Data.(agenttypes.PlanUpdate); ok {
+			return &StreamEvent{Type: "plan_update", Data: plan}
+		}
+	case agenttypes.EventTypeCompact:
+		if compact, ok := update.Data.(agenttypes.CompactNotice); ok {
+			return &StreamEvent{Type: "compact_notice", Data: compact}
+		}
+	case agenttypes.EventTypeLogin:
+		if login, ok := update.Data.(agenttypes.LoginNotice); ok {
+			return &StreamEvent{Type: "login_notice", Data: login}
 		}
 	case agenttypes.EventTypeMessageDone:
 		if done, ok := update.Data.(agenttypes.MessageDone); ok {

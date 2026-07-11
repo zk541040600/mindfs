@@ -65,7 +65,7 @@ struct Index {
   private nativeBridgeMethodList(): Array<string> {
     return [
       'download',
-      'downloadBase64',
+      'saveBase64',
       'openExternalURL',
       'getAppInfo',
       'configureReplyPoller',

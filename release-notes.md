@@ -1,35 +1,77 @@
-# MindFS v0.3.4-sdk-runtime.5-default
+# MindFS v0.4.0
 
 ## 新功能
-- Pi 默认交互 runtime 切换为 `pi-sdk`，普通聊天、工具事件、slash、模型/思考等级、取消和扩展 UI 走 SDK runtime。
-- 保留 `pi-rpc` 作为显式回滚协议，便于 SDK 默认版本出现环境问题时快速切回。
+- 增加任务看板，可自定义任务阶段及每阶段提示词
+- 侧边栏布局调整，增加 worktree 和关联文件
+- 会话、任务、worktree关联展示，review 时更加清晰
+- 增加 git diff 双栏视图
+- 用户消息快速定位浮钮
+- 服务启动可指定 webhook 通知脚本
+- 增加两款配色主题
 
 ## 优化和修复
-- 前端扩展 UI 兼容 SDK `notificationType`、`content` 和 `placement` payload 形状。
-- SDK bridge 文档更新为默认 runtime + metadata/import probe 的双角色说明。
+- 子会话默认折叠，展示数量角标
+- 增加 git push/pull/commit 操作
+- 过滤shell命令脏历史
+- 修复ios触底回滚
+- 多项目会话搜索
+- 关联文件包含项目外文件，提交后 diff 仍然可用
+- 优化 acp 会话加载速度
+- 优化会话卡片展示
+- claude 会话导入忽略 subagent
 
 
-# MindFS v0.3.4-sdk.1
+# MindFS v0.3.8
 
 ## 新功能
-- Pi SDK 辅助桥接产品化：安全会话 metadata、SDK 状态、显式刷新、安全 transcript 导入与导入前确认 UI。
-- Docker 运行版本跟随当前 latest，避免 `/api/app/update` 对本地构建误报更新。
+- 多项目会话列表（需要主动勾选）
+- 左右测变化位置交换（需要主动勾选）
+- codex 增加 /login，方便远程登录
 
 ## 优化和修复
-- Pi SDK bridge 改为环境变量 / 本地模块 / 全局 npm root 解析，不再硬编码主机绝对路径。
-- 明确 Pi 生产交互主链路仍为 `pi-rpc`，SDK 仅用于辅助 metadata/status/import 能力，失败时不影响聊天主链路。
+- 修复同名项目移除在添加后 git 历史缺失问题
+- 优化 web push 内容
+- 会话列表中正在回复会话添加呼吸灯效果
+- 子会话过多时折叠展示
+- 优化codex /status 展示
+- 修复 codex /compact 立刻返回问题
+- 增加 codex skill 候选扫描目录
+- 修复执行命令创建脏文件问题
+- 修复切换会话时的额外提示音
 
 
-# MindFS v0.3.3
+# MindFS v0.3.7
 
 ## 新功能
-- Pi SDK-backed external session metadata listing。
-- Pi SDK bridge 60s cache、read-only `/api/agents/pi/sdk-status`、`refresh=true` 显式刷新。
-- 显式 `mode: "safe_transcript"` 的 Pi session 安全导入，包含 redaction、限制、warning code 和 fail-closed 行为。
+- codex 支持 ask user，todolist, plan 卡片/toolcall
+- cc 支持 subagent
+- web push 通知（需要菜单中手动打开）
+- 从历史消息 fork 新会话
 
 ## 优化和修复
-- Pi import UI 展示 SDK 状态与刷新按钮。
-- 保持 `agents.json` 中 Pi 为 `protocol: "pi-rpc"`，普通聊天、slash、tool、extension UI 不切到 SDK。
+- 修复 markdown 中本地文件无法预览
+- 修复 e2ee 模式下无法下载文件
+- acp 协议新版本适配，修复无法设置模型
+- 修复 ask user 刷新页面后回答丢失
+- 修复 cc 模型名称显示问题
+- 修复无法添加 nas/网络盘 项目
+
+
+# MindFS v0.3.6
+
+## 新功能
+- 从公网访问本地服务，可以实现本地服务的一键公网访问
+- codex/claude 支持/plan 命令
+
+## 优化和修复
+- 修复未安装 agent 出现在选择列表中
+- 修复 e2ee 模式【从公网访问】按钮灰色
+- 修复 Windows 上被识别为病毒
+- 修复新开/刷新页面时未补拉已有回复
+- 修复新开/刷新页面时 thought 重复
+- 修复 acp agent 有时候一致处于正在回复
+- 识别不可恢复错误，优化自动重试
+
 
 # MindFS v0.3.5
 
@@ -46,6 +88,28 @@
 - 文件权限错误返回到前端
 - 修复移动端长时间切后台后一直正在回复的问题
 - codex skill 扫描目录增加.agent/skills
+
+
+# MindFS v0.3.4-sdk-runtime.5-default
+
+## 新功能
+- Pi 默认交互 runtime 切换为 `pi-sdk`，普通聊天、工具事件、slash、模型/思考等级、取消和扩展 UI 走 SDK runtime。
+- 保留 `pi-rpc` 作为显式回滚协议，便于 SDK 默认版本出现环境问题时快速回切。
+
+## 优化和修复
+- 前端扩展 UI 兼容 SDK `notificationType`、`content` 和 `placement` payload 形状。
+- SDK bridge 文档更新为默认 runtime + metadata/import probe 的双角色说明。
+
+
+# MindFS v0.3.4-sdk.1
+
+## 新功能
+- Pi SDK 辅助桥接产品化：安全会话 metadata、SDK 状态、显式刷新、安全 transcript 导入与导入前确认 UI。
+- Docker 运行版本跟随当前 latest，避免 `/api/app/update` 对本地构建误报更新。
+
+## 优化和修复
+- Pi SDK bridge 改为环境变量 / 本地模块 / 全局 npm root 解析，不再硬编码主机绝对路径。
+- 明确 Pi 生产交互主链路仍为 `pi-rpc`，SDK 仅用于辅助 metadata/status/import 能力，失败时不影响聊天主链路。
 
 
 # MindFS v0.3.4

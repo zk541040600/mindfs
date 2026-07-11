@@ -1,5 +1,4 @@
 import { registerPlugin } from "@capacitor/core";
-import { Directory, Filesystem } from "@capacitor/filesystem";
 import { appURL } from "./base";
 import { e2eeService } from "./e2ee";
 import { fetchProofProtectedBlob } from "./file";
@@ -18,10 +17,10 @@ type NativeDownloadPlugin = {
     filename: string;
     directory: string;
   }>;
-  saveBase64: (opts: { data: string; filename: string }) => Promise<{
+  saveBase64: (opts: { dataBase64: string; filename: string; mimeType?: string }) => Promise<{
     filename: string;
     directory: string;
-    uri?: string;
+    path?: string;
   }>;
 };
 
@@ -30,14 +29,14 @@ const NativeDownload = registerPlugin<NativeDownloadPlugin>("NativeDownload");
 type WindowWithNativeDownloadBridge = Window & {
   MindFSNativeDownload?: {
     download?: (url: string, filename: string) => string;
-    downloadBase64?: (data: string, filename: string) => string;
+    saveBase64?: (dataBase64: string, filename: string, mimeType?: string) => string;
   };
 };
 
 const invalidDownloadNamePattern = /[\x00-\x1f\x7f<>:"/\\|?*]+/g;
 const maxDownloadNameLength = 180;
 
-export function sanitizeDownloadName(path: string, name?: string): string {
+function sanitizeDownloadName(path: string, name?: string): string {
   const candidate = String(name || path || "").trim();
   if (!candidate) {
     return "download";
@@ -108,59 +107,7 @@ function triggerBrowserDownload(url: string, filename: string): void {
   anchor.remove();
 }
 
-async function blobToBase64(blob: Blob): Promise<string> {
-  const bytes = new Uint8Array(await blob.arrayBuffer());
-  let binary = "";
-  const chunkSize = 0x8000;
-  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
-    const chunk = bytes.subarray(offset, offset + chunkSize);
-    binary += String.fromCharCode(...chunk);
-  }
-  return btoa(binary);
-}
-
-async function downloadBlobWithNativeShell(blob: Blob, filename: string): Promise<void> {
-  const data = await blobToBase64(blob);
-  const unifiedBridge = getNativeBridge();
-  if (typeof unifiedBridge?.downloadBase64 === "function") {
-    const result = await unifiedBridge.downloadBase64(JSON.stringify({ filename, data }));
-    if (typeof result === "string" && result) {
-      throw new Error(result);
-    }
-    return;
-  }
-
-  const nativeBridge = (window as WindowWithNativeDownloadBridge).MindFSNativeDownload;
-  if (typeof nativeBridge?.downloadBase64 === "function") {
-    const errorMessage = nativeBridge.downloadBase64(data, filename);
-    if (errorMessage) {
-      throw new Error(errorMessage);
-    }
-    return;
-  }
-
-  try {
-    await NativeDownload.saveBase64({ data, filename });
-    return;
-  } catch (error) {
-    console.warn("[download] native saveBase64 plugin unavailable", error);
-  }
-
-  await Filesystem.writeFile({
-    path: filename,
-    data,
-    directory: Directory.Documents,
-  });
-}
-
-async function downloadBlob(blob: Blob, filename: string): Promise<void> {
-  if (isNativeShellRuntime()) {
-    await downloadBlobWithNativeShell(blob, filename);
-    return;
-  }
-  if (typeof URL === "undefined" || typeof URL.createObjectURL !== "function") {
-    throw new Error("当前浏览器不支持安全下载");
-  }
+function triggerBlobDownload(blob: Blob, filename: string): void {
   const objectURL = URL.createObjectURL(blob);
   try {
     triggerBrowserDownload(objectURL, filename);
@@ -195,6 +142,43 @@ async function downloadWithNativeShell(url: string, filename: string): Promise<v
   await NativeDownload.download({ url, filename });
 }
 
+function blobToBase64(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error || new Error("读取下载内容失败"));
+    reader.onload = () => {
+      const result = String(reader.result || "");
+      const comma = result.indexOf(",");
+      resolve(comma >= 0 ? result.slice(comma + 1) : result);
+    };
+    reader.readAsDataURL(blob);
+  });
+}
+
+async function saveBlobWithNativeShell(blob: Blob, filename: string): Promise<void> {
+  const dataBase64 = await blobToBase64(blob);
+  const mimeType = blob.type || "application/octet-stream";
+  const unifiedBridge = getNativeBridge();
+  if (typeof unifiedBridge?.saveBase64 === "function") {
+    const result = await unifiedBridge.saveBase64(JSON.stringify({ dataBase64, filename, mimeType }));
+    if (typeof result === "string" && result) {
+      throw new Error(result);
+    }
+    return;
+  }
+
+  const nativeBridge = (window as WindowWithNativeDownloadBridge).MindFSNativeDownload;
+  if (nativeBridge && typeof nativeBridge.saveBase64 === "function") {
+    const errorMessage = nativeBridge.saveBase64(dataBase64, filename, mimeType);
+    if (errorMessage) {
+      throw new Error(errorMessage);
+    }
+    return;
+  }
+
+  await NativeDownload.saveBase64({ dataBase64, filename, mimeType });
+}
+
 export async function downloadURL(url: string, filename = "download"): Promise<void> {
   if (typeof document === "undefined") {
     throw new Error("download is only available in browser runtime");
@@ -216,11 +200,21 @@ export async function downloadURL(url: string, filename = "download"): Promise<v
 export async function downloadFile(params: DownloadFileParams): Promise<void> {
   const filename = sanitizeDownloadName(params.path, params.name);
   if (e2eeService.isRequired()) {
-    const blob = await fetchProofProtectedBlob({
-      rootId: params.rootId,
-      path: params.path,
-    });
-    await downloadBlob(blob, filename);
+    if (!isNativeShellRuntime()) {
+      const blob = await fetchProofProtectedBlob({ rootId: params.rootId, path: params.path });
+      triggerBlobDownload(blob, filename);
+      return;
+    }
+    const blob = await fetchProofProtectedBlob({ rootId: params.rootId, path: params.path });
+    try {
+      await saveBlobWithNativeShell(blob, filename);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error || "");
+      if (!/not implemented|unimplemented|not available|plugin/i.test(message)) {
+        throw error;
+      }
+      throw new Error("当前 Android 壳不支持 E2EE 文件保存，请升级到最新版 Android 壳后重试");
+    }
     return;
   }
   const url = toAbsoluteDownloadURL(buildDownloadURL(params.rootId, params.path));

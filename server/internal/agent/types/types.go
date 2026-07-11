@@ -55,6 +55,51 @@ type Session interface {
 	Close() error
 }
 
+type ForkPointKind string
+
+const (
+	ForkPointClaudeMessageUUID ForkPointKind = "claude_message_uuid"
+	ForkPointCodexUserOrdinal  ForkPointKind = "codex_user_ordinal"
+)
+
+type ResolveForkPointInput struct {
+	RootPath       string
+	AgentSessionID string
+	AgentTurnIndex int
+}
+
+type ResolveForkPointOutput struct {
+	Kind              ForkPointKind
+	AgentSessionID    string
+	ClaudeMessageUUID string
+	CodexUserOrdinal  int
+}
+
+type ForkPointResolver interface {
+	ResolveForkPointByAgentTurnIndex(ctx context.Context, in ResolveForkPointInput) (ResolveForkPointOutput, error)
+}
+
+type ForkSessionInput struct {
+	SessionKey         string
+	AgentName          string
+	Model              string
+	Mode               string
+	Effort             string
+	FastService        string
+	PlanMode           bool
+	RootPath           string
+	SourceAgentSession string
+	ForkPoint          ResolveForkPointOutput
+}
+
+type ForkSessionOutput struct {
+	AgentSessionID string
+}
+
+type SessionForker interface {
+	ForkSession(ctx context.Context, in ForkSessionInput) (ForkSessionOutput, error)
+}
+
 type ContextWindow struct {
 	TotalTokens        int `json:"totalTokens"`
 	ModelContextWindow int `json:"modelContextWindow"`
@@ -73,6 +118,7 @@ type OpenSessionInput struct {
 	AgentSessionID string
 	AgentCtxSeq    int
 	TestScenario   string
+	ForkPoint      ResolveForkPointOutput
 }
 
 type RuntimeDefaults struct {
@@ -190,6 +236,9 @@ const (
 	EventTypeToolCall     EventType = "tool_call"
 	EventTypeToolUpdate   EventType = "tool_update"
 	EventTypeTodoUpdate   EventType = "todo_update"
+	EventTypePlanUpdate   EventType = "plan_update"
+	EventTypeCompact      EventType = "compact_notice"
+	EventTypeLogin        EventType = "login_notice"
 	EventTypeMessageDone  EventType = "message_done"
 	EventTypeRecovery     EventType = "recovery"
 	EventTypeExtensionUI  EventType = "extension_ui"
@@ -203,16 +252,28 @@ type Event struct {
 }
 
 type MessageChunk struct {
-	Content string `json:"content"`
+	Content         string `json:"content"`
+	ParentToolUseID string `json:"parentToolUseId,omitempty"`
+	TaskID          string `json:"taskId,omitempty"`
+	SubagentType    string `json:"subagentType,omitempty"`
+	TaskDescription string `json:"taskDescription,omitempty"`
 }
 
 type ThoughtChunk struct {
-	ID      string `json:"id,omitempty"`
-	Content string `json:"content"`
+	ID              string `json:"id,omitempty"`
+	Content         string `json:"content"`
+	ParentToolUseID string `json:"parentToolUseId,omitempty"`
+	TaskID          string `json:"taskId,omitempty"`
+	SubagentType    string `json:"subagentType,omitempty"`
+	TaskDescription string `json:"taskDescription,omitempty"`
 }
 
 type MessageDone struct {
-	ContextWindow ContextWindow `json:"contextWindow"`
+	ContextWindow   ContextWindow `json:"contextWindow"`
+	ParentToolUseID string        `json:"parentToolUseId,omitempty"`
+	TaskID          string        `json:"taskId,omitempty"`
+	SubagentType    string        `json:"subagentType,omitempty"`
+	TaskDescription string        `json:"taskDescription,omitempty"`
 }
 
 type RecoveryStatus struct {
@@ -241,6 +302,28 @@ type TodoItem struct {
 
 type TodoUpdate struct {
 	Items []TodoItem `json:"items"`
+}
+
+type PlanUpdate struct {
+	ID      string `json:"id,omitempty"`
+	Content string `json:"content"`
+	Delta   bool   `json:"delta,omitempty"`
+}
+
+type CompactNotice struct {
+	ID      string `json:"id,omitempty"`
+	Status  string `json:"status,omitempty"`
+	Summary string `json:"summary,omitempty"`
+}
+
+type LoginNotice struct {
+	Status          string `json:"status"`
+	LoginID         string `json:"loginId,omitempty"`
+	VerificationURL string `json:"verificationUrl,omitempty"`
+	UserCode        string `json:"userCode,omitempty"`
+	Error           string `json:"error,omitempty"`
+	AuthMode        string `json:"authMode,omitempty"`
+	PlanType        string `json:"planType,omitempty"`
 }
 
 type AskUserQuestionOption struct {

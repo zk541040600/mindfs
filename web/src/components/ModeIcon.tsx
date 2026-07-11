@@ -1,6 +1,6 @@
 import React, { useId } from "react";
 
-export type ModeIconType = "chat" | "plugin" | "command";
+export type ModeIconType = "chat" | "plugin" | "command" | "task";
 
 type ModeIconProps = {
   type: ModeIconType;
@@ -14,6 +14,9 @@ export function ModeIcon({ type, size = "1em", style }: ModeIconProps) {
   }
   if (type === "command") {
     return <CommandIcon size={size} style={style} />;
+  }
+  if (type === "task") {
+    return <TaskIcon size={size} style={style} />;
   }
   return <ChatIcon size={size} style={style} />;
 }
@@ -64,6 +67,15 @@ function CommandIcon({ size, style }: Omit<ModeIconProps, "type">) {
         <path d="m7 7l1.227 1.057C8.742 8.502 9 8.724 9 9s-.258.498-.773.943L7 11m4 0h3" />
         <path d="M12 21c3.75 0 5.625 0 6.939-.955a5 5 0 0 0 1.106-1.106C21 17.625 21 15.749 21 12s0-5.625-.955-6.939a5 5 0 0 0-1.106-1.106C17.625 3 15.749 3 12 3s-5.625 0-6.939.955A5 5 0 0 0 3.955 5.06C3 6.375 3 8.251 3 12s0 5.625.955 6.939a5 5 0 0 0 1.106 1.106C6.375 21 8.251 21 12 21" />
       </g>
+    </svg>
+  );
+}
+
+function TaskIcon({ size, style }: Omit<ModeIconProps, "type">) {
+  return (
+    <svg xmlns="http://www.w3.org/2000/svg" width={size} height={size} viewBox="0 0 24 24" style={{ color: "#0082c9", ...style }} aria-hidden="true">
+      <path d="M0 0h24v24H0z" fill="none" />
+      <path fill="currentColor" d="M12 22c.8 0 1.6-.1 2.3-.3c-.4-.5-.8-1.1-1-1.8c-.4.1-.9.1-1.3.1c-4.4 0-8-3.6-8-8s3.6-8 8-8c.8 0 1.5.1 2.2.3l1.6-1.6C14.6 2.3 13.3 2 12 2C6.5 2 2 6.5 2 12s4.5 10 10 10M6.5 11.5l1.4-1.4l3.1 3.1l8.6-8.6L21 6L11 16zM19 14l-1.26 2.75L15 18l2.74 1.26L19 22l1.25-2.74L23 18l-2.75-1.25z" />
     </svg>
   );
 }

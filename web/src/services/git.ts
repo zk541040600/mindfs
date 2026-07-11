@@ -9,6 +9,7 @@ export type GitStatusItem = {
   display_path?: string;
   old_path?: string;
   status: GitStatusCode;
+  staged?: boolean;
   additions: number;
   deletions: number;
   is_dir?: boolean;
@@ -23,13 +24,16 @@ export type GitStatusPayload = {
 
 export type GitDiffPayload = CachedGitDiffPayload & {
   path: string;
+  display_path?: string;
   old_path?: string;
   status: GitStatusCode | string;
   additions: number;
   deletions: number;
   content: string;
   commit?: string;
-  source?: "worktree" | "commit";
+  base_head?: string;
+  target_head?: string;
+  source?: "worktree" | "commit" | "commit_range";
 };
 
 export type GitHistoryItem = {
@@ -73,14 +77,35 @@ export type GitWorktreesPayload = {
   items: GitWorktreeItem[];
 };
 
-export async function fetchGitStatus(rootId: string): Promise<GitStatusPayload> {
-  const payload = await protectedJSON<any>(appURL("/api/git/status", new URLSearchParams({ root: rootId })));
+export type GitActionPayload = {
+  output: string;
+  status: GitStatusPayload;
+};
+
+function normalizeGitStatusPayload(payload: any): GitStatusPayload {
   return {
     available: payload?.available === true,
     branch: typeof payload?.branch === "string" ? payload.branch : undefined,
     dirty_count: Number(payload?.dirty_count) || 0,
     items: Array.isArray(payload?.items) ? payload.items as GitStatusItem[] : [],
   };
+}
+
+function normalizeGitActionPayload(payload: any): GitActionPayload {
+  return {
+    output: typeof payload?.output === "string" ? payload.output : "",
+    status: normalizeGitStatusPayload(payload?.status || {}),
+  };
+}
+
+export async function fetchGitStatus(rootId: string): Promise<GitStatusPayload> {
+  const payload = await protectedJSON<any>(appURL("/api/git/status", new URLSearchParams({ root: rootId })));
+  return normalizeGitStatusPayload(payload);
+}
+
+export async function fetchGitStatusByPath(path: string): Promise<GitStatusPayload> {
+  const payload = await protectedJSON<any>(appURL("/api/git/status", new URLSearchParams({ path })));
+  return normalizeGitStatusPayload(payload);
 }
 
 const DEFAULT_HISTORY_LIMIT = 10;
@@ -322,6 +347,9 @@ export async function fetchGitHistory(
       return normalized;
     }
     const existing = getHistoryCacheEntry(rootId);
+    if (!normalized.available) {
+      return normalized;
+    }
     if (!beforeCommit && !afterCommit) {
       const remoteHead = normalized.remote_head;
       setHistoryCacheEntry(rootId, {
@@ -337,12 +365,9 @@ export async function fetchGitHistory(
         remoteHead,
       });
     } else if (afterCommit) {
-      const remoteHead = normalized.remote_head || existing?.remoteHead;
-      setHistoryCacheEntry(rootId, {
-        items: applyRemoteHead(mergeHistoryItems(normalized.items, existing?.items || []), remoteHead),
-        hasMore: existing?.hasMore ?? normalized.has_more,
-        remoteHead,
-      });
+      // afterCommit is a change probe. A reset/rebase can leave afterCommit as an
+      // existing object that is no longer in the current HEAD history, so blindly
+      // prepending new commits to the cached list can show stale commits.
     }
     return {
       ...normalized,
@@ -408,13 +433,61 @@ export async function checkoutGitBranch(rootId: string, branch: string): Promise
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ root: rootId, branch }),
   });
-  const status = payload?.status || {};
-  return {
-    available: status?.available === true,
-    branch: typeof status?.branch === "string" ? status.branch : undefined,
-    dirty_count: Number(status?.dirty_count) || 0,
-    items: Array.isArray(status?.items) ? status.items as GitStatusItem[] : [],
-  };
+  return normalizeGitStatusPayload(payload?.status || {});
+}
+
+export async function pullGit(rootId: string): Promise<GitActionPayload> {
+  const payload = await protectedJSON<any>(appURL("/api/git/pull"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ root: rootId }),
+  });
+  return normalizeGitActionPayload(payload);
+}
+
+export async function pushGit(rootId: string): Promise<GitActionPayload> {
+  const payload = await protectedJSON<any>(appURL("/api/git/push"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ root: rootId }),
+  });
+  return normalizeGitActionPayload(payload);
+}
+
+export async function commitGit(rootId: string, message: string): Promise<GitActionPayload> {
+  const payload = await protectedJSON<any>(appURL("/api/git/commit"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ root: rootId, message }),
+  });
+  return normalizeGitActionPayload(payload);
+}
+
+export async function stageGitItem(rootId: string, item: Pick<GitStatusItem, "path">): Promise<GitActionPayload> {
+  const payload = await protectedJSON<any>(appURL("/api/git/stage"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ root: rootId, path: item.path }),
+  });
+  return normalizeGitActionPayload(payload);
+}
+
+export async function unstageGitItem(rootId: string, item: Pick<GitStatusItem, "path">): Promise<GitActionPayload> {
+  const payload = await protectedJSON<any>(appURL("/api/git/unstage"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ root: rootId, path: item.path }),
+  });
+  return normalizeGitActionPayload(payload);
+}
+
+export async function discardGitItem(rootId: string, item: Pick<GitStatusItem, "path" | "status">): Promise<GitActionPayload> {
+  const payload = await protectedJSON<any>(appURL("/api/git/discard"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ root: rootId, path: item.path, status: item.status }),
+  });
+  return normalizeGitActionPayload(payload);
 }
 
 export async function fetchGitWorktrees(rootId: string): Promise<GitWorktreesPayload> {
@@ -476,17 +549,25 @@ export function buildGitDiffCacheSignature(item?: Partial<GitStatusItem> | null)
 export async function fetchGitDiff(
   rootId: string,
   path: string,
-  options?: { cacheSignature?: string },
+  options?: { cacheSignature?: string; repoPath?: string },
 ): Promise<GitDiffPayload> {
   const cacheSignature = options?.cacheSignature || "";
-  const cached = await getCachedGitDiff(rootId, path, cacheSignature);
-  if (cached) {
-    return cached as GitDiffPayload;
+  const repoPath = String(options?.repoPath || "").trim();
+  if (!repoPath) {
+    const cached = await getCachedGitDiff(rootId, path, cacheSignature);
+    if (cached) {
+      return cached as GitDiffPayload;
+    }
   }
 
-  const payload = await protectedJSON<any>(appURL("/api/git/diff", new URLSearchParams({ root: rootId, path })));
+  const params = new URLSearchParams({ root: rootId, path });
+  if (repoPath) {
+    params.set("repo_path", repoPath);
+  }
+  const payload = await protectedJSON<any>(appURL("/api/git/diff", params));
   const diff = {
     path: typeof payload?.path === "string" ? payload.path : path,
+    display_path: typeof payload?.display_path === "string" ? payload.display_path : undefined,
     old_path: typeof payload?.old_path === "string" ? payload.old_path : undefined,
     status: typeof payload?.status === "string" ? payload.status : "M",
     additions: Number(payload?.additions) || 0,
@@ -495,7 +576,9 @@ export async function fetchGitDiff(
     file_meta: Array.isArray(payload?.file_meta) ? payload.file_meta : [],
     source: "worktree" as const,
   };
-  await setCachedGitDiff(rootId, path, diff, cacheSignature);
+  if (!repoPath) {
+    await setCachedGitDiff(rootId, path, diff, cacheSignature);
+  }
   return diff;
 }
 
@@ -523,8 +606,9 @@ export async function fetchGitCommitDiff(
     appURL("/api/git/commit/diff", new URLSearchParams({ root: rootId, commit, path })),
   ).then((payload) => {
     const diff = {
-      path: typeof payload?.path === "string" ? payload.path : path,
-      old_path: typeof payload?.old_path === "string" ? payload.old_path : item.old_path,
+    path: typeof payload?.path === "string" ? payload.path : path,
+    display_path: typeof payload?.display_path === "string" ? payload.display_path : undefined,
+    old_path: typeof payload?.old_path === "string" ? payload.old_path : item.old_path,
       status: typeof payload?.status === "string" ? payload.status : item.status,
       additions: Number(payload?.additions) || Number(item.additions) || 0,
       deletions: Number(payload?.deletions) || Number(item.deletions) || 0,
@@ -541,4 +625,36 @@ export async function fetchGitCommitDiff(
   });
   gitCommitDiffInflight.set(key, promise);
   return promise;
+}
+
+export async function fetchGitRelatedFileDiff(
+  rootId: string,
+  file: { path: string; head?: string; repo_path?: string; repo_kind?: string },
+): Promise<GitDiffPayload> {
+  const path = file.path;
+  const head = file.head || "";
+  const params = new URLSearchParams({ root: rootId, path });
+  if (head) {
+    params.set("head", head);
+  }
+  if (file.repo_path) {
+    params.set("repo_path", file.repo_path);
+  }
+  if (file.repo_kind) {
+    params.set("repo_kind", file.repo_kind);
+  }
+  const payload = await protectedJSON<any>(appURL("/api/git/related-file/diff", params));
+  return {
+    path: typeof payload?.path === "string" ? payload.path : path,
+    display_path: typeof payload?.display_path === "string" ? payload.display_path : undefined,
+    old_path: typeof payload?.old_path === "string" ? payload.old_path : undefined,
+    status: typeof payload?.status === "string" ? payload.status : "M",
+    additions: Number(payload?.additions) || 0,
+    deletions: Number(payload?.deletions) || 0,
+    content: typeof payload?.content === "string" ? payload.content : "",
+    file_meta: Array.isArray(payload?.file_meta) ? payload.file_meta : [],
+    base_head: typeof payload?.base_head === "string" ? payload.base_head : head,
+    target_head: typeof payload?.target_head === "string" ? payload.target_head : undefined,
+    source: payload?.source === "commit_range" ? "commit_range" : "worktree",
+  };
 }

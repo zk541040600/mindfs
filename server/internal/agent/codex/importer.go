@@ -45,6 +45,16 @@ type sessionFileCandidate struct {
 	UpdatedAt time.Time
 }
 
+type importedExchangeLocator struct {
+	agenttypes.ImportedExchange
+	CodexUserCountAfter int
+}
+
+type importedTurn struct {
+	Users []importedExchangeLocator
+	Agent importedExchangeLocator
+}
+
 func NewImporter(opts ImporterOptions) *Importer {
 	codexHome := strings.TrimSpace(os.Getenv("CODEX_HOME"))
 	if codexHome == "" {
@@ -137,6 +147,51 @@ func (i *Importer) ImportExternalSession(_ context.Context, in agenttypes.Import
 		}, nil
 	}
 	return agenttypes.ImportedExternalSession{}, errors.New("external session not found")
+}
+
+func (i *Importer) ResolveForkPointByAgentTurnIndex(ctx context.Context, in agenttypes.ResolveForkPointInput) (agenttypes.ResolveForkPointOutput, error) {
+	rootPath := normalizeComparablePath(in.RootPath)
+	if rootPath == "" {
+		return agenttypes.ResolveForkPointOutput{}, errors.New("root path required")
+	}
+	targetID := strings.TrimSpace(in.AgentSessionID)
+	if targetID == "" {
+		return agenttypes.ResolveForkPointOutput{}, errors.New("agent session id required")
+	}
+	if in.AgentTurnIndex <= 0 {
+		return agenttypes.ResolveForkPointOutput{}, errors.New("agent turn index required")
+	}
+	file, ok := i.lookupSessionFile(targetID, rootPath)
+	if !ok {
+		files, err := i.scanSessionFiles(ctx, time.Time{}, time.Time{}, int(^uint(0)>>1), nil)
+		if err != nil {
+			return agenttypes.ResolveForkPointOutput{}, err
+		}
+		for _, candidate := range files {
+			if candidate.AgentSessionID == targetID && normalizeComparablePath(candidate.Cwd) == rootPath {
+				file = candidate
+				ok = true
+				break
+			}
+		}
+	}
+	if !ok {
+		return agenttypes.ResolveForkPointOutput{}, errors.New("external session not found")
+	}
+	items, err := readCodexImportedExchangeLocators(file.Path, time.Time{})
+	if err != nil {
+		return agenttypes.ResolveForkPointOutput{}, err
+	}
+	turns := buildImportedTurns(items)
+	if in.AgentTurnIndex > len(turns) {
+		return agenttypes.ResolveForkPointOutput{}, errors.New("agent turn index out of range")
+	}
+	agent := turns[in.AgentTurnIndex-1].Agent
+	return agenttypes.ResolveForkPointOutput{
+		Kind:             agenttypes.ForkPointCodexUserOrdinal,
+		AgentSessionID:   targetID,
+		CodexUserOrdinal: agent.CodexUserCountAfter,
+	}, nil
 }
 
 func (i *Importer) scanSessionFiles(ctx context.Context, before, after time.Time, limit int, visit agenttypes.ExternalSessionVisitFunc) ([]codexSessionFile, error) {
@@ -355,6 +410,18 @@ func inspectCodexSessionFile(path string) (codexSessionFile, bool, error) {
 }
 
 func readCodexImportedExchanges(path string, after time.Time) ([]agenttypes.ImportedExchange, error) {
+	locators, err := readCodexImportedExchangeLocators(path, after)
+	if err != nil {
+		return nil, err
+	}
+	items := make([]agenttypes.ImportedExchange, 0, len(locators))
+	for _, item := range locators {
+		items = append(items, item.ImportedExchange)
+	}
+	return items, nil
+}
+
+func readCodexImportedExchangeLocators(path string, after time.Time) ([]importedExchangeLocator, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, apperr.Wrap("open", path, err)
@@ -372,9 +439,6 @@ func readCodexImportedExchanges(path string, after time.Time) ([]agenttypes.Impo
 			return nil
 		}
 		timestamp := parseTimeRFC3339(asString(raw["timestamp"]))
-		if !after.IsZero() && (timestamp.IsZero() || !timestamp.After(after)) {
-			return nil
-		}
 		switch raw["type"] {
 		case "response_item":
 			payload, _ := raw["payload"].(map[string]any)
@@ -395,13 +459,17 @@ func readCodexImportedExchanges(path string, after time.Time) ([]agenttypes.Impo
 				}
 				items = appendMergedExchange(items, "agent", text, timestamp)
 			}
+		case "event_msg":
+			if numTurns := codexRollbackTurns(raw); numTurns > 0 {
+				items = dropLastCodexUserTurns(items, numTurns)
+			}
 		}
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	return items, nil
+	return codexExchangeLocatorsAfter(items, after), nil
 }
 
 var errStopJSONL = errors.New("stop jsonl")
@@ -444,6 +512,103 @@ func appendMergedExchange(items []agenttypes.ImportedExchange, role, content str
 		Timestamp: ts,
 	})
 	return items
+}
+
+func appendMergedExchangeLocator(items []importedExchangeLocator, role, content string, ts time.Time, userCount int) []importedExchangeLocator {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return items
+	}
+	if len(items) > 0 && items[len(items)-1].Role == role {
+		last := &items[len(items)-1]
+		last.Content = strings.TrimSpace(last.Content + "\n\n" + content)
+		if !ts.IsZero() {
+			last.Timestamp = ts
+		}
+		last.CodexUserCountAfter = userCount
+		return items
+	}
+	items = append(items, importedExchangeLocator{
+		ImportedExchange: agenttypes.ImportedExchange{
+			Role:      role,
+			Content:   content,
+			Timestamp: ts,
+		},
+		CodexUserCountAfter: userCount,
+	})
+	return items
+}
+
+func codexRollbackTurns(raw map[string]any) int {
+	payload, _ := raw["payload"].(map[string]any)
+	if payload == nil || strings.TrimSpace(asString(payload["type"])) != "thread_rolled_back" {
+		return 0
+	}
+	switch value := payload["num_turns"].(type) {
+	case float64:
+		if value > 0 {
+			return int(value)
+		}
+	case int:
+		if value > 0 {
+			return value
+		}
+	}
+	return 0
+}
+
+func dropLastCodexUserTurns(items []agenttypes.ImportedExchange, numTurns int) []agenttypes.ImportedExchange {
+	if numTurns <= 0 || len(items) == 0 {
+		return items
+	}
+	out := items
+	for ; numTurns > 0 && len(out) > 0; numTurns-- {
+		userIndex := -1
+		for i := len(out) - 1; i >= 0; i-- {
+			if out[i].Role == "user" {
+				userIndex = i
+				break
+			}
+		}
+		if userIndex < 0 {
+			return nil
+		}
+		out = out[:userIndex]
+	}
+	return out
+}
+
+func codexExchangeLocatorsAfter(items []agenttypes.ImportedExchange, after time.Time) []importedExchangeLocator {
+	out := make([]importedExchangeLocator, 0, len(items))
+	userCount := 0
+	for _, item := range items {
+		if item.Role == "user" {
+			userCount++
+		}
+		if !after.IsZero() && (item.Timestamp.IsZero() || !item.Timestamp.After(after)) {
+			continue
+		}
+		out = appendMergedExchangeLocator(out, item.Role, item.Content, item.Timestamp, userCount)
+	}
+	return out
+}
+
+func buildImportedTurns(items []importedExchangeLocator) []importedTurn {
+	turns := make([]importedTurn, 0)
+	users := make([]importedExchangeLocator, 0)
+	for _, item := range items {
+		switch item.Role {
+		case "user":
+			users = append(users, item)
+		case "agent":
+			turns = append(turns, importedTurn{
+				Users: append([]importedExchangeLocator(nil), users...),
+				Agent: item,
+			})
+			users = nil
+		}
+	}
+	return turns
 }
 
 func extractCodexMessageText(raw any) string {

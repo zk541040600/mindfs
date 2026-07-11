@@ -33,8 +33,16 @@ Access your personal AI agents and workstation data anywhere, anytime through Mi
 - **Rich media input**: Attach files and images directly in your messages.
 - **Multi-device sync**: Access the same instance from multiple devices simultaneously with live session sync.
 - **Configuration backup and switching**: Agent configurations can be backed up and switched with one click, making it easier to move between multiple accounts or API keys.
-- **Subagents**: Codex subagents are automatically discovered and displayed.
+- **Subagents**: Codex/claudecode subagents are automatically discovered and displayed.
+- **session fork**: Session can forked from historical replies.
 - **Scheduled tasks**: Trigger agents to run tasks at specified times.
+- **Codex Remote Login**: Login to Codex remotely via the /login command.
+
+### Task Board
+- **Concurrent Execution**: Run multiple tasks in parallel, with each task isolated via its own worktree.
+- **Task Templates**: Customize task stages within templates. Each stage supports configuration of the agent, model, planning mode toggle, preset prompts, and more.
+- **Deep Linking**: Dynamic, interactive associations between tasks, worktrees, sessions, and files.
+- **Quick Creation**: Instantly spin up tasks from templates, with support for file uploads, images, and skill inputs.
 
 ### File Access
 
@@ -50,6 +58,8 @@ Access your personal AI agents and workstation data anywhere, anytime through Mi
 - **Bidirectional file–session linking**: Jump from a file to the session that created it, or from a session to all files it touched.
 - **Android, Browser app (PWA)**: Install to desktop or mobile home screen for a native-like experience — no app store required.
 - **Mobile-optimized UI**: Bottom action bar within thumb reach, independent panel swipe navigation, input box adapts to the soft keyboard.
+- **Notification Push**: Notifications are delivered via Web Push upon session status changes (iOS requires adding the page to the home screen).
+- **User Habit Adaptation**: Support swapping the left and right sidebars, and switching between single-project and multi-project session lists.
 
 ### Access Modes
 
@@ -71,6 +81,10 @@ Access your personal AI agents and workstation data anywhere, anytime through Mi
 - **Screen-width adaptation**: Command output adapts to the screen width for a friendlier result view.
 - **Selectable shell type**: Choose the shell used for command execution, so Windows users do not need to worry about shell type mismatches.
 - **Session persistence**: Each session gets a long-lived shell, making tmux-like command continuity easier.
+
+### Remote Access to Local Services
+- **One-Click Exposure**: In Relay mode, configure the address of your local service in MindFS to expose it to the public network with one click.
+- **Public Domain Name**: Access local services directly via a unique public domain name.
 
 ### Installation
 
@@ -262,6 +276,8 @@ mindfs -agent-config /path/to/agents.json
 | `-agent-config string` | empty | Load one extra `agents.json` file. |
 | `-no-relayer` | `false` | Disable relay integration. Local and private-network access still work. |
 | `-e2ee` | `false` | Enable end-to-end encryption for sensitive data. The pairing code can also be used as an authentication mechanism: unpaired frontends cannot access node content. LAN access requires `-tls` to work correctly. On first enablement, the CLI prints the pairing secret. |
+| `-web-push` | `true` | Enable PWA Web Push notifications. VAPID keys are generated automatically on first start. |
+| `-notify-script string` | empty | Executable script for notification events. MindFS passes the JSON payload on stdin. |
 | `-tls` | `false` | Enable HTTPS. If `-cert` and `-key` are not provided, MindFS generates and reuses a local self-signed certificate. |
 | `-cert string` | empty | TLS certificate file in PEM format. Used with `-tls`; auto-generated when empty. |
 | `-key string` | empty | TLS private key file in PEM format. Used with `-tls`; auto-generated when empty. |

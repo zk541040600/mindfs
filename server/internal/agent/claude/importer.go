@@ -43,6 +43,16 @@ type sessionFileCandidate struct {
 	UpdatedAt time.Time
 }
 
+type importedExchangeLocator struct {
+	agenttypes.ImportedExchange
+	ClaudeLastMessageUUID string
+}
+
+type importedTurn struct {
+	Users []importedExchangeLocator
+	Agent importedExchangeLocator
+}
+
 func NewImporter(opts ImporterOptions) *Importer {
 	home, _ := os.UserHomeDir()
 	return &Importer{
@@ -138,6 +148,54 @@ func (i *Importer) ImportExternalSession(_ context.Context, in agenttypes.Import
 	return agenttypes.ImportedExternalSession{}, errors.New("external session not found")
 }
 
+func (i *Importer) ResolveForkPointByAgentTurnIndex(ctx context.Context, in agenttypes.ResolveForkPointInput) (agenttypes.ResolveForkPointOutput, error) {
+	rootPath := normalizeComparablePath(in.RootPath)
+	if rootPath == "" {
+		return agenttypes.ResolveForkPointOutput{}, errors.New("root path required")
+	}
+	targetID := strings.TrimSpace(in.AgentSessionID)
+	if targetID == "" {
+		return agenttypes.ResolveForkPointOutput{}, errors.New("agent session id required")
+	}
+	if in.AgentTurnIndex <= 0 {
+		return agenttypes.ResolveForkPointOutput{}, errors.New("agent turn index required")
+	}
+	file, ok := i.lookupSessionFile(targetID, rootPath)
+	if !ok {
+		files, err := i.scanSessionFiles(ctx, rootPath, time.Time{}, time.Time{}, int(^uint(0)>>1), nil)
+		if err != nil {
+			return agenttypes.ResolveForkPointOutput{}, err
+		}
+		for _, candidate := range files {
+			if candidate.AgentSessionID == targetID {
+				file = candidate
+				ok = true
+				break
+			}
+		}
+	}
+	if !ok {
+		return agenttypes.ResolveForkPointOutput{}, errors.New("external session not found")
+	}
+	items, err := readClaudeImportedExchangeLocators(file.Path, time.Time{})
+	if err != nil {
+		return agenttypes.ResolveForkPointOutput{}, err
+	}
+	turns := buildImportedTurns(items)
+	if in.AgentTurnIndex > len(turns) {
+		return agenttypes.ResolveForkPointOutput{}, errors.New("agent turn index out of range")
+	}
+	agent := turns[in.AgentTurnIndex-1].Agent
+	if strings.TrimSpace(agent.ClaudeLastMessageUUID) == "" {
+		return agenttypes.ResolveForkPointOutput{}, errors.New("claude message uuid not found")
+	}
+	return agenttypes.ResolveForkPointOutput{
+		Kind:              agenttypes.ForkPointClaudeMessageUUID,
+		AgentSessionID:    targetID,
+		ClaudeMessageUUID: agent.ClaudeLastMessageUUID,
+	}, nil
+}
+
 func (i *Importer) scanSessionFiles(ctx context.Context, rootPath string, before, after time.Time, limit int, visit agenttypes.ExternalSessionVisitFunc) ([]claudeSessionFile, error) {
 	if strings.TrimSpace(i.baseDir) == "" {
 		return nil, nil
@@ -223,6 +281,9 @@ func sortedSessionJSONLFiles(baseDir string) ([]sessionFileCandidate, error) {
 		if d == nil || d.IsDir() || filepath.Ext(path) != ".jsonl" {
 			return nil
 		}
+		if isClaudeSubagentSessionFile(baseDir, path) {
+			return nil
+		}
 		info, err := d.Info()
 		if err != nil {
 			if apperr.IsPermission(err) {
@@ -246,6 +307,19 @@ func sortedSessionJSONLFiles(baseDir string) ([]sessionFileCandidate, error) {
 		return items[i].Path > items[j].Path
 	})
 	return items, nil
+}
+
+func isClaudeSubagentSessionFile(baseDir, path string) bool {
+	rel, err := filepath.Rel(baseDir, path)
+	if err != nil {
+		return false
+	}
+	for _, part := range strings.Split(rel, string(os.PathSeparator)) {
+		if part == "subagents" {
+			return true
+		}
+	}
+	return false
 }
 
 func (i *Importer) projectDir(rootPath string) string {
@@ -357,13 +431,25 @@ func inspectClaudeSessionFile(path string) (claudeSessionFile, bool, error) {
 }
 
 func readClaudeImportedExchanges(path string, after time.Time) ([]agenttypes.ImportedExchange, error) {
+	locators, err := readClaudeImportedExchangeLocators(path, after)
+	if err != nil {
+		return nil, err
+	}
+	items := make([]agenttypes.ImportedExchange, 0, len(locators))
+	for _, item := range locators {
+		items = append(items, item.ImportedExchange)
+	}
+	return items, nil
+}
+
+func readClaudeImportedExchangeLocators(path string, after time.Time) ([]importedExchangeLocator, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, apperr.Wrap("open", path, err)
 	}
 	defer file.Close()
 
-	items := make([]agenttypes.ImportedExchange, 0)
+	items := make([]importedExchangeLocator, 0)
 	err = forEachJSONLLine(file, func(line string) error {
 		line = strings.TrimSpace(line)
 		if line == "" {
@@ -377,6 +463,7 @@ func readClaudeImportedExchanges(path string, after time.Time) ([]agenttypes.Imp
 		if role != "user" && role != "assistant" {
 			return nil
 		}
+		uuid := strings.TrimSpace(asString(raw["uuid"]))
 		message, _ := raw["message"].(map[string]any)
 		if message == nil {
 			return nil
@@ -393,10 +480,10 @@ func readClaudeImportedExchanges(path string, after time.Time) ([]agenttypes.Imp
 			if !isMeaningfulClaudeUserText(text) {
 				return nil
 			}
-			items = appendMergedClaudeExchange(items, "user", text, ts)
+			items = appendMergedClaudeExchangeLocator(items, "user", text, ts, uuid)
 			return nil
 		}
-		items = appendMergedClaudeExchange(items, "agent", text, ts)
+		items = appendMergedClaudeExchangeLocator(items, "agent", text, ts, uuid)
 		return nil
 	})
 	if err != nil {
@@ -495,6 +582,51 @@ func appendMergedClaudeExchange(items []agenttypes.ImportedExchange, role, conte
 		Timestamp: ts,
 	})
 	return items
+}
+
+func appendMergedClaudeExchangeLocator(items []importedExchangeLocator, role, content string, ts time.Time, uuid string) []importedExchangeLocator {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return items
+	}
+	if len(items) > 0 && items[len(items)-1].Role == role {
+		last := &items[len(items)-1]
+		last.Content = strings.TrimSpace(last.Content + "\n\n" + content)
+		if !ts.IsZero() {
+			last.Timestamp = ts
+		}
+		if strings.TrimSpace(uuid) != "" {
+			last.ClaudeLastMessageUUID = strings.TrimSpace(uuid)
+		}
+		return items
+	}
+	items = append(items, importedExchangeLocator{
+		ImportedExchange: agenttypes.ImportedExchange{
+			Role:      role,
+			Content:   content,
+			Timestamp: ts,
+		},
+		ClaudeLastMessageUUID: strings.TrimSpace(uuid),
+	})
+	return items
+}
+
+func buildImportedTurns(items []importedExchangeLocator) []importedTurn {
+	turns := make([]importedTurn, 0)
+	users := make([]importedExchangeLocator, 0)
+	for _, item := range items {
+		switch item.Role {
+		case "user":
+			users = append(users, item)
+		case "agent":
+			turns = append(turns, importedTurn{
+				Users: append([]importedExchangeLocator(nil), users...),
+				Agent: item,
+			})
+			users = nil
+		}
+	}
+	return turns
 }
 
 func appendSortedClaudeSession(items []claudeSessionFile, item claudeSessionFile) []claudeSessionFile {

@@ -67,54 +67,134 @@ func TestSaveUploadedFilesDefaultsToAttachmentDirAndRenamesConflicts(t *testing.
 	assertFileContent(t, filepath.Join(rootDir, filepath.FromSlash(wantSecond)), "second file")
 }
 
-func TestSaveUploadedFilesRejectsParentDirectoryName(t *testing.T) {
+func TestGetGitRelatedFileDiffResolvesTaskWorktreePath(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found")
+	}
 	rootDir := t.TempDir()
+	runUsecaseGit(t, rootDir, "init")
+	runUsecaseGit(t, rootDir, "config", "user.email", "test@example.com")
+	runUsecaseGit(t, rootDir, "config", "user.name", "Test User")
+	mustWriteFile(t, filepath.Join(rootDir, "note.txt"), "base\n")
+	runUsecaseGit(t, rootDir, "add", "note.txt")
+	runUsecaseGit(t, rootDir, "commit", "-m", "initial")
+	runUsecaseGit(t, rootDir, "checkout", "-b", "task-1")
+	base := strings.TrimSpace(runUsecaseGit(t, rootDir, "rev-parse", "HEAD"))
+	runUsecaseGit(t, rootDir, "checkout", "-")
+
+	worktreeRoot := filepath.Join(rootDir, ".worktree", "task-1")
+	runUsecaseGit(t, rootDir, "worktree", "add", worktreeRoot, "task-1")
+	mustWriteFile(t, filepath.Join(rootDir, "note.txt"), "main-only\n")
+	mustWriteFile(t, filepath.Join(worktreeRoot, "note.txt"), "worktree-only\n")
+
 	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
 	service := Service{Registry: uploadTestRegistry{root: root}}
-
-	_, err := service.SaveUploadedFiles(context.Background(), SaveUploadedFilesInput{
-		RootID: "mindfs",
-		Files: []UploadFile{{
-			Name:   "..",
-			Reader: bytes.NewBufferString("escape"),
-		}},
+	out, err := service.GetGitRelatedFileDiff(context.Background(), GitRelatedFileDiffInput{
+		RootID:   root.ID,
+		RepoPath: rootDir,
+		RepoKind: "git",
+		Head:     base,
+		Path:     ".worktree/task-1/note.txt",
 	})
-	if err == nil || !strings.Contains(err.Error(), "file name required") {
-		t.Fatalf("SaveUploadedFiles error = %v, want file name required", err)
+	if err != nil {
+		t.Fatalf("GetGitRelatedFileDiff returned error: %v", err)
+	}
+	if !strings.Contains(out.Diff.Content, "+worktree-only") {
+		t.Fatalf("diff content does not contain worktree change:\n%s", out.Diff.Content)
+	}
+	if strings.Contains(out.Diff.Content, "main-only") {
+		t.Fatalf("diff content used main worktree instead of task worktree:\n%s", out.Diff.Content)
+	}
+
+	out, err = service.GetGitRelatedFileDiff(context.Background(), GitRelatedFileDiffInput{
+		RootID:   root.ID,
+		RepoKind: "git",
+		Head:     base,
+		Path:     ".worktree/task-1/note.txt",
+	})
+	if err != nil {
+		t.Fatalf("GetGitRelatedFileDiff without repo path returned error: %v", err)
+	}
+	if !strings.Contains(out.Diff.Content, "+worktree-only") {
+		t.Fatalf("diff without repo path does not contain worktree change:\n%s", out.Diff.Content)
+	}
+	if strings.Contains(out.Diff.Content, "main-only") {
+		t.Fatalf("diff without repo path used main worktree instead of task worktree:\n%s", out.Diff.Content)
 	}
 }
 
-func TestImportExternalSessionRejectsEmptyTranscriptWithoutCreatingSession(t *testing.T) {
+func TestNormalizeSessionRelatedFilesResolvesLegacyTaskWorktreePath(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found")
+	}
 	rootDir := t.TempDir()
-	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
-	manager := session.NewManager(root)
-	registry := &externalImportTestRegistry{
-		commandTestRegistry: &commandTestRegistry{root: root, manager: manager},
-		importer: &fakeExternalSessionImporter{imported: agenttypes.ImportedExternalSession{
-			Agent:          "codex",
-			AgentSessionID: "agent-session",
-			Exchanges: []agenttypes.ImportedExchange{
-				{Role: "system", Content: "hidden"},
-				{Role: "user", Content: "   "},
-			},
-		}},
-	}
-	service := Service{Registry: registry}
+	runUsecaseGit(t, rootDir, "init")
+	runUsecaseGit(t, rootDir, "config", "user.email", "test@example.com")
+	runUsecaseGit(t, rootDir, "config", "user.name", "Test User")
+	mustWriteFile(t, filepath.Join(rootDir, "note.txt"), "base\n")
+	runUsecaseGit(t, rootDir, "add", "note.txt")
+	runUsecaseGit(t, rootDir, "commit", "-m", "initial")
+	runUsecaseGit(t, rootDir, "checkout", "-b", "task-1")
+	runUsecaseGit(t, rootDir, "checkout", "-")
 
-	_, err := service.ImportExternalSession(context.Background(), ImportExternalSessionInput{
-		RootID:         root.ID,
-		Agent:          "codex",
-		AgentSessionID: "agent-session",
+	worktreeRoot := filepath.Join(rootDir, ".worktree", "task-1")
+	runUsecaseGit(t, rootDir, "worktree", "add", worktreeRoot, "task-1")
+	mustWriteFile(t, filepath.Join(worktreeRoot, "note.txt"), "worktree-only\n")
+
+	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
+	files := normalizeSessionRelatedFiles(context.Background(), root, []session.RelatedFile{{
+		RootID:   root.ID,
+		RepoPath: rootDir,
+		RepoName: root.Name,
+		RepoKind: "git",
+		Path:     ".worktree/task-1/note.txt",
+		Head:     strings.TrimSpace(runUsecaseGit(t, worktreeRoot, "rev-parse", "HEAD")),
+	}})
+	if len(files) != 1 {
+		t.Fatalf("files len = %d, want 1", len(files))
+	}
+	if !sameUsecaseTestPath(files[0].RepoPath, worktreeRoot) {
+		t.Fatalf("RepoPath = %q, want %q", files[0].RepoPath, worktreeRoot)
+	}
+	if files[0].Path != "note.txt" {
+		t.Fatalf("Path = %q, want note.txt", files[0].Path)
+	}
+}
+
+func TestGetGitDiffUsesRepoPath(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found")
+	}
+	rootDir := t.TempDir()
+	runUsecaseGit(t, rootDir, "init")
+	runUsecaseGit(t, rootDir, "config", "user.email", "test@example.com")
+	runUsecaseGit(t, rootDir, "config", "user.name", "Test User")
+	mustWriteFile(t, filepath.Join(rootDir, "note.txt"), "base\n")
+	runUsecaseGit(t, rootDir, "add", "note.txt")
+	runUsecaseGit(t, rootDir, "commit", "-m", "initial")
+	runUsecaseGit(t, rootDir, "checkout", "-b", "task-1")
+	runUsecaseGit(t, rootDir, "checkout", "-")
+
+	worktreeRoot := filepath.Join(rootDir, ".worktree", "task-1")
+	runUsecaseGit(t, rootDir, "worktree", "add", worktreeRoot, "task-1")
+	mustWriteFile(t, filepath.Join(rootDir, "note.txt"), "main-only\n")
+	mustWriteFile(t, filepath.Join(worktreeRoot, "note.txt"), "worktree-only\n")
+
+	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
+	service := Service{Registry: uploadTestRegistry{root: root}}
+	out, err := service.GetGitDiff(context.Background(), GitDiffInput{
+		RootID:   root.ID,
+		RepoPath: worktreeRoot,
+		Path:     "note.txt",
 	})
-	if err == nil || !strings.Contains(err.Error(), "no importable messages") {
-		t.Fatalf("ImportExternalSession error = %v, want no importable messages", err)
+	if err != nil {
+		t.Fatalf("GetGitDiff returned error: %v", err)
 	}
-	sessions, listErr := manager.List(context.Background(), session.ListOptions{})
-	if listErr != nil {
-		t.Fatalf("List sessions returned error: %v", listErr)
+	if !strings.Contains(out.Diff.Content, "+worktree-only") {
+		t.Fatalf("diff content does not contain worktree change:\n%s", out.Diff.Content)
 	}
-	if len(sessions) != 0 {
-		t.Fatalf("created %d sessions for empty transcript, want 0", len(sessions))
+	if strings.Contains(out.Diff.Content, "main-only") {
+		t.Fatalf("diff content used main worktree instead of task worktree:\n%s", out.Diff.Content)
 	}
 }
 
@@ -192,6 +272,84 @@ func TestSendCommandMessagePersistsFinalToolCallAndSuggestion(t *testing.T) {
 	}
 	if len(candidates) != 1 || candidates[0].Name != "printf mindfs-command" {
 		t.Fatalf("candidates = %#v", candidates)
+	}
+}
+
+func TestSearchSessionsMultiRootIncludesRootIDs(t *testing.T) {
+	ctx := context.Background()
+	rootA := rootfs.NewRootInfo("root-a", "Root A", t.TempDir())
+	rootB := rootfs.NewRootInfo("root-b", "Root B", t.TempDir())
+	managerA := session.NewManager(rootA)
+	managerB := session.NewManager(rootB)
+	registry := &multiRootSearchTestRegistry{
+		roots:    []rootfs.RootInfo{rootA, rootB},
+		managers: map[string]*session.Manager{rootA.ID: managerA, rootB.ID: managerB},
+	}
+	service := Service{Registry: registry}
+
+	if _, err := managerA.Create(ctx, session.CreateInput{Type: session.TypeChat, Name: "needle alpha"}); err != nil {
+		t.Fatalf("create root A session: %v", err)
+	}
+	rootBSession, err := managerB.Create(ctx, session.CreateInput{Type: session.TypeChat, Name: "beta"})
+	if err != nil {
+		t.Fatalf("create root B session: %v", err)
+	}
+	if err := managerB.AddExchangeForAgent(ctx, rootBSession, "user", "content has needle inside", "codex", "", "", ""); err != nil {
+		t.Fatalf("add root B exchange: %v", err)
+	}
+
+	out, err := service.SearchSessions(ctx, SearchSessionsInput{
+		Query:     "needle",
+		Limit:     20,
+		MultiRoot: true,
+	})
+	if err != nil {
+		t.Fatalf("SearchSessions returned error: %v", err)
+	}
+	if len(out.Items) != 2 {
+		t.Fatalf("items len = %d, want 2: %#v", len(out.Items), out.Items)
+	}
+	seen := map[string]bool{}
+	for _, item := range out.Items {
+		seen[item.RootID] = true
+	}
+	if !seen[rootA.ID] || !seen[rootB.ID] {
+		t.Fatalf("root ids = %#v, want %q and %q", seen, rootA.ID, rootB.ID)
+	}
+}
+
+func TestSearchSessionsMultiRootAppliesGlobalLimit(t *testing.T) {
+	ctx := context.Background()
+	rootA := rootfs.NewRootInfo("root-a", "Root A", t.TempDir())
+	rootB := rootfs.NewRootInfo("root-b", "Root B", t.TempDir())
+	managerA := session.NewManager(rootA)
+	managerB := session.NewManager(rootB)
+	registry := &multiRootSearchTestRegistry{
+		roots:    []rootfs.RootInfo{rootA, rootB},
+		managers: map[string]*session.Manager{rootA.ID: managerA, rootB.ID: managerB},
+	}
+	service := Service{Registry: registry}
+
+	if _, err := managerA.Create(ctx, session.CreateInput{Type: session.TypeChat, Name: "needle alpha"}); err != nil {
+		t.Fatalf("create root A session: %v", err)
+	}
+	if _, err := managerB.Create(ctx, session.CreateInput{Type: session.TypeChat, Name: "needle beta"}); err != nil {
+		t.Fatalf("create root B session: %v", err)
+	}
+
+	out, err := service.SearchSessions(ctx, SearchSessionsInput{
+		Query:     "needle",
+		Limit:     1,
+		MultiRoot: true,
+	})
+	if err != nil {
+		t.Fatalf("SearchSessions returned error: %v", err)
+	}
+	if len(out.Items) != 1 {
+		t.Fatalf("items len = %d, want 1: %#v", len(out.Items), out.Items)
+	}
+	if out.Items[0].RootID == "" {
+		t.Fatal("first item root id is empty")
 	}
 }
 
@@ -331,276 +489,353 @@ func TestSubSessionSyntheticDonePersistsPartialResponse(t *testing.T) {
 	}
 }
 
-func TestSendMessageSynthesizesFallbackWhenAgentReturnsOnlyToolEvents(t *testing.T) {
+func TestClaudeSubagentRouterCreatesChildSessionAndRoutesChunks(t *testing.T) {
 	ctx := context.Background()
 	rootDir := t.TempDir()
 	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
 	manager := session.NewManager(root)
-	created, err := manager.Create(ctx, session.CreateInput{Type: session.TypeChat, Agent: "pi", Name: "chat"})
+	parent, err := manager.Create(ctx, session.CreateInput{Type: session.TypeChat, Agent: "claude", Name: "parent"})
 	if err != nil {
-		t.Fatalf("create chat session: %v", err)
+		t.Fatalf("create parent: %v", err)
 	}
 
-	pool := agent.NewPool(agent.Config{Agents: []agent.Definition{{
-		Name:     "pi",
-		Command:  writeFakePiSDKNoTextForUsecase(t),
-		Protocol: agent.ProtocolPiSDK,
-	}}})
-	defer pool.CloseAll()
-	service := Service{Registry: &chatAgentTestRegistry{
-		commandTestRegistry: &commandTestRegistry{root: root, manager: manager},
-		pool:                pool,
-	}}
-
-	var chunks []string
+	var created *session.Session
 	var sawDone bool
-	if err := service.SendMessage(ctx, SendMessageInput{
+	router := newClaudeSubagentRouter(subagentSessionInput{
 		RootID:  root.ID,
-		Key:     created.Key,
-		Agent:   "pi",
-		Content: "run a tool",
-		OnUpdate: func(event agenttypes.Event) {
-			switch event.Type {
-			case agenttypes.EventTypeMessageChunk:
-				if chunk, ok := event.Data.(agenttypes.MessageChunk); ok {
-					chunks = append(chunks, chunk.Content)
-				}
-			case agenttypes.EventTypeMessageDone:
+		Parent:  parent,
+		Agent:   "claude",
+		Model:   "sonnet",
+		Mode:    "default",
+		Effort:  "medium",
+		Manager: manager,
+		OnCreated: func(child *session.Session) {
+			created = child
+		},
+		OnUpdate: func(sessionKey string, update agenttypes.Event) {
+			if created != nil && sessionKey == created.Key && update.Type == agenttypes.EventTypeMessageDone {
 				sawDone = true
 			}
 		},
-	}); err != nil {
-		t.Fatalf("SendMessage returned error: %v", err)
+	})
+
+	parentTask := agenttypes.ToolCall{
+		CallID:  "tool-1",
+		Title:   "Review changes",
+		Status:  "running",
+		Kind:    agenttypes.ToolKindTask,
+		RawType: "claude_task",
+		Meta: map[string]any{
+			"parentToolUseId": "tool-1",
+			"taskId":          "task-1",
+			"taskDescription": "Review changes",
+		},
+	}
+	if consumed := router.Handle(ctx, agenttypes.Event{Type: agenttypes.EventTypeToolCall, Data: parentTask}); consumed {
+		t.Fatalf("parent task lifecycle should not be consumed")
+	}
+	if created != nil {
+		t.Fatalf("parent task lifecycle should not create child")
+	}
+
+	if consumed := router.Handle(ctx, agenttypes.Event{
+		Type: agenttypes.EventTypeMessageChunk,
+		Data: agenttypes.MessageChunk{
+			Content:         "child response",
+			ParentToolUseID: "tool-1",
+			TaskID:          "task-1",
+		},
+	}); !consumed {
+		t.Fatalf("subagent chunk was not consumed")
+	}
+	if created == nil {
+		t.Fatalf("child session was not created")
+	}
+	if created.ParentSessionKey != parent.Key || created.ParentToolCallID != "tool-1" {
+		t.Fatalf("created child parent fields = %#v", created)
+	}
+	if consumed := router.Handle(ctx, agenttypes.Event{
+		Type: agenttypes.EventTypeMessageDone,
+		Data: agenttypes.MessageDone{ParentToolUseID: "tool-1", TaskID: "task-1"},
+	}); !consumed {
+		t.Fatalf("subagent done was not consumed")
+	}
+
+	loaded, err := manager.Get(ctx, created.Key, 0)
+	if err != nil {
+		t.Fatalf("get child: %v", err)
+	}
+	if len(loaded.Exchanges) != 1 || loaded.Exchanges[0].Content != "child response" {
+		t.Fatalf("child exchanges = %#v", loaded.Exchanges)
 	}
 	if !sawDone {
-		t.Fatalf("message_done was not emitted")
-	}
-	fallback := strings.Join(chunks, "")
-	if !strings.Contains(fallback, "已完成工具调用") || !strings.Contains(fallback, "没有返回可见文本") {
-		t.Fatalf("fallback chunk = %q", fallback)
-	}
-
-	loaded, err := manager.Get(ctx, created.Key, 0)
-	if err != nil {
-		t.Fatalf("get session: %v", err)
-	}
-	if len(loaded.Exchanges) != 2 {
-		t.Fatalf("exchanges = %d, want user and agent", len(loaded.Exchanges))
-	}
-	if loaded.Exchanges[1].Content != fallback {
-		t.Fatalf("persisted agent content = %q, want fallback %q", loaded.Exchanges[1].Content, fallback)
-	}
-	aux, err := manager.GetExchangeAux(ctx, created.Key, 0)
-	if err != nil {
-		t.Fatalf("get aux: %v", err)
-	}
-	if len(aux[2]) == 0 || aux[2][0].ToolCall == nil || aux[2][0].ToolCall.Status != "complete" {
-		t.Fatalf("aux[2] = %#v, want completed tool call", aux[2])
+		t.Fatalf("sub session done update was not emitted")
 	}
 }
 
-func TestStaleAgentSessionErrorDetection(t *testing.T) {
-	cases := []struct {
-		name string
-		err  error
-		want bool
-	}{
-		{name: "unknown session id", err: errors.New("Invalid params: Unknown sessionId: 019ea739"), want: true},
-		{name: "session not found", err: errors.New("session not found"), want: true},
-		{name: "agent already processing", err: errors.New("Agent is already processing"), want: false},
-		{name: "invalid unrelated params", err: errors.New("Invalid params: model required"), want: false},
-		{name: "ordinary upstream failure", err: errors.New("rate limit exceeded"), want: false},
-		{name: "nil", err: nil, want: false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := isStaleAgentSessionError(tc.err); got != tc.want {
-				t.Fatalf("isStaleAgentSessionError(%v) = %v, want %v", tc.err, got, tc.want)
-			}
-		})
-	}
-}
-
-func TestAgentAlreadyProcessingErrorDetection(t *testing.T) {
-	cases := []struct {
-		name string
-		err  error
-		want bool
-	}{
-		{name: "plain", err: errors.New("Agent is already processing"), want: true},
-		{name: "compact", err: errors.New("agentisalreadyprocessing"), want: true},
-		{name: "with newline", err: errors.New("Agent is\nalready processing"), want: true},
-		{name: "unknown session", err: errors.New("Unknown sessionId"), want: false},
-		{name: "nil", err: nil, want: false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := isAgentAlreadyProcessingError(tc.err); got != tc.want {
-				t.Fatalf("isAgentAlreadyProcessingError(%v) = %v, want %v", tc.err, got, tc.want)
-			}
-		})
-	}
-}
-
-func TestBuildPromptReadsHistoryWhenAgentContextReset(t *testing.T) {
+func TestClaudeSubagentRouterDoesNotCreateChildFromTaskIDOnly(t *testing.T) {
 	ctx := context.Background()
 	rootDir := t.TempDir()
 	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
 	manager := session.NewManager(root)
-	created, err := manager.Create(ctx, session.CreateInput{Type: session.TypeChat, Agent: "pi", Name: "chat"})
+	parent, err := manager.Create(ctx, session.CreateInput{Type: session.TypeChat, Agent: "claude", Name: "parent"})
 	if err != nil {
-		t.Fatalf("create session: %v", err)
-	}
-	if err := manager.AddExchangeForAgent(ctx, created, "user", "first", "pi", "", "", ""); err != nil {
-		t.Fatalf("add user: %v", err)
-	}
-	if err := manager.AddExchangeForAgent(ctx, created, "agent", "second", "pi", "", "", ""); err != nil {
-		t.Fatalf("add agent: %v", err)
-	}
-	loaded, err := manager.Get(ctx, created.Key, 0)
-	if err != nil {
-		t.Fatalf("get session: %v", err)
+		t.Fatalf("create parent: %v", err)
 	}
 
-	zero := 0
-	prompt := (&Service{}).BuildPrompt(BuildPromptInput{
-		Session:     loaded,
-		Manager:     manager,
-		Agent:       "pi",
-		Message:     "continue",
-		AgentCtxSeq: &zero,
+	var createdCount int
+	router := newClaudeSubagentRouter(subagentSessionInput{
+		RootID:  root.ID,
+		Parent:  parent,
+		Agent:   "claude",
+		Manager: manager,
+		OnCreated: func(*session.Session) {
+			createdCount++
+		},
 	})
-	if !strings.Contains(prompt, "This session was migrated from elsewhere") {
-		t.Fatalf("prompt = %q, want switch read hint", prompt)
+
+	taskOnly := agenttypes.ToolCall{
+		CallID:  "task-opaque-id",
+		Title:   "Task progress",
+		Status:  "running",
+		Kind:    agenttypes.ToolKindTask,
+		RawType: "claude_task",
+		Meta: map[string]any{
+			"taskId": "task-opaque-id",
+		},
 	}
-	if !strings.Contains(prompt, ".mindfs/sessions/"+created.Key+".jsonl") {
-		t.Fatalf("prompt = %q, want exchange log path", prompt)
+	if consumed := router.Handle(ctx, agenttypes.Event{Type: agenttypes.EventTypeToolUpdate, Data: taskOnly}); consumed {
+		t.Fatalf("task lifecycle should stay on parent")
 	}
-	if !strings.HasSuffix(prompt, "continue") {
-		t.Fatalf("prompt = %q, want original message suffix", prompt)
+	if createdCount != 0 {
+		t.Fatalf("createdCount = %d, want 0", createdCount)
+	}
+
+	if consumed := router.Handle(ctx, agenttypes.Event{
+		Type: agenttypes.EventTypeMessageChunk,
+		Data: agenttypes.MessageChunk{Content: "orphan task text", TaskID: "task-opaque-id"},
+	}); consumed {
+		t.Fatalf("task-id-only chunk should not create child")
+	}
+	if createdCount != 0 {
+		t.Fatalf("createdCount after task chunk = %d, want 0", createdCount)
+	}
+
+	if consumed := router.Handle(ctx, agenttypes.Event{
+		Type: agenttypes.EventTypeMessageChunk,
+		Data: agenttypes.MessageChunk{
+			Content:         "subagent text",
+			ParentToolUseID: "call_e365874817b34ca79e665ee9",
+			TaskID:          "task-opaque-id",
+		},
+	}); !consumed {
+		t.Fatalf("parent-tool-use chunk should create child")
+	}
+	if createdCount != 1 {
+		t.Fatalf("createdCount after parent chunk = %d, want 1", createdCount)
 	}
 }
 
-func TestEnsureAgentSessionResetsPiContextOnRuntimeOpen(t *testing.T) {
-	ctx := context.Background()
-	rootDir := t.TempDir()
-	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
-	manager := session.NewManager(root)
-	created, err := manager.Create(ctx, session.CreateInput{Type: session.TypeChat, Agent: "pi", Name: "chat"})
-	if err != nil {
-		t.Fatalf("create session: %v", err)
-	}
-	for _, item := range []struct {
-		role    string
-		content string
-	}{
-		{"user", "first"},
-		{"agent", "second"},
-		{"user", "third"},
-		{"agent", "fourth"},
-	} {
-		if err := manager.AddExchangeForAgent(ctx, created, item.role, item.content, "pi", "", "", ""); err != nil {
-			t.Fatalf("add %s exchange: %v", item.role, err)
-		}
-	}
-	if err := manager.UpsertAgentBinding(ctx, session.AgentBinding{
-		SessionKey:     created.Key,
-		Agent:          "pi",
-		AgentSessionID: "previous-pi-runtime",
-		AgentCtxSeq:    4,
-	}); err != nil {
-		t.Fatalf("upsert binding: %v", err)
-	}
-	loaded, err := manager.Get(ctx, created.Key, 0)
-	if err != nil {
-		t.Fatalf("get session: %v", err)
-	}
-	pool := agent.NewPool(agent.Config{Agents: []agent.Definition{{
-		Name:     "pi",
-		Protocol: agent.ProtocolPiRPC,
-		Command:  writeFakePiRPCForUsecase(t),
-	}}})
-	defer pool.CloseAll()
-
-	_, agentCtxSeq, err := (&Service{}).ensureAgentSession(ctx, pool, manager, loaded, "pi", "", "", "", "", rootDir)
-	if err != nil {
-		t.Fatalf("ensureAgentSession: %v", err)
-	}
-	if agentCtxSeq == nil {
-		t.Fatal("agentCtxSeq is nil, want reset marker")
-	}
-	if *agentCtxSeq != 0 {
-		t.Fatalf("agentCtxSeq = %d, want 0 for stateless pi runtime", *agentCtxSeq)
+func TestDedupeExchangeAuxBufferMergesDuplicateToolCalls(t *testing.T) {
+	items := []session.ExchangeAux{
+		{
+			Seq:  1,
+			Line: 0,
+			ToolCall: &agenttypes.ToolCall{
+				CallID:  "call-1",
+				Title:   "Print hi",
+				Status:  "running",
+				Kind:    agenttypes.ToolKindTask,
+				RawType: "tool_use",
+				Content: []agenttypes.ToolCallContentItem{{Type: "text", Text: "prompt body"}},
+				Meta:    map[string]any{"prompt": "prompt body"},
+			},
+		},
+		{
+			Seq:  1,
+			Line: 0,
+			ToolCall: &agenttypes.ToolCall{
+				CallID:  "call-1",
+				Status:  "running",
+				Kind:    agenttypes.ToolKindTask,
+				RawType: "claude_task",
+				Meta:    map[string]any{"lastToolName": "Bash"},
+			},
+		},
 	}
 
-	prompt := (&Service{}).BuildPrompt(BuildPromptInput{
-		Session:     loaded,
-		Manager:     manager,
-		Agent:       "pi",
-		Message:     "continue",
-		AgentCtxSeq: agentCtxSeq,
-	})
-	if !strings.Contains(prompt, "read the last 4 lines") {
-		t.Fatalf("prompt = %q, want full history read hint", prompt)
+	got := dedupeExchangeAuxBuffer(items)
+	if len(got) != 1 || got[0].ToolCall == nil {
+		t.Fatalf("deduped items = %#v, want one toolcall", got)
+	}
+	toolCall := got[0].ToolCall
+	if toolCall.Title != "Print hi" || toolCall.RawType != "claude_task" {
+		t.Fatalf("toolCall latest fields = %#v", toolCall)
+	}
+	if len(toolCall.Content) != 1 || toolCall.Content[0].Text != "prompt body" {
+		t.Fatalf("toolCall content = %#v, want original prompt body", toolCall.Content)
+	}
+	if toolCall.Meta["prompt"] != "prompt body" || toolCall.Meta["lastToolName"] != "Bash" {
+		t.Fatalf("toolCall meta = %#v", toolCall.Meta)
 	}
 }
 
-func TestUsesStatelessRuntimeContextOnlyForPiRPC(t *testing.T) {
-	piPool := agent.NewPool(agent.Config{Agents: []agent.Definition{{
-		Name:     "pi",
-		Protocol: agent.ProtocolPiRPC,
-	}}})
-	defer piPool.CloseAll()
-	if !usesStatelessRuntimeContext(piPool, "pi") {
-		t.Fatal("pi-rpc should be treated as stateless runtime context")
+func TestDedupeExchangeAuxBufferMergesTaskCreateAndUpdateByCallID(t *testing.T) {
+	items := []session.ExchangeAux{
+		{
+			Seq:  1,
+			Line: 0,
+			ToolCall: &agenttypes.ToolCall{
+				CallID: "claude-task-list:7",
+				Title:  "检查 git 状态",
+				Status: "running",
+				Kind:   agenttypes.ToolKindTask,
+				Meta: map[string]any{
+					"toolUseId": "call-create-1",
+					"taskId":    "7",
+					"taskTool":  "TaskCreate",
+				},
+			},
+		},
+		{
+			Seq:  1,
+			Line: 0,
+			ToolCall: &agenttypes.ToolCall{
+				CallID: "claude-task-list:7",
+				Status: "complete",
+				Kind:   agenttypes.ToolKindTask,
+				Meta: map[string]any{
+					"toolUseId":   "call-update-1",
+					"taskId":      "7",
+					"taskStatus":  "complete",
+					"taskTool":    "TaskUpdate",
+					"updatedOnly": true,
+				},
+			},
+		},
 	}
 
-	codexPool := agent.NewPool(agent.Config{Agents: []agent.Definition{{
-		Name:     "codex",
-		Protocol: agent.ProtocolCodexSDK,
-	}}})
-	defer codexPool.CloseAll()
-	if usesStatelessRuntimeContext(codexPool, "codex") {
-		t.Fatal("codex-sdk should keep durable runtime context")
+	got := dedupeExchangeAuxBuffer(items)
+	if len(got) != 1 || got[0].ToolCall == nil {
+		t.Fatalf("deduped items = %#v, want one toolcall", got)
 	}
-
-	claudePool := agent.NewPool(agent.Config{Agents: []agent.Definition{{
-		Name:     "claude",
-		Protocol: agent.ProtocolClaudeSDK,
-	}}})
-	defer claudePool.CloseAll()
-	if usesStatelessRuntimeContext(claudePool, "claude") {
-		t.Fatal("claude-sdk should keep durable runtime context")
+	if got[0].ToolCall.CallID != "claude-task-list:7" {
+		t.Fatalf("callID = %q, want real task call id", got[0].ToolCall.CallID)
+	}
+	if got[0].ToolCall.Title != "检查 git 状态" {
+		t.Fatalf("title = %q, want original create title", got[0].ToolCall.Title)
+	}
+	if got[0].ToolCall.Status != "complete" {
+		t.Fatalf("status = %q, want latest task status", got[0].ToolCall.Status)
+	}
+	if got[0].ToolCall.Meta["taskId"] != "7" || got[0].ToolCall.Meta["taskTool"] != "TaskCreate" || got[0].ToolCall.Meta["updatedOnly"] != true {
+		t.Fatalf("meta = %#v, want merged task metadata", got[0].ToolCall.Meta)
 	}
 }
 
-func TestAgentContextSeqOverrideAfterOpenResetsWhenResumeCreatesNewSession(t *testing.T) {
-	binding := &session.AgentBinding{
-		AgentSessionID: "pi-synthetic-session",
-		AgentCtxSeq:    6,
+func TestDedupeExchangeAuxBufferKeepsLatestTodoState(t *testing.T) {
+	items := []session.ExchangeAux{
+		{
+			Seq:  1,
+			Line: 0,
+			ToolCall: &agenttypes.ToolCall{
+				CallID: "todo-call-1",
+				Title:  "todos",
+				Status: "running",
+				Kind:   agenttypes.ToolKindTodo,
+				Content: []agenttypes.ToolCallContentItem{{
+					Type: "text",
+					Text: "- [ ] first",
+				}},
+			},
+		},
+		{
+			Seq:  1,
+			Line: 0,
+			ToolCall: &agenttypes.ToolCall{
+				CallID: "todo-call-2",
+				Title:  "todos",
+				Status: "running",
+				Kind:   agenttypes.ToolKindTodo,
+				Content: []agenttypes.ToolCallContentItem{{
+					Type: "text",
+					Text: "- [x] first\n- [ ] second",
+				}},
+			},
+		},
+		{
+			Seq:  1,
+			Line: 0,
+			Todo: &agenttypes.TodoUpdate{
+				Items: []agenttypes.TodoItem{{Content: "codex final", Status: "completed"}},
+			},
+		},
 	}
 
-	got := agentContextSeqOverrideAfterOpen(false, binding, "pi-synthetic-session", "019eb637-77d1-7567-ab40-4e22386a40c1")
-	if got == nil {
-		t.Fatal("agentCtxSeq override is nil, want reset marker")
+	got := dedupeExchangeAuxBuffer(items)
+	if len(got) != 1 || got[0].Todo == nil {
+		t.Fatalf("deduped items = %#v, want latest codex todo", got)
 	}
-	if *got != 0 {
-		t.Fatalf("agentCtxSeq override = %d, want reset marker when SDK opened a new session", *got)
+	if got[0].Todo.Items[0].Content != "codex final" {
+		t.Fatalf("todo = %#v, want latest state", got[0].Todo)
 	}
 }
 
-func TestAgentContextSeqOverrideAfterOpenKeepsSeqWhenResumeSucceeds(t *testing.T) {
-	binding := &session.AgentBinding{
-		AgentSessionID: "019eb637-77d1-7567-ab40-4e22386a40c1",
-		AgentCtxSeq:    6,
+func TestDedupeExchangeAuxBufferMergesDuplicateTodoToolCallBeforeKeepingLatest(t *testing.T) {
+	items := []session.ExchangeAux{
+		{
+			Seq:  1,
+			Line: 0,
+			ToolCall: &agenttypes.ToolCall{
+				CallID: "todo-call-1",
+				Title:  "todos",
+				Status: "running",
+				Kind:   agenttypes.ToolKindTodo,
+				Content: []agenttypes.ToolCallContentItem{{
+					Type: "text",
+					Text: "- [ ] first",
+				}},
+			},
+		},
+		{
+			Seq:  1,
+			Line: 0,
+			ToolCall: &agenttypes.ToolCall{
+				CallID: "todo-call-1",
+				Status: "complete",
+				Kind:   agenttypes.ToolKindTodo,
+			},
+		},
 	}
 
-	got := agentContextSeqOverrideAfterOpen(false, binding, binding.AgentSessionID, binding.AgentSessionID)
-	if got == nil {
-		t.Fatal("agentCtxSeq override is nil, want existing seq")
+	got := dedupeExchangeAuxBuffer(items)
+	if len(got) != 1 || got[0].ToolCall == nil {
+		t.Fatalf("deduped items = %#v, want one todo toolcall", got)
 	}
-	if *got != 6 {
-		t.Fatalf("agentCtxSeq override = %d, want existing seq when SDK resumed the same session", *got)
+	if got[0].ToolCall.Status != "complete" {
+		t.Fatalf("status = %q, want complete", got[0].ToolCall.Status)
+	}
+	if len(got[0].ToolCall.Content) != 1 || got[0].ToolCall.Content[0].Text != "- [ ] first" {
+		t.Fatalf("content = %#v, want merged original content", got[0].ToolCall.Content)
+	}
+}
+
+func TestShouldPersistToolCallAuxSkipsClaudeTaskProgress(t *testing.T) {
+	if shouldPersistToolCallAux(agenttypes.ToolCall{
+		CallID:  "call-1",
+		Kind:    agenttypes.ToolKindTask,
+		RawType: "claude_task",
+		Meta:    map[string]any{"subtype": "task_progress"},
+	}) {
+		t.Fatalf("claude task progress should not persist")
+	}
+	if !shouldPersistToolCallAux(agenttypes.ToolCall{
+		CallID:  "call-1",
+		Kind:    agenttypes.ToolKindTask,
+		RawType: "claude_task",
+		Meta:    map[string]any{"subtype": "task_started"},
+	}) {
+		t.Fatalf("claude task start should persist")
 	}
 }
 
@@ -701,6 +936,38 @@ func TestSearchCommandCandidatesMergesMindFSAndShellHistory(t *testing.T) {
 	}
 	if candidates[0].Name != "git status" || candidates[1].Name != "git stash" {
 		t.Fatalf("candidates = %#v", candidates)
+	}
+}
+
+func TestSearchCommandCandidatesCleansMindFSControlHistory(t *testing.T) {
+	rootDir := t.TempDir()
+	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
+	manager := session.NewManager(root)
+	historyFile := filepath.Join(rootDir, "zsh_history")
+	history := strings.Join([]string{
+		": 1710000000:0;command printf '\\n%s\\n' '__MINDFS_CMD_START_abc__'",
+		": 1710000001:0;eval 'git status' </dev/null",
+		": 1710000002:0;__mindfs_status=$?",
+		": 1710000003:0;command printf '\\n%s%s\\n' '__MINDFS_CMD_END_abc__:' \"$__mindfs_status\"",
+		": 1710000004:0;eval 'printf '\\''x y'\\''' </dev/null",
+		": 1710000005:0;git stash",
+	}, "\n") + "\n"
+	if err := os.WriteFile(historyFile, []byte(history), 0o644); err != nil {
+		t.Fatalf("write zsh history: %v", err)
+	}
+	t.Setenv("HISTFILE", historyFile)
+
+	candidates, err := SearchCommandCandidates(context.Background(), manager, root.ID, "", 10, ShellHistorySpec{Command: "zsh"})
+	if err != nil {
+		t.Fatalf("SearchCommandCandidates: %v", err)
+	}
+	names := make([]string, 0, len(candidates))
+	for _, item := range candidates {
+		names = append(names, item.Name)
+	}
+	want := []string{"git stash", "printf 'x y'", "git status"}
+	if strings.Join(names, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("candidate names = %#v, want %#v", names, want)
 	}
 }
 
@@ -859,6 +1126,32 @@ func TestSkillCandidateProviderSearch(t *testing.T) {
 	}
 	if got := descriptionByName["trellis-start"]; got != "Start Trellis" {
 		t.Fatalf("unexpected trellis-start description: %q", got)
+	}
+}
+
+func TestSkillCandidateProviderSearchIncludesCodexPluginCacheSkills(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	rootDir := t.TempDir()
+	mustWriteFile(t, filepath.Join(homeDir, ".codex", "plugins", "cache", "openai-primary-runtime", "documents", "26.1.0", "skills", "documents", "SKILL.md"), "---\nname: documents\ndescription: Old documents skill\n---\n")
+	mustWriteFile(t, filepath.Join(homeDir, ".codex", "plugins", "cache", "openai-primary-runtime", "documents", "26.10.0", "skills", "documents", "SKILL.md"), "---\nname: documents\ndescription: Current documents skill\n---\n")
+	mustWriteFile(t, filepath.Join(homeDir, ".codex", "plugins", "cache", "openai-curated-remote", "product-design", "0.1.47", "skills", "audit", "SKILL.md"), "---\nname: audit\ndescription: Audit product flows\n---\n")
+	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
+
+	provider := NewSkillCandidateProvider()
+	items, err := provider.Search(context.Background(), root, "codex", "")
+	if err != nil {
+		t.Fatalf("Search returned error: %v", err)
+	}
+	descriptionByName := make(map[string]string, len(items))
+	for _, item := range items {
+		descriptionByName[item.Name] = item.Description
+	}
+	if got := descriptionByName["documents"]; got != "Current documents skill" {
+		t.Fatalf("documents description = %q, want Current documents skill; items=%#v", got, items)
+	}
+	if got := descriptionByName["audit"]; got != "Audit product flows" {
+		t.Fatalf("audit description = %q, want Audit product flows; items=%#v", got, items)
 	}
 }
 
@@ -1029,6 +1322,19 @@ func TestCommandCandidatesFromStatus(t *testing.T) {
 	}
 }
 
+func TestCodexSlashCandidatesIncludeTransientCommands(t *testing.T) {
+	provider := NewSlashCommandCandidateProvider(func(agentName string) (agent.Status, bool) {
+		return agent.Status{Name: agentName}, true
+	})
+	items, err := provider.Search(context.Background(), rootfs.RootInfo{}, "codex", "lo")
+	if err != nil {
+		t.Fatalf("Search returned error: %v", err)
+	}
+	if len(items) != 1 || items[0].Name != "login" {
+		t.Fatalf("items = %#v, want login", items)
+	}
+}
+
 func TestMergeCandidateItemsPreferSlash(t *testing.T) {
 	items := mergeCandidateItemsPreferSlash([]CandidateItem{
 		{Type: CandidateTypeSlashCommand, Name: "review", Description: "Slash review"},
@@ -1081,37 +1387,6 @@ func TestPromptStoreAppendMovesExistingToLatestAndLimits(t *testing.T) {
 	}
 }
 
-func TestPromptStoreSaveUsesAtomicFileReplacement(t *testing.T) {
-	dir := t.TempDir()
-	store := &PromptStore{filePath: filepath.Join(dir, "prompts.json")}
-
-	if _, err := store.Append("remember this"); err != nil {
-		t.Fatalf("Append returned error: %v", err)
-	}
-	info, err := os.Stat(store.filePath)
-	if err != nil {
-		t.Fatalf("Stat prompts returned error: %v", err)
-	}
-	if got := info.Mode().Perm(); got != 0o644 {
-		t.Fatalf("prompts mode = %v, want 0644", got)
-	}
-	temps, err := filepath.Glob(filepath.Join(dir, "prompts.json.tmp-*"))
-	if err != nil {
-		t.Fatalf("Glob temp files returned error: %v", err)
-	}
-	if len(temps) != 0 {
-		t.Fatalf("prompt temp files left behind: %#v", temps)
-	}
-
-	items, err := store.Load()
-	if err != nil {
-		t.Fatalf("Load returned error: %v", err)
-	}
-	if len(items) != 1 || items[0] != "remember this" {
-		t.Fatalf("prompts = %#v, want saved prompt", items)
-	}
-}
-
 func TestPromptCandidateProviderSearchReturnsNewestFirst(t *testing.T) {
 	store := &PromptStore{filePath: filepath.Join(t.TempDir(), "prompts.json")}
 	for _, item := range []string{"first prompt", "second prompt", "another"} {
@@ -1132,6 +1407,47 @@ func TestPromptCandidateProviderSearchReturnsNewestFirst(t *testing.T) {
 	}
 	if items[1].Name != "first prompt" {
 		t.Fatalf("expected older prompt second, got %#v", items[1])
+	}
+}
+
+func TestSwitchReadHintPathUsesRuntimeRoot(t *testing.T) {
+	rootDir := t.TempDir()
+	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
+	manager := session.NewManager(root)
+	created, err := manager.Create(context.Background(), session.CreateInput{
+		Type: session.TypeChat,
+		Name: "Task",
+	})
+	if err != nil {
+		t.Fatalf("Create session: %v", err)
+	}
+
+	basePath := switchReadHintPath(manager, created.Key, rootDir)
+	if !strings.HasPrefix(basePath, ".mindfs/") {
+		t.Fatalf("base path = %q, want .mindfs relative path", basePath)
+	}
+
+	worktreeRoot := filepath.Join(rootDir, ".worktree", "task-1")
+	worktreePath := switchReadHintPath(manager, created.Key, worktreeRoot)
+	if !strings.HasPrefix(worktreePath, "../../.mindfs/") {
+		t.Fatalf("worktree path = %q, want path relative to worktree cwd", worktreePath)
+	}
+}
+
+func TestRelatedFileRecordPathUsesRuntimeRoot(t *testing.T) {
+	rootDir := filepath.Clean("/project/mindfs")
+	worktreeRoot := filepath.Join(rootDir, ".worktree", "task-55")
+
+	got := relatedFileRecordPath(rootDir, worktreeRoot, "test.json")
+	want := filepath.Join(worktreeRoot, "test.json")
+	if got != want {
+		t.Fatalf("relatedFileRecordPath relative = %q, want %q", got, want)
+	}
+
+	got = relatedFileRecordPath(rootDir, worktreeRoot, ".worktree/task-55/test.json")
+	want = filepath.Join(rootDir, ".worktree", "task-55", "test.json")
+	if got != want {
+		t.Fatalf("relatedFileRecordPath worktree rel = %q, want %q", got, want)
 	}
 }
 
@@ -1413,86 +1729,27 @@ func mustWriteFile(t *testing.T, path string, content string) {
 	}
 }
 
-func writeFakePiRPCForUsecase(t *testing.T) string {
+func runUsecaseGit(t *testing.T, root string, args ...string) string {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "fake-pi")
-	script := `#!/usr/bin/env python3
-import json
-import sys
-
-def send(obj):
-    print(json.dumps(obj, ensure_ascii=False), flush=True)
-
-for line in sys.stdin:
-    req = json.loads(line)
-    req_id = req.get("id")
-    if req.get("type") == "get_state":
-        send({
-            "id": req_id,
-            "type": "response",
-            "command": "get_state",
-            "success": True,
-            "data": {
-                "sessionId": "fresh-pi-runtime",
-                "thinkingLevel": "off",
-                "model": {"provider": "fake", "id": "model"},
-            },
-        })
-    else:
-        send({"id": req_id, "type": "response", "command": req.get("type"), "success": True, "data": {}})
-`
-	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
-		t.Fatalf("write fake pi rpc: %v", err)
+	cmd := exec.Command("git", args...)
+	cmd.Dir = root
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s returned error: %v\n%s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
 	}
-	return path
+	return string(out)
 }
 
-func writeFakePiSDKNoTextForUsecase(t *testing.T) string {
-	t.Helper()
-	path := filepath.Join(t.TempDir(), "fake-node")
-	script := `#!/usr/bin/env python3
-import json
-import sys
-
-def send(obj):
-    print(json.dumps(obj, ensure_ascii=False), flush=True)
-
-for line in sys.stdin:
-    req = json.loads(line)
-    req_id = req.get("id")
-    typ = req.get("type")
-    if typ == "start_sdk_runtime":
-        send({
-            "id": req_id,
-            "type": "response",
-            "command": "start_sdk_runtime",
-            "success": True,
-            "data": {"sessionId": "fake-pi-sdk-session"},
-        })
-    elif typ == "prompt":
-        send({"id": req_id, "type": "response", "command": "prompt", "success": True, "data": {"runtime": "sdk"}})
-        send({"type": "agent_start"})
-        send({
-            "type": "tool_execution_start",
-            "toolCallId": "tool-1",
-            "toolName": "fffind",
-            "args": {"pattern": "AGENTS.md"},
-        })
-        send({
-            "type": "tool_execution_end",
-            "toolCallId": "tool-1",
-            "toolName": "fffind",
-            "result": {"content": [{"type": "text", "text": "AGENTS.md"}]},
-            "isError": False,
-        })
-        send({"type": "agent_end", "willRetry": False})
-    else:
-        send({"id": req_id, "type": "response", "command": typ, "success": True, "data": {}})
-`
-	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
-		t.Fatalf("write fake pi sdk: %v", err)
+func sameUsecaseTestPath(left, right string) bool {
+	left = filepath.Clean(left)
+	right = filepath.Clean(right)
+	if resolved, err := filepath.EvalSymlinks(left); err == nil {
+		left = filepath.Clean(resolved)
 	}
-	return path
+	if resolved, err := filepath.EvalSymlinks(right); err == nil {
+		right = filepath.Clean(resolved)
+	}
+	return left == right
 }
 
 func selectRunnableAgent(cfg agent.Config) (string, bool) {
@@ -1591,10 +1848,6 @@ func (s *fakeUsecaseAgentSession) AnswerQuestion(context.Context, agenttypes.Ask
 	return nil
 }
 
-func (s *fakeUsecaseAgentSession) AnswerExtensionUI(context.Context, agenttypes.ExtensionUIResponse) error {
-	return nil
-}
-
 func (s *fakeUsecaseAgentSession) CurrentModel() string { return "" }
 
 func (s *fakeUsecaseAgentSession) SetModel(context.Context, string) error { return nil }
@@ -1641,44 +1894,35 @@ func (s *fakeUsecaseAgentSession) emit(event agenttypes.Event) {
 	}
 }
 
-type externalImportTestRegistry struct {
-	*commandTestRegistry
-	importer agenttypes.ExternalSessionImporter
-}
+func TestCancelSessionTurnCancelsTransientActiveTurn(t *testing.T) {
+	rootDir := t.TempDir()
+	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
+	manager := session.NewManager(root)
+	service := Service{Registry: &commandTestRegistry{root: root, manager: manager}}
+	sessionKey := "transient-login-test"
+	turnCtx, cancel := context.WithCancel(context.Background())
+	fakeSession := &fakeUsecaseAgentSession{}
+	registerActiveTurn(root.ID, sessionKey, "", cancel)
+	setActiveTurnSession(root.ID, sessionKey, fakeSession)
+	defer unregisterActiveTurn(root.ID, sessionKey)
 
-func (r *externalImportTestRegistry) GetExternalSessionImporter(string) (agenttypes.ExternalSessionImporter, error) {
-	if r.importer == nil {
-		return nil, errors.New("not implemented")
+	if err := service.CancelSessionTurn(context.Background(), CancelSessionTurnInput{
+		RootID: root.ID,
+		Key:    sessionKey,
+	}); err != nil {
+		t.Fatalf("CancelSessionTurn returned error: %v", err)
 	}
-	return r.importer, nil
-}
-
-type fakeExternalSessionImporter struct {
-	imported agenttypes.ImportedExternalSession
-}
-
-func (i *fakeExternalSessionImporter) AgentName() string { return strings.TrimSpace(i.imported.Agent) }
-
-func (i *fakeExternalSessionImporter) ListExternalSessions(context.Context, agenttypes.ListExternalSessionsInput) (agenttypes.ListExternalSessionsResult, error) {
-	return agenttypes.ListExternalSessionsResult{}, nil
-}
-
-func (i *fakeExternalSessionImporter) ImportExternalSession(context.Context, agenttypes.ImportExternalSessionInput) (agenttypes.ImportedExternalSession, error) {
-	return i.imported, nil
+	if turnCtx.Err() == nil {
+		t.Fatal("expected transient turn context to be canceled")
+	}
+	if fakeSession.cancelCalls != 1 {
+		t.Fatalf("CancelCurrentTurn calls = %d, want 1", fakeSession.cancelCalls)
+	}
 }
 
 type commandTestRegistry struct {
 	root    rootfs.RootInfo
 	manager *session.Manager
-}
-
-type chatAgentTestRegistry struct {
-	*commandTestRegistry
-	pool *agent.Pool
-}
-
-func (r *chatAgentTestRegistry) GetAgentPool() *agent.Pool {
-	return r.pool
 }
 
 func (r *commandTestRegistry) GetRoot(rootID string) (rootfs.RootInfo, error) {
@@ -1733,6 +1977,70 @@ func (r *commandTestRegistry) GetFileWatcher(string, *session.Manager) (*rootfs.
 }
 
 func (r *commandTestRegistry) ReleaseFileWatcher(string, string) {}
+
+type multiRootSearchTestRegistry struct {
+	roots    []rootfs.RootInfo
+	managers map[string]*session.Manager
+}
+
+func (r *multiRootSearchTestRegistry) GetRoot(rootID string) (rootfs.RootInfo, error) {
+	for _, root := range r.roots {
+		if root.ID == rootID {
+			return root, nil
+		}
+	}
+	return rootfs.RootInfo{}, errors.New("root not found")
+}
+
+func (r *multiRootSearchTestRegistry) GetSessionManager(rootID string) (*session.Manager, error) {
+	manager := r.managers[rootID]
+	if manager == nil {
+		return nil, errors.New("session manager not found")
+	}
+	return manager, nil
+}
+
+func (r *multiRootSearchTestRegistry) UpsertRoot(string) (rootfs.RootInfo, error) {
+	return rootfs.RootInfo{}, nil
+}
+
+func (r *multiRootSearchTestRegistry) RemoveRoot(string) (rootfs.RootInfo, error) {
+	return rootfs.RootInfo{}, nil
+}
+
+func (r *multiRootSearchTestRegistry) RenameRoot(string, string, string) (rootfs.RootInfo, error) {
+	return rootfs.RootInfo{}, nil
+}
+
+func (r *multiRootSearchTestRegistry) ListRoots() []rootfs.RootInfo {
+	return append([]rootfs.RootInfo(nil), r.roots...)
+}
+
+func (r *multiRootSearchTestRegistry) GetAgentPool() *agent.Pool {
+	return nil
+}
+
+func (r *multiRootSearchTestRegistry) GetPreferences() *preferences.Store {
+	return nil
+}
+
+func (r *multiRootSearchTestRegistry) GetExternalSessionImporter(string) (agenttypes.ExternalSessionImporter, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (r *multiRootSearchTestRegistry) GetProber() *agent.Prober {
+	return nil
+}
+
+func (r *multiRootSearchTestRegistry) GetCandidateRegistry() *CandidateRegistry {
+	return nil
+}
+
+func (r *multiRootSearchTestRegistry) GetFileWatcher(string, *session.Manager) (*rootfs.SharedFileWatcher, error) {
+	return nil, nil
+}
+
+func (r *multiRootSearchTestRegistry) ReleaseFileWatcher(string, string) {}
 
 type renameManagedDirTestRegistry struct {
 	root                       rootfs.RootInfo
@@ -1808,3 +2116,480 @@ func (*renameManagedDirTestRegistry) GetFileWatcher(string, *session.Manager) (*
 }
 
 func (*renameManagedDirTestRegistry) ReleaseFileWatcher(string, string) {}
+
+// Local fork regression coverage retained while merging upstream.
+func TestSaveUploadedFilesRejectsParentDirectoryName(t *testing.T) {
+	rootDir := t.TempDir()
+	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
+	service := Service{Registry: uploadTestRegistry{root: root}}
+
+	_, err := service.SaveUploadedFiles(context.Background(), SaveUploadedFilesInput{
+		RootID: "mindfs",
+		Files: []UploadFile{{
+			Name:   "..",
+			Reader: bytes.NewBufferString("escape"),
+		}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "file name required") {
+		t.Fatalf("SaveUploadedFiles error = %v, want file name required", err)
+	}
+}
+
+func TestImportExternalSessionRejectsEmptyTranscriptWithoutCreatingSession(t *testing.T) {
+	rootDir := t.TempDir()
+	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
+	manager := session.NewManager(root)
+	registry := &externalImportTestRegistry{
+		commandTestRegistry: &commandTestRegistry{root: root, manager: manager},
+		importer: &fakeExternalSessionImporter{imported: agenttypes.ImportedExternalSession{
+			Agent:          "codex",
+			AgentSessionID: "agent-session",
+			Exchanges: []agenttypes.ImportedExchange{
+				{Role: "system", Content: "hidden"},
+				{Role: "user", Content: "   "},
+			},
+		}},
+	}
+	service := Service{Registry: registry}
+
+	_, err := service.ImportExternalSession(context.Background(), ImportExternalSessionInput{
+		RootID:         root.ID,
+		Agent:          "codex",
+		AgentSessionID: "agent-session",
+	})
+	if err == nil || !strings.Contains(err.Error(), "no importable messages") {
+		t.Fatalf("ImportExternalSession error = %v, want no importable messages", err)
+	}
+	sessions, listErr := manager.List(context.Background(), session.ListOptions{})
+	if listErr != nil {
+		t.Fatalf("List sessions returned error: %v", listErr)
+	}
+	if len(sessions) != 0 {
+		t.Fatalf("created %d sessions for empty transcript, want 0", len(sessions))
+	}
+}
+
+func TestSendMessageSynthesizesFallbackWhenAgentReturnsOnlyToolEvents(t *testing.T) {
+	ctx := context.Background()
+	rootDir := t.TempDir()
+	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
+	manager := session.NewManager(root)
+	created, err := manager.Create(ctx, session.CreateInput{Type: session.TypeChat, Agent: "pi", Name: "chat"})
+	if err != nil {
+		t.Fatalf("create chat session: %v", err)
+	}
+
+	pool := agent.NewPool(agent.Config{Agents: []agent.Definition{{
+		Name:     "pi",
+		Command:  writeFakePiSDKNoTextForUsecase(t),
+		Protocol: agent.ProtocolPiSDK,
+	}}})
+	defer pool.CloseAll()
+	service := Service{Registry: &chatAgentTestRegistry{
+		commandTestRegistry: &commandTestRegistry{root: root, manager: manager},
+		pool:                pool,
+	}}
+
+	var chunks []string
+	var sawDone bool
+	if err := service.SendMessage(ctx, SendMessageInput{
+		RootID:  root.ID,
+		Key:     created.Key,
+		Agent:   "pi",
+		Content: "run a tool",
+		OnUpdate: func(event agenttypes.Event) {
+			switch event.Type {
+			case agenttypes.EventTypeMessageChunk:
+				if chunk, ok := event.Data.(agenttypes.MessageChunk); ok {
+					chunks = append(chunks, chunk.Content)
+				}
+			case agenttypes.EventTypeMessageDone:
+				sawDone = true
+			}
+		},
+	}); err != nil {
+		t.Fatalf("SendMessage returned error: %v", err)
+	}
+	if !sawDone {
+		t.Fatalf("message_done was not emitted")
+	}
+	fallback := strings.Join(chunks, "")
+	if !strings.Contains(fallback, "已完成工具调用") || !strings.Contains(fallback, "没有返回可见文本") {
+		t.Fatalf("fallback chunk = %q", fallback)
+	}
+
+	loaded, err := manager.Get(ctx, created.Key, 0)
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	if len(loaded.Exchanges) != 2 {
+		t.Fatalf("exchanges = %d, want user and agent", len(loaded.Exchanges))
+	}
+	if loaded.Exchanges[1].Content != fallback {
+		t.Fatalf("persisted agent content = %q, want fallback %q", loaded.Exchanges[1].Content, fallback)
+	}
+	aux, err := manager.GetExchangeAux(ctx, created.Key, 0)
+	if err != nil {
+		t.Fatalf("get aux: %v", err)
+	}
+	if len(aux[2]) == 0 || aux[2][0].ToolCall == nil || aux[2][0].ToolCall.Status != "complete" {
+		t.Fatalf("aux[2] = %#v, want completed tool call", aux[2])
+	}
+}
+
+func TestStaleAgentSessionErrorDetection(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "unknown session id", err: errors.New("Invalid params: Unknown sessionId: 019ea739"), want: true},
+		{name: "session not found", err: errors.New("session not found"), want: true},
+		{name: "agent already processing", err: errors.New("Agent is already processing"), want: false},
+		{name: "invalid unrelated params", err: errors.New("Invalid params: model required"), want: false},
+		{name: "ordinary upstream failure", err: errors.New("rate limit exceeded"), want: false},
+		{name: "nil", err: nil, want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isStaleAgentSessionError(tc.err); got != tc.want {
+				t.Fatalf("isStaleAgentSessionError(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestAgentAlreadyProcessingErrorDetection(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "plain", err: errors.New("Agent is already processing"), want: true},
+		{name: "compact", err: errors.New("agentisalreadyprocessing"), want: true},
+		{name: "with newline", err: errors.New("Agent is\nalready processing"), want: true},
+		{name: "unknown session", err: errors.New("Unknown sessionId"), want: false},
+		{name: "nil", err: nil, want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isAgentAlreadyProcessingError(tc.err); got != tc.want {
+				t.Fatalf("isAgentAlreadyProcessingError(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestBuildPromptReadsHistoryWhenAgentContextReset(t *testing.T) {
+	ctx := context.Background()
+	rootDir := t.TempDir()
+	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
+	manager := session.NewManager(root)
+	created, err := manager.Create(ctx, session.CreateInput{Type: session.TypeChat, Agent: "pi", Name: "chat"})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if err := manager.AddExchangeForAgent(ctx, created, "user", "first", "pi", "", "", ""); err != nil {
+		t.Fatalf("add user: %v", err)
+	}
+	if err := manager.AddExchangeForAgent(ctx, created, "agent", "second", "pi", "", "", ""); err != nil {
+		t.Fatalf("add agent: %v", err)
+	}
+	loaded, err := manager.Get(ctx, created.Key, 0)
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+
+	zero := 0
+	prompt := (&Service{}).BuildPrompt(BuildPromptInput{
+		Session:     loaded,
+		Manager:     manager,
+		Agent:       "pi",
+		Message:     "continue",
+		AgentCtxSeq: &zero,
+	})
+	if !strings.Contains(prompt, "This session was migrated from elsewhere") {
+		t.Fatalf("prompt = %q, want switch read hint", prompt)
+	}
+	if !strings.Contains(prompt, ".mindfs/sessions/"+created.Key+".jsonl") {
+		t.Fatalf("prompt = %q, want exchange log path", prompt)
+	}
+	if !strings.HasSuffix(prompt, "continue") {
+		t.Fatalf("prompt = %q, want original message suffix", prompt)
+	}
+}
+
+func TestEnsureAgentSessionResetsPiContextOnRuntimeOpen(t *testing.T) {
+	ctx := context.Background()
+	rootDir := t.TempDir()
+	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
+	manager := session.NewManager(root)
+	created, err := manager.Create(ctx, session.CreateInput{Type: session.TypeChat, Agent: "pi", Name: "chat"})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	for _, item := range []struct {
+		role    string
+		content string
+	}{
+		{"user", "first"},
+		{"agent", "second"},
+		{"user", "third"},
+		{"agent", "fourth"},
+	} {
+		if err := manager.AddExchangeForAgent(ctx, created, item.role, item.content, "pi", "", "", ""); err != nil {
+			t.Fatalf("add %s exchange: %v", item.role, err)
+		}
+	}
+	if err := manager.UpsertAgentBinding(ctx, session.AgentBinding{
+		SessionKey:     created.Key,
+		Agent:          "pi",
+		AgentSessionID: "previous-pi-runtime",
+		AgentCtxSeq:    4,
+	}); err != nil {
+		t.Fatalf("upsert binding: %v", err)
+	}
+	loaded, err := manager.Get(ctx, created.Key, 0)
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	pool := agent.NewPool(agent.Config{Agents: []agent.Definition{{
+		Name:     "pi",
+		Protocol: agent.ProtocolPiRPC,
+		Command:  writeFakePiRPCForUsecase(t),
+	}}})
+	defer pool.CloseAll()
+
+	_, agentCtxSeq, err := (&Service{}).ensureAgentSession(ctx, pool, manager, loaded, "pi", "", "", "", "", rootDir)
+	if err != nil {
+		t.Fatalf("ensureAgentSession: %v", err)
+	}
+	if agentCtxSeq == nil {
+		t.Fatal("agentCtxSeq is nil, want reset marker")
+	}
+	if *agentCtxSeq != 0 {
+		t.Fatalf("agentCtxSeq = %d, want 0 for stateless pi runtime", *agentCtxSeq)
+	}
+
+	prompt := (&Service{}).BuildPrompt(BuildPromptInput{
+		Session:     loaded,
+		Manager:     manager,
+		Agent:       "pi",
+		Message:     "continue",
+		AgentCtxSeq: agentCtxSeq,
+	})
+	if !strings.Contains(prompt, "read the last 4 lines") {
+		t.Fatalf("prompt = %q, want full history read hint", prompt)
+	}
+}
+
+func TestUsesStatelessRuntimeContextOnlyForPiRPC(t *testing.T) {
+	piPool := agent.NewPool(agent.Config{Agents: []agent.Definition{{
+		Name:     "pi",
+		Protocol: agent.ProtocolPiRPC,
+	}}})
+	defer piPool.CloseAll()
+	if !usesStatelessRuntimeContext(piPool, "pi") {
+		t.Fatal("pi-rpc should be treated as stateless runtime context")
+	}
+
+	codexPool := agent.NewPool(agent.Config{Agents: []agent.Definition{{
+		Name:     "codex",
+		Protocol: agent.ProtocolCodexSDK,
+	}}})
+	defer codexPool.CloseAll()
+	if usesStatelessRuntimeContext(codexPool, "codex") {
+		t.Fatal("codex-sdk should keep durable runtime context")
+	}
+
+	claudePool := agent.NewPool(agent.Config{Agents: []agent.Definition{{
+		Name:     "claude",
+		Protocol: agent.ProtocolClaudeSDK,
+	}}})
+	defer claudePool.CloseAll()
+	if usesStatelessRuntimeContext(claudePool, "claude") {
+		t.Fatal("claude-sdk should keep durable runtime context")
+	}
+}
+
+func TestAgentContextSeqOverrideAfterOpenResetsWhenResumeCreatesNewSession(t *testing.T) {
+	binding := &session.AgentBinding{
+		AgentSessionID: "pi-synthetic-session",
+		AgentCtxSeq:    6,
+	}
+
+	got := agentContextSeqOverrideAfterOpen(false, binding, "pi-synthetic-session", "019eb637-77d1-7567-ab40-4e22386a40c1")
+	if got == nil {
+		t.Fatal("agentCtxSeq override is nil, want reset marker")
+	}
+	if *got != 0 {
+		t.Fatalf("agentCtxSeq override = %d, want reset marker when SDK opened a new session", *got)
+	}
+}
+
+func TestAgentContextSeqOverrideAfterOpenKeepsSeqWhenResumeSucceeds(t *testing.T) {
+	binding := &session.AgentBinding{
+		AgentSessionID: "019eb637-77d1-7567-ab40-4e22386a40c1",
+		AgentCtxSeq:    6,
+	}
+
+	got := agentContextSeqOverrideAfterOpen(false, binding, binding.AgentSessionID, binding.AgentSessionID)
+	if got == nil {
+		t.Fatal("agentCtxSeq override is nil, want existing seq")
+	}
+	if *got != 6 {
+		t.Fatalf("agentCtxSeq override = %d, want existing seq when SDK resumed the same session", *got)
+	}
+}
+
+func TestPromptStoreSaveUsesAtomicFileReplacement(t *testing.T) {
+	dir := t.TempDir()
+	store := &PromptStore{filePath: filepath.Join(dir, "prompts.json")}
+
+	if _, err := store.Append("remember this"); err != nil {
+		t.Fatalf("Append returned error: %v", err)
+	}
+	info, err := os.Stat(store.filePath)
+	if err != nil {
+		t.Fatalf("Stat prompts returned error: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o644 {
+		t.Fatalf("prompts mode = %v, want 0644", got)
+	}
+	temps, err := filepath.Glob(filepath.Join(dir, "prompts.json.tmp-*"))
+	if err != nil {
+		t.Fatalf("Glob temp files returned error: %v", err)
+	}
+	if len(temps) != 0 {
+		t.Fatalf("prompt temp files left behind: %#v", temps)
+	}
+
+	items, err := store.Load()
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if len(items) != 1 || items[0] != "remember this" {
+		t.Fatalf("prompts = %#v, want saved prompt", items)
+	}
+}
+
+func writeFakePiRPCForUsecase(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "fake-pi")
+	script := `#!/usr/bin/env python3
+import json
+import sys
+
+def send(obj):
+    print(json.dumps(obj, ensure_ascii=False), flush=True)
+
+for line in sys.stdin:
+    req = json.loads(line)
+    req_id = req.get("id")
+    if req.get("type") == "get_state":
+        send({
+            "id": req_id,
+            "type": "response",
+            "command": "get_state",
+            "success": True,
+            "data": {
+                "sessionId": "fresh-pi-runtime",
+                "thinkingLevel": "off",
+                "model": {"provider": "fake", "id": "model"},
+            },
+        })
+    else:
+        send({"id": req_id, "type": "response", "command": req.get("type"), "success": True, "data": {}})
+`
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake pi rpc: %v", err)
+	}
+	return path
+}
+
+func writeFakePiSDKNoTextForUsecase(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "fake-node")
+	script := `#!/usr/bin/env python3
+import json
+import sys
+
+def send(obj):
+    print(json.dumps(obj, ensure_ascii=False), flush=True)
+
+for line in sys.stdin:
+    req = json.loads(line)
+    req_id = req.get("id")
+    typ = req.get("type")
+    if typ == "start_sdk_runtime":
+        send({
+            "id": req_id,
+            "type": "response",
+            "command": "start_sdk_runtime",
+            "success": True,
+            "data": {"sessionId": "fake-pi-sdk-session"},
+        })
+    elif typ == "prompt":
+        send({"id": req_id, "type": "response", "command": "prompt", "success": True, "data": {"runtime": "sdk"}})
+        send({"type": "agent_start"})
+        send({
+            "type": "tool_execution_start",
+            "toolCallId": "tool-1",
+            "toolName": "fffind",
+            "args": {"pattern": "AGENTS.md"},
+        })
+        send({
+            "type": "tool_execution_end",
+            "toolCallId": "tool-1",
+            "toolName": "fffind",
+            "result": {"content": [{"type": "text", "text": "AGENTS.md"}]},
+            "isError": False,
+        })
+        send({"type": "agent_end", "willRetry": False})
+    else:
+        send({"id": req_id, "type": "response", "command": typ, "success": True, "data": {}})
+`
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake pi sdk: %v", err)
+	}
+	return path
+}
+
+func (s *fakeUsecaseAgentSession) AnswerExtensionUI(context.Context, agenttypes.ExtensionUIResponse) error {
+	return nil
+}
+
+type externalImportTestRegistry struct {
+	*commandTestRegistry
+	importer agenttypes.ExternalSessionImporter
+}
+
+func (r *externalImportTestRegistry) GetExternalSessionImporter(string) (agenttypes.ExternalSessionImporter, error) {
+	if r.importer == nil {
+		return nil, errors.New("not implemented")
+	}
+	return r.importer, nil
+}
+
+type fakeExternalSessionImporter struct {
+	imported agenttypes.ImportedExternalSession
+}
+
+func (i *fakeExternalSessionImporter) AgentName() string { return strings.TrimSpace(i.imported.Agent) }
+
+func (i *fakeExternalSessionImporter) ListExternalSessions(context.Context, agenttypes.ListExternalSessionsInput) (agenttypes.ListExternalSessionsResult, error) {
+	return agenttypes.ListExternalSessionsResult{}, nil
+}
+
+func (i *fakeExternalSessionImporter) ImportExternalSession(context.Context, agenttypes.ImportExternalSessionInput) (agenttypes.ImportedExternalSession, error) {
+	return i.imported, nil
+}
+
+type chatAgentTestRegistry struct {
+	*commandTestRegistry
+	pool *agent.Pool
+}
+
+func (r *chatAgentTestRegistry) GetAgentPool() *agent.Pool {
+	return r.pool
+}

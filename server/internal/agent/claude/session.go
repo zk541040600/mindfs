@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -25,6 +26,13 @@ const (
 	deltaTypeThinking deltaType = "thinking"
 )
 
+type subagentMeta struct {
+	ParentToolUseID string
+	TaskID          string
+	SubagentType    string
+	TaskDescription string
+}
+
 type OpenOptions struct {
 	AgentName       string
 	SessionKey      string
@@ -36,6 +44,8 @@ type OpenOptions struct {
 	Args            []string
 	Env             map[string]string
 	ResumeSessionID string
+	ForkSessionID   string
+	ResumeMessageID string
 }
 
 type Runtime struct{}
@@ -62,19 +72,41 @@ func (r *Runtime) OpenSession(ctx context.Context, opts OpenOptions) (types.Sess
 		claudeagent.WithEnv(opts.Env),
 		claudeagent.WithVerbose(true),
 		claudeagent.WithIncludePartialMessages(true),
+		claudeagent.WithAgentProgressSummaries(true),
+		claudeagent.WithForwardSubagentText(true),
 		claudeagent.WithCanUseTool(s.handleCanUseTool),
 	}
 	if strings.TrimSpace(opts.Command) != "" {
 		optionList = append(optionList, claudeagent.WithCLIPath(opts.Command))
 	}
-	if strings.TrimSpace(opts.ResumeSessionID) != "" {
+	forkSessionID := strings.TrimSpace(opts.ForkSessionID)
+	resumeMessageID := strings.TrimSpace(opts.ResumeMessageID)
+	explicitSessionID := ""
+	if forkSessionID != "" && resumeMessageID != "" {
+		forked, err := claudeagent.ForkSession(forkSessionID, &claudeagent.ForkSessionOptions{
+			UpToMessageID: resumeMessageID,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("fork claude session at message: %w", err)
+		}
+		if forked == nil || strings.TrimSpace(forked.SessionID) == "" {
+			return nil, errors.New("fork claude session did not return session id")
+		}
+		explicitSessionID = strings.TrimSpace(forked.SessionID)
+		optionList = append(optionList, claudeagent.WithResume(explicitSessionID))
+	} else if forkSessionID != "" {
+		optionList = append(optionList, claudeagent.WithForkSession(forkSessionID))
+	} else if strings.TrimSpace(opts.ResumeSessionID) != "" {
 		optionList = append(optionList, claudeagent.WithResume(strings.TrimSpace(opts.ResumeSessionID)))
+	}
+	if resumeMessageID != "" && forkSessionID == "" {
+		optionList = append(optionList, claudeagent.WithResumeSessionAt(resumeMessageID))
 	}
 	if strings.TrimSpace(opts.Model) != "" {
 		optionList = append(optionList, claudeagent.WithModel(strings.TrimSpace(opts.Model)))
 	}
 	if strings.TrimSpace(opts.Effort) != "" {
-		optionList = append(optionList, claudeagent.WithEffort(claudeagent.Effort(strings.TrimSpace(opts.Effort))))
+		optionList = append(optionList, claudeagent.WithEffort(claudeagent.EffortLevel(strings.TrimSpace(opts.Effort))))
 	}
 	if opts.PlanMode {
 		optionList = append(optionList, claudeagent.WithPermissionMode(claudeagent.PermissionModePlan))
@@ -112,6 +144,9 @@ func (r *Runtime) OpenSession(ctx context.Context, opts OpenOptions) (types.Sess
 	s.client = client
 	s.stream = stream
 	s.sessionID = stream.SessionID()
+	if strings.TrimSpace(s.sessionID) == "" {
+		s.sessionID = explicitSessionID
+	}
 	s.model = selectedModel
 	go s.consumeMessages()
 	return s, nil
@@ -142,7 +177,7 @@ type session struct {
 	sessionID  string
 	sessionKey string
 	model      string
-	planMode  bool
+	planMode   bool
 	context    types.ContextWindow
 
 	sendMu          sync.Mutex
@@ -162,6 +197,7 @@ type session struct {
 
 	pendingToolMu    sync.Mutex
 	pendingToolCalls map[string]types.ToolCall
+	taskTypes        map[string]string
 
 	questionMu    sync.Mutex
 	questionWaits map[string]chan askUserAnswerResult
@@ -550,7 +586,9 @@ func (s *session) consumeMessages() {
 		case claudeagent.PartialAssistantMessage:
 			// Incremental text / thinking tokens. Buffer and coalesce them into
 			// larger readable chunks before emitting UI updates.
-			s.handlePartialAssistantMessage(m.Event)
+			s.handlePartialAssistantMessage(m.Event, subagentMetaFromPartial(m))
+		case claudeagent.StreamEvent:
+			s.handleStreamEvent(m)
 		case claudeagent.AssistantMessage:
 			// Finalized assistant message. Flush pending deltas first so finalized
 			// blocks do not interleave with previously buffered streaming output.
@@ -568,7 +606,28 @@ func (s *session) consumeMessages() {
 		case claudeagent.ToolProgressMessage:
 			// Lightweight progress heartbeat for a tool call that is still running.
 			s.flushAllDeltas()
-			s.emitToolUpdate(m.ToolUseID, m.ToolName)
+			s.emitToolUpdate(m.ToolUseID, m.ToolName, subagentMetaFromToolProgress(m))
+		case claudeagent.CompactBoundaryMessage:
+			s.flushAllDeltas()
+			s.handleCompactBoundaryMessage(m)
+		case claudeagent.AuthStatusMessage:
+			s.flushAllDeltas()
+			s.handleAuthStatusMessage(m)
+		case claudeagent.SubagentResultMessage:
+			s.flushAllDeltas()
+			s.handleSubagentResultMessage(m)
+		case claudeagent.TaskStartedMessage:
+			s.flushAllDeltas()
+			s.handleTaskStartedMessage(m)
+		case claudeagent.TaskProgressMessage:
+			s.flushAllDeltas()
+			s.handleTaskProgressMessage(m)
+		case claudeagent.TaskUpdatedMessage:
+			s.flushAllDeltas()
+			s.handleTaskUpdatedMessage(m)
+		case claudeagent.TaskNotificationMessage:
+			s.flushAllDeltas()
+			s.handleTaskNotificationMessage(m)
 		case claudeagent.ResultMessage:
 			// End-of-turn boundary. Claude may place the final text here when no
 			// incremental tokens were streamed, so emit it as a last fallback.
@@ -595,7 +654,7 @@ func (s *session) consumeMessages() {
 	s.failPendingTurns(errors.New("response stream ended unexpectedly"))
 }
 
-func (s *session) handlePartialAssistantMessage(rawEvent json.RawMessage) {
+func (s *session) handlePartialAssistantMessage(rawEvent json.RawMessage, meta subagentMeta) {
 	if contextTokens := contextTokensFromPartialEvent(rawEvent); contextTokens > 0 {
 		s.mu.Lock()
 		s.context.TotalTokens = contextTokens
@@ -604,6 +663,16 @@ func (s *session) handlePartialAssistantMessage(rawEvent json.RawMessage) {
 	textDelta, thinkingDelta := extractDeltas(rawEvent)
 	if textDelta == "" && thinkingDelta == "" && len(rawEvent) > 0 {
 		log.Printf("[agent/claude] output.unhandled.partial session=%s raw=%s", s.sessionKey, truncateRaw(rawEvent))
+	}
+	if meta.hasSubagentRef() {
+		s.flushAllDeltas()
+		if thinkingDelta != "" {
+			s.emitThoughtChunkWithMeta(thinkingDelta, meta)
+		}
+		if textDelta != "" {
+			s.emitMessageChunkWithMeta(textDelta, meta)
+		}
+		return
 	}
 	// Thinking and visible text are rendered in separate UI lanes, so flush the
 	// other lane before appending to the current one.
@@ -657,14 +726,25 @@ func (s *session) appendDelta(kind deltaType, delta string) {
 }
 
 func (s *session) emitThoughtChunk(content string) {
+	s.emitThoughtChunkWithMeta(content, subagentMeta{})
+}
+
+func (s *session) emitThoughtChunkWithMeta(content string, meta subagentMeta) {
 	s.emit(types.Event{
 		Type:      types.EventTypeThoughtChunk,
 		SessionID: s.SessionID(),
-		Data:      types.ThoughtChunk{Content: content},
+		Data: types.ThoughtChunk{
+			Content:         content,
+			ParentToolUseID: meta.ParentToolUseID,
+			TaskID:          meta.TaskID,
+			SubagentType:    meta.SubagentType,
+			TaskDescription: meta.TaskDescription,
+		},
 	})
 }
 
 func (s *session) handleAssistantMessage(msg claudeagent.AssistantMessage, sawDelta bool) {
+	meta := subagentMetaFromAssistant(msg)
 	for _, block := range msg.Message.Content {
 		switch block.Type {
 		case "text":
@@ -673,14 +753,23 @@ func (s *session) handleAssistantMessage(msg claudeagent.AssistantMessage, sawDe
 			if sawDelta {
 				continue
 			}
-			s.emitMessageChunk(block.Text)
+			s.emitMessageChunkWithMeta(block.Text, meta)
 		case "thinking":
-			s.emitThoughtChunk(block.Text)
+			s.emitThoughtChunkWithMeta(block.Text, meta)
 		case "tool_use":
 			// tool_use is the structured tool invocation request. Its completion
 			// arrives later as UserMessage + ToolUseResult.
 			s.logRawToolCallBlock(block)
 			toolCall := newRunningToolCall(block.ID, block.Name, block.Type, block.Input)
+			toolCall.Meta = mergeToolCallMeta(toolCall.Meta, meta.toMap())
+			if isTaskListToolName(block.Name) {
+				toolCall.Meta = mergeToolCallMeta(toolCall.Meta, map[string]any{
+					"taskTool":  canonicalTaskListToolName(block.Name),
+					"toolUseId": block.ID,
+				})
+				s.trackPendingToolCall(toolCall)
+				continue
+			}
 			s.trackPendingToolCall(toolCall)
 			s.emit(types.Event{
 				Type:      types.EventTypeToolCall,
@@ -719,6 +808,167 @@ func (s *session) handleTodoUpdateMessage(msg claudeagent.TodoUpdateMessage) {
 		SessionID: s.SessionID(),
 		Data:      types.TodoUpdate{Items: items},
 	})
+}
+
+func (s *session) handleStreamEvent(msg claudeagent.StreamEvent) {
+	if msg.Delta != "" {
+		s.emitMessageChunk(msg.Delta)
+		return
+	}
+	raw, err := json.Marshal(msg)
+	if err != nil {
+		return
+	}
+	s.handlePartialAssistantMessage(raw, subagentMeta{})
+}
+
+func (s *session) handleCompactBoundaryMessage(msg claudeagent.CompactBoundaryMessage) {
+	s.emit(types.Event{
+		Type:      types.EventTypeCompact,
+		SessionID: s.SessionID(),
+		Data: types.CompactNotice{
+			ID:      firstNonEmpty(msg.UUID, msg.SessionID),
+			Status:  strings.TrimSpace(msg.CompactMetadata.Trigger),
+			Summary: compactBoundarySummary(msg),
+		},
+	})
+}
+
+func (s *session) handleAuthStatusMessage(msg claudeagent.AuthStatusMessage) {
+	status := "success"
+	if msg.IsAuthenticating {
+		status = "running"
+	}
+	if strings.TrimSpace(msg.Error) != "" {
+		status = "failed"
+	}
+	lines := append([]string(nil), msg.Output...)
+	if errText := strings.TrimSpace(msg.Error); errText != "" {
+		lines = append(lines, errText)
+	}
+	callID := firstNonEmpty(msg.UUID, "auth-"+msg.SessionID, "auth-status")
+	s.emit(types.Event{
+		Type:      types.EventTypeToolUpdate,
+		SessionID: s.SessionID(),
+		Data: types.ToolCall{
+			CallID:  callID,
+			Title:   "authentication",
+			Status:  status,
+			Kind:    types.ToolKindOther,
+			RawType: "auth_status",
+			Content: []types.ToolCallContentItem{{Type: "text", Text: strings.Join(lines, "\n")}},
+			Meta: map[string]any{
+				"rawType":          "auth_status",
+				"isAuthenticating": msg.IsAuthenticating,
+			},
+		},
+	})
+}
+
+func (s *session) handleSubagentResultMessage(msg claudeagent.SubagentResultMessage) {
+	agentName := strings.TrimSpace(msg.AgentName)
+	title := firstNonEmpty(agentName, "subagent")
+	status := "complete"
+	if strings.EqualFold(strings.TrimSpace(msg.Status), "error") {
+		status = "failed"
+	}
+	callID := "subagent-result-" + strings.ToLower(strings.ReplaceAll(title, " ", "-"))
+	s.emit(types.Event{
+		Type:      types.EventTypeToolUpdate,
+		SessionID: s.SessionID(),
+		Data: types.ToolCall{
+			CallID:  callID,
+			Title:   title,
+			Status:  status,
+			Kind:    types.ToolKindTask,
+			RawType: "subagent_result",
+			Content: []types.ToolCallContentItem{{Type: "text", Text: strings.TrimSpace(msg.Result)}},
+			Meta: map[string]any{
+				"rawType":      "subagent_result",
+				"subagentType": agentName,
+				"status":       strings.TrimSpace(msg.Status),
+			},
+		},
+	})
+}
+
+func (s *session) handleTaskStartedMessage(msg claudeagent.TaskStartedMessage) {
+	s.trackTaskType(msg.TaskID, msg.TaskType)
+	if isIgnoredClaudeTaskType(msg.TaskType) {
+		return
+	}
+	toolCall := claudeTaskToolCall(
+		firstNonEmpty(msg.ToolUseID, msg.TaskID),
+		"running",
+		msg.Description,
+		msg.Prompt,
+		subagentMeta{
+			ParentToolUseID: msg.ToolUseID,
+			TaskID:          msg.TaskID,
+			SubagentType:    msg.SubagentType,
+			TaskDescription: msg.Description,
+		},
+		map[string]any{
+			"subtype":      msg.Subtype,
+			"taskType":     msg.TaskType,
+			"workflowName": msg.WorkflowName,
+		},
+	)
+	if strings.TrimSpace(toolCall.CallID) != "" {
+		s.trackPendingToolCall(toolCall)
+	}
+	s.emit(types.Event{Type: types.EventTypeToolCall, SessionID: s.SessionID(), Data: toolCall})
+}
+
+func (s *session) handleTaskProgressMessage(msg claudeagent.TaskProgressMessage) {
+	if isIgnoredClaudeTaskType(s.taskType(msg.TaskID)) {
+		return
+	}
+	callID := firstNonEmpty(msg.ToolUseID, msg.TaskID)
+	toolCall := claudeTaskToolCall(
+		callID,
+		"running",
+		msg.Description,
+		msg.Summary,
+		subagentMeta{
+			ParentToolUseID: msg.ToolUseID,
+			TaskID:          msg.TaskID,
+			SubagentType:    msg.SubagentType,
+			TaskDescription: msg.Description,
+		},
+		map[string]any{
+			"subtype":      msg.Subtype,
+			"lastToolName": msg.LastToolName,
+			"progress":     firstNonEmpty(msg.Summary, msg.Description),
+		},
+	)
+	if s.hasPendingToolCall(callID) {
+		toolCall.Title = ""
+	}
+	s.emit(types.Event{Type: types.EventTypeToolUpdate, SessionID: s.SessionID(), Data: toolCall})
+}
+
+func (s *session) handleTaskUpdatedMessage(msg claudeagent.TaskUpdatedMessage) {
+	if isIgnoredClaudeTaskType(s.taskType(msg.TaskID)) {
+		return
+	}
+	toolCall := claudeTaskToolCall(
+		msg.TaskID,
+		claudeTaskRunStatus(string(msg.Patch.Status)),
+		msg.Patch.Description,
+		msg.Patch.Error,
+		subagentMeta{TaskID: msg.TaskID, TaskDescription: msg.Patch.Description},
+		map[string]any{
+			"subtype":        msg.Subtype,
+			"error":          msg.Patch.Error,
+			"isBackgrounded": boolPtrValue(msg.Patch.IsBackgrounded),
+		},
+	)
+	s.emit(types.Event{Type: types.EventTypeToolUpdate, SessionID: s.SessionID(), Data: toolCall})
+}
+
+func (s *session) handleTaskNotificationMessage(msg claudeagent.TaskNotificationMessage) {
+	_ = msg
 }
 
 func (s *session) awaitAskUserQuestion(ctx context.Context, qs claudeagent.QuestionSet) (claudeagent.Answers, error) {
@@ -832,7 +1082,7 @@ func summarizeToolCall(name string, input json.RawMessage) (string, map[string]a
 		title, nextMeta, content := summarizeWebSearchToolCall(input, meta)
 		return title, nextMeta, nil, content
 	case types.ToolKindTask:
-		title, nextMeta, content := summarizeTaskToolCall(input, meta)
+		title, nextMeta, content := summarizeTaskToolCall(name, input, meta)
 		return title, nextMeta, nil, content
 	case types.ToolKindAskUser:
 		title, nextMeta, content := summarizeAskUserToolCall(input, meta)
@@ -1001,7 +1251,10 @@ func summarizeTodoToolCall(input json.RawMessage, fallbackMeta map[string]any) (
 	}}
 }
 
-func summarizeTaskToolCall(input json.RawMessage, fallbackMeta map[string]any) (string, map[string]any, []types.ToolCallContentItem) {
+func summarizeTaskToolCall(name string, input json.RawMessage, fallbackMeta map[string]any) (string, map[string]any, []types.ToolCallContentItem) {
+	if title, meta, content, ok := summarizeTaskListToolCall(name, input, fallbackMeta); ok {
+		return title, meta, content
+	}
 	var payload claudeagent.TaskInput
 	if err := json.Unmarshal(input, &payload); err != nil {
 		return "task", fallbackMeta, nil
@@ -1048,6 +1301,111 @@ func summarizeTaskToolCall(input json.RawMessage, fallbackMeta map[string]any) (
 		Type: "text",
 		Text: strings.Join(lines, "\n\n"),
 	}}
+}
+
+func summarizeTaskListToolCall(name string, input json.RawMessage, fallbackMeta map[string]any) (string, map[string]any, []types.ToolCallContentItem, bool) {
+	switch normalizeToolName(name) {
+	case "taskcreate":
+		var payload struct {
+			Subject     string `json:"subject"`
+			Description string `json:"description"`
+			ActiveForm  string `json:"activeForm"`
+		}
+		if err := json.Unmarshal(input, &payload); err != nil {
+			return "task", fallbackMeta, nil, true
+		}
+		subject := strings.TrimSpace(payload.Subject)
+		description := strings.TrimSpace(payload.Description)
+		activeForm := strings.TrimSpace(payload.ActiveForm)
+		title := firstNonEmpty(subject, activeForm, description, "task")
+		meta := cloneToolMeta(fallbackMeta)
+		if subject != "" {
+			meta["subject"] = subject
+		}
+		if description != "" {
+			meta["description"] = description
+		}
+		if activeForm != "" {
+			meta["activeForm"] = activeForm
+		}
+		if description == "" || description == title {
+			return title, meta, nil, true
+		}
+		return title, meta, []types.ToolCallContentItem{{Type: "text", Text: description}}, true
+	case "taskupdate":
+		var payload struct {
+			TaskID string `json:"taskId"`
+			Status string `json:"status"`
+		}
+		if err := json.Unmarshal(input, &payload); err != nil {
+			return "", fallbackMeta, nil, true
+		}
+		meta := cloneToolMeta(fallbackMeta)
+		if taskID := strings.TrimSpace(payload.TaskID); taskID != "" {
+			meta["taskId"] = taskID
+		}
+		if status := normalizeTaskListStatus(payload.Status); status != "" {
+			meta["taskStatus"] = status
+		}
+		return "", meta, nil, true
+	case "tasklist":
+		return "TaskList", cloneToolMeta(fallbackMeta), nil, true
+	case "taskget":
+		var payload struct {
+			TaskID string `json:"taskId"`
+		}
+		meta := cloneToolMeta(fallbackMeta)
+		if err := json.Unmarshal(input, &payload); err == nil {
+			if taskID := strings.TrimSpace(payload.TaskID); taskID != "" {
+				meta["taskId"] = taskID
+			}
+		}
+		return "TaskGet", meta, nil, true
+	default:
+		return "", nil, nil, false
+	}
+}
+
+func normalizeTaskListStatus(status string) string {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "completed", "complete", "done":
+		return "complete"
+	case "inprogress", "in_progress", "running":
+		return "running"
+	case "failed", "error":
+		return "failed"
+	case "cancelled", "canceled":
+		return "cancelled"
+	default:
+		return ""
+	}
+}
+
+func taskListCallID(taskID string) string {
+	taskID = strings.TrimSpace(taskID)
+	if taskID == "" {
+		return ""
+	}
+	return "claude-task-list:" + taskID
+}
+
+func isTaskListToolName(name string) bool {
+	return canonicalTaskListToolName(name) != ""
+}
+
+func canonicalTaskListToolName(name string) string {
+	switch normalizeToolName(name) {
+	case "taskcreate":
+		return "TaskCreate"
+	case "taskupdate":
+		return "TaskUpdate"
+	case "tasklist":
+		return "TaskList"
+	case "taskget":
+		return "TaskGet"
+	default:
+		return ""
+	}
 }
 
 func summarizeAskUserToolCall(input json.RawMessage, fallbackMeta map[string]any) (string, map[string]any, []types.ToolCallContentItem) {
@@ -1162,6 +1520,176 @@ func cloneToolMeta(meta map[string]any) map[string]any {
 	return out
 }
 
+func subagentMetaFromPartial(msg claudeagent.PartialAssistantMessage) subagentMeta {
+	meta := subagentMeta{}
+	if msg.ParentToolUseID != nil {
+		meta.ParentToolUseID = strings.TrimSpace(*msg.ParentToolUseID)
+	}
+	return meta
+}
+
+func subagentMetaFromAssistant(msg claudeagent.AssistantMessage) subagentMeta {
+	meta := subagentMeta{
+		SubagentType:    strings.TrimSpace(msg.SubagentType),
+		TaskDescription: strings.TrimSpace(msg.TaskDescription),
+	}
+	if msg.ParentToolUseID != nil {
+		meta.ParentToolUseID = strings.TrimSpace(*msg.ParentToolUseID)
+	}
+	return meta
+}
+
+func subagentMetaFromToolProgress(msg claudeagent.ToolProgressMessage) subagentMeta {
+	meta := subagentMeta{}
+	if msg.ParentToolUseID != nil {
+		meta.ParentToolUseID = strings.TrimSpace(*msg.ParentToolUseID)
+	}
+	if msg.TaskID != nil {
+		meta.TaskID = strings.TrimSpace(*msg.TaskID)
+	}
+	return meta
+}
+
+func (m subagentMeta) hasSubagentRef() bool {
+	return strings.TrimSpace(m.ParentToolUseID) != "" || strings.TrimSpace(m.TaskID) != ""
+}
+
+func (m subagentMeta) toMap() map[string]any {
+	out := map[string]any{}
+	if value := strings.TrimSpace(m.ParentToolUseID); value != "" {
+		out["parentToolUseId"] = value
+	}
+	if value := strings.TrimSpace(m.TaskID); value != "" {
+		out["taskId"] = value
+	}
+	if value := strings.TrimSpace(m.SubagentType); value != "" {
+		out["subagentType"] = value
+	}
+	if value := strings.TrimSpace(m.TaskDescription); value != "" {
+		out["taskDescription"] = value
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func claudeTaskToolCall(callID, status, description, text string, meta subagentMeta, extra map[string]any) types.ToolCall {
+	callID = strings.TrimSpace(callID)
+	if callID == "" {
+		callID = strings.TrimSpace(meta.TaskID)
+	}
+	if callID == "" {
+		callID = "claude-task"
+	}
+	title := strings.TrimSpace(description)
+	if title == "" {
+		title = strings.TrimSpace(text)
+	}
+	if title == "" {
+		title = firstNonEmpty(meta.SubagentType, meta.TaskID, callID, "task")
+	}
+	status = strings.TrimSpace(status)
+	if status == "" {
+		status = "running"
+	}
+	content := []types.ToolCallContentItem(nil)
+	if body := strings.TrimSpace(text); body != "" && body != title {
+		content = []types.ToolCallContentItem{{Type: "text", Text: body}}
+	}
+	merged := mergeToolCallMeta(meta.toMap(), map[string]any{
+		"rawType": "claude_task",
+	})
+	merged = mergeToolCallMeta(merged, extra)
+	return types.ToolCall{
+		CallID:  callID,
+		Title:   title,
+		Status:  status,
+		Kind:    types.ToolKindTask,
+		RawType: "claude_task",
+		Content: content,
+		Meta:    merged,
+	}
+}
+
+func claudeTaskRunStatus(status string) string {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "completed":
+		return "complete"
+	case "failed", "killed":
+		return "failed"
+	case "paused":
+		return "running"
+	case "pending", "running":
+		return "running"
+	default:
+		return "running"
+	}
+}
+
+func compactBoundarySummary(msg claudeagent.CompactBoundaryMessage) string {
+	parts := make([]string, 0, 2)
+	if trigger := strings.TrimSpace(msg.CompactMetadata.Trigger); trigger != "" {
+		parts = append(parts, "trigger: "+trigger)
+	}
+	if msg.CompactMetadata.PreTokens > 0 {
+		parts = append(parts, fmt.Sprintf("tokens before compact: %d", msg.CompactMetadata.PreTokens))
+	}
+	return strings.Join(parts, "\n")
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+func boolPtrValue(value *bool) any {
+	if value == nil {
+		return nil
+	}
+	return *value
+}
+
+func isIgnoredClaudeTaskType(taskType string) bool {
+	switch strings.ToLower(strings.TrimSpace(taskType)) {
+	case "local_bash":
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *session) trackTaskType(taskID, taskType string) {
+	taskID = strings.TrimSpace(taskID)
+	taskType = strings.TrimSpace(taskType)
+	if taskID == "" || taskType == "" {
+		return
+	}
+	s.pendingToolMu.Lock()
+	defer s.pendingToolMu.Unlock()
+	if s.taskTypes == nil {
+		s.taskTypes = make(map[string]string)
+	}
+	s.taskTypes[taskID] = taskType
+}
+
+func (s *session) taskType(taskID string) string {
+	taskID = strings.TrimSpace(taskID)
+	if taskID == "" {
+		return ""
+	}
+	s.pendingToolMu.Lock()
+	defer s.pendingToolMu.Unlock()
+	if s.taskTypes == nil {
+		return ""
+	}
+	return s.taskTypes[taskID]
+}
+
 func (s *session) trackPendingToolCall(toolCall types.ToolCall) {
 	s.pendingToolMu.Lock()
 	defer s.pendingToolMu.Unlock()
@@ -1171,7 +1699,22 @@ func (s *session) trackPendingToolCall(toolCall types.ToolCall) {
 	if s.pendingToolCalls == nil {
 		s.pendingToolCalls = make(map[string]types.ToolCall)
 	}
-	s.pendingToolCalls[toolCall.CallID] = toolCall
+	key := stringMeta(toolCall.Meta, "toolUseId")
+	if key == "" {
+		key = toolCall.CallID
+	}
+	s.pendingToolCalls[key] = toolCall
+}
+
+func (s *session) hasPendingToolCall(callID string) bool {
+	callID = strings.TrimSpace(callID)
+	if callID == "" {
+		return false
+	}
+	s.pendingToolMu.Lock()
+	defer s.pendingToolMu.Unlock()
+	_, ok := s.pendingToolCalls[callID]
+	return ok
 }
 
 func (s *session) cancelPendingToolCall(callID, reason string) (types.ToolCall, bool) {
@@ -1216,6 +1759,9 @@ func (s *session) toolResultUpdate(msg claudeagent.UserMessage) (types.ToolCall,
 	if !ok {
 		return types.ToolCall{}, false
 	}
+	if isTaskListToolCall(base) {
+		return taskListToolResultUpdate(base, msg.ToolUseResult)
+	}
 
 	result := summarizeToolResult(base.Kind, msg.ToolUseResult)
 	if result == "" {
@@ -1224,12 +1770,215 @@ func (s *session) toolResultUpdate(msg claudeagent.UserMessage) (types.ToolCall,
 	update := base
 	update.Status = "complete"
 	if result != "" {
-		update.Meta = mergeToolCallMeta(base.Meta, map[string]any{"output": result})
+		update.Meta = mergeToolCallMeta(update.Meta, map[string]any{"output": result})
 		if base.Kind != types.ToolKindEdit || len(base.Content) == 0 {
 			update.Content = []types.ToolCallContentItem{{Type: "text", Text: result}}
 		}
 	}
 	return update, true
+}
+
+func isTaskListToolCall(toolCall types.ToolCall) bool {
+	return toolCall.Kind == types.ToolKindTask && canonicalTaskListToolName(stringMeta(toolCall.Meta, "taskTool")) != ""
+}
+
+func taskListToolResultUpdate(base types.ToolCall, raw any) (types.ToolCall, bool) {
+	taskTool := canonicalTaskListToolName(stringMeta(base.Meta, "taskTool"))
+	if taskTool == "" {
+		return types.ToolCall{}, false
+	}
+
+	result := summarizeToolResult(base.Kind, raw)
+	if result == "" {
+		result = summarizeGenericToolResult(raw)
+	}
+	if isEmptyJSONResult(result) {
+		result = ""
+	}
+
+	switch taskTool {
+	case "TaskCreate":
+		taskID := firstNonEmpty(extractTaskListResultID(raw), stringMeta(base.Meta, "taskId"))
+		update := base
+		update.Status = "running"
+		if taskID != "" {
+			update.CallID = taskListCallID(taskID)
+			update.Meta = mergeToolCallMeta(update.Meta, map[string]any{"taskId": taskID})
+		}
+		return update, true
+	case "TaskUpdate":
+		taskID := firstNonEmpty(extractTaskListResultID(raw), stringMeta(base.Meta, "taskId"))
+		status := firstNonEmpty(extractTaskListResultStatus(raw), stringMeta(base.Meta, "taskStatus"), "complete")
+		update := base
+		update.Title = ""
+		update.Content = nil
+		update.Status = status
+		meta := map[string]any{"taskStatus": status}
+		if taskID != "" {
+			update.CallID = taskListCallID(taskID)
+			meta["taskId"] = taskID
+		}
+		update.Meta = mergeToolCallMeta(update.Meta, meta)
+		return update, true
+	case "TaskList":
+		if result == "" {
+			return types.ToolCall{}, false
+		}
+		update := base
+		update.Status = "complete"
+		update.Meta = mergeToolCallMeta(update.Meta, map[string]any{"output": result})
+		update.Content = []types.ToolCallContentItem{{Type: "text", Text: result}}
+		return update, true
+	case "TaskGet":
+		if result == "" {
+			return types.ToolCall{}, false
+		}
+		taskID := firstNonEmpty(extractTaskListResultID(raw), stringMeta(base.Meta, "taskId"))
+		update := base
+		update.Status = "complete"
+		if taskID != "" {
+			update.CallID = taskListCallID(taskID)
+			update.Meta = mergeToolCallMeta(update.Meta, map[string]any{"taskId": taskID})
+		}
+		update.Meta = mergeToolCallMeta(update.Meta, map[string]any{"output": result})
+		update.Content = []types.ToolCallContentItem{{Type: "text", Text: result}}
+		return update, true
+	default:
+		return types.ToolCall{}, false
+	}
+}
+
+func isEmptyJSONResult(value string) bool {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return true
+	}
+	return trimmed == "{}" || trimmed == "[]"
+}
+
+func extractTaskListResultID(raw any) string {
+	value := normalizeToolResultValue(raw)
+	switch v := value.(type) {
+	case map[string]any:
+		if taskID := stringField(v, "taskId"); taskID != "" {
+			return taskID
+		}
+		if id := stringField(v, "id"); id != "" {
+			return id
+		}
+		if task, ok := v["task"].(map[string]any); ok {
+			if taskID := stringField(task, "taskId"); taskID != "" {
+				return taskID
+			}
+			if id := stringField(task, "id"); id != "" {
+				return id
+			}
+		}
+		if result, ok := v["result"].(map[string]any); ok {
+			if taskID := stringField(result, "taskId"); taskID != "" {
+				return taskID
+			}
+			if id := stringField(result, "id"); id != "" {
+				return id
+			}
+			if task, ok := result["task"].(map[string]any); ok {
+				if taskID := stringField(task, "taskId"); taskID != "" {
+					return taskID
+				}
+				if id := stringField(task, "id"); id != "" {
+					return id
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func extractTaskListResultStatus(raw any) string {
+	value := normalizeToolResultValue(raw)
+	switch v := value.(type) {
+	case map[string]any:
+		if status := normalizeTaskListStatus(stringField(v, "status")); status != "" {
+			return status
+		}
+		if statusChange, ok := v["statusChange"].(map[string]any); ok {
+			if status := normalizeTaskListStatus(stringField(statusChange, "to")); status != "" {
+				return status
+			}
+		}
+		if task, ok := v["task"].(map[string]any); ok {
+			if status := normalizeTaskListStatus(stringField(task, "status")); status != "" {
+				return status
+			}
+		}
+		if result, ok := v["result"].(map[string]any); ok {
+			if status := normalizeTaskListStatus(stringField(result, "status")); status != "" {
+				return status
+			}
+			if statusChange, ok := result["statusChange"].(map[string]any); ok {
+				if status := normalizeTaskListStatus(stringField(statusChange, "to")); status != "" {
+					return status
+				}
+			}
+			if task, ok := result["task"].(map[string]any); ok {
+				if status := normalizeTaskListStatus(stringField(task, "status")); status != "" {
+					return status
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func normalizeToolResultValue(raw any) any {
+	switch v := raw.(type) {
+	case string:
+		var decoded any
+		if err := json.Unmarshal([]byte(v), &decoded); err == nil {
+			return decoded
+		}
+		return raw
+	case []byte:
+		var decoded any
+		if err := json.Unmarshal(v, &decoded); err == nil {
+			return decoded
+		}
+		return raw
+	case json.RawMessage:
+		var decoded any
+		if err := json.Unmarshal(v, &decoded); err == nil {
+			return decoded
+		}
+		return raw
+	default:
+		data, err := json.Marshal(raw)
+		if err != nil {
+			return raw
+		}
+		var decoded any
+		if err := json.Unmarshal(data, &decoded); err == nil {
+			return decoded
+		}
+		return raw
+	}
+}
+
+func stringField(data map[string]any, key string) string {
+	value, ok := data[key]
+	if !ok {
+		return ""
+	}
+	switch v := value.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case float64:
+		if v == float64(int64(v)) {
+			return strconv.FormatInt(int64(v), 10)
+		}
+		return strings.TrimSpace(fmt.Sprint(v))
+	default:
+		return strings.TrimSpace(fmt.Sprint(v))
+	}
 }
 
 func mergeToolCallMeta(base map[string]any, extra map[string]any) map[string]any {
@@ -1244,6 +1993,22 @@ func mergeToolCallMeta(base map[string]any, extra map[string]any) map[string]any
 		out[k] = v
 	}
 	return out
+}
+
+func stringMeta(meta map[string]any, key string) string {
+	if len(meta) == 0 {
+		return ""
+	}
+	value, ok := meta[key]
+	if !ok {
+		return ""
+	}
+	switch v := value.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	default:
+		return strings.TrimSpace(fmt.Sprint(v))
+	}
 }
 
 func (s *session) popPendingToolCall(callID string) (types.ToolCall, bool) {
@@ -1400,22 +2165,33 @@ func summarizeGenericToolResultValue(value any) string {
 }
 
 func (s *session) emitMessageChunk(content string) {
-	if strings.TrimSpace(content) != "" {
+	s.emitMessageChunkWithMeta(content, subagentMeta{})
+}
+
+func (s *session) emitMessageChunkWithMeta(content string, meta subagentMeta) {
+	if strings.TrimSpace(content) != "" && !meta.hasSubagentRef() {
 		s.sawMessageText = true
 	}
 	s.emit(types.Event{
 		Type:      types.EventTypeMessageChunk,
 		SessionID: s.SessionID(),
-		Data:      types.MessageChunk{Content: content},
+		Data: types.MessageChunk{
+			Content:         content,
+			ParentToolUseID: meta.ParentToolUseID,
+			TaskID:          meta.TaskID,
+			SubagentType:    meta.SubagentType,
+			TaskDescription: meta.TaskDescription,
+		},
 	})
 }
 
-func (s *session) emitToolUpdate(callID, name string) {
+func (s *session) emitToolUpdate(callID, name string, meta subagentMeta) {
 	toolCall := types.ToolCall{
 		CallID: callID,
 		Title:  name,
 		Status: "running",
 		Kind:   mapToolKind(name),
+		Meta:   meta.toMap(),
 	}
 	s.emit(types.Event{
 		Type:      types.EventTypeToolUpdate,
@@ -1468,6 +2244,18 @@ func (s *session) updateSessionID(msg any) {
 	case claudeagent.ToolProgressMessage:
 		s.setSessionID(m.SessionID)
 	case claudeagent.PartialAssistantMessage:
+		s.setSessionID(m.SessionID)
+	case claudeagent.CompactBoundaryMessage:
+		s.setSessionID(m.SessionID)
+	case claudeagent.AuthStatusMessage:
+		s.setSessionID(m.SessionID)
+	case claudeagent.TaskStartedMessage:
+		s.setSessionID(m.SessionID)
+	case claudeagent.TaskProgressMessage:
+		s.setSessionID(m.SessionID)
+	case claudeagent.TaskUpdatedMessage:
+		s.setSessionID(m.SessionID)
+	case claudeagent.TaskNotificationMessage:
 		s.setSessionID(m.SessionID)
 	}
 }
@@ -1649,7 +2437,7 @@ func extractDeltas(raw json.RawMessage) (string, string) {
 }
 
 func mapToolKind(name string) types.ToolKind {
-	switch strings.ToLower(strings.TrimSpace(name)) {
+	switch normalizeToolName(name) {
 	case "read":
 		return types.ToolKindRead
 	case "edit", "write", "multiedit":
@@ -1666,7 +2454,7 @@ func mapToolKind(name string) types.ToolKind {
 		return types.ToolKindExecute
 	case "webfetch", "fetch":
 		return types.ToolKindFetch
-	case "task":
+	case "task", "taskcreate", "taskupdate", "tasklist", "taskget":
 		return types.ToolKindTask
 	case "askuserquestion":
 		return types.ToolKindAskUser
@@ -1679,6 +2467,13 @@ func mapToolKind(name string) types.ToolKind {
 	default:
 		return types.ToolKindOther
 	}
+}
+
+func normalizeToolName(name string) string {
+	name = strings.ToLower(strings.TrimSpace(name))
+	name = strings.ReplaceAll(name, "_", "")
+	name = strings.ReplaceAll(name, "-", "")
+	return name
 }
 
 func preview(content string) string {

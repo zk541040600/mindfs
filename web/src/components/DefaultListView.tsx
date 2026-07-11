@@ -9,6 +9,7 @@ import {
 } from "../services/directorySort";
 
 type DirectorySortControlValue = DirectorySortMode | "inherit";
+export type MainContentViewMode = "task-kanban" | "file-browser";
 
 const ChevronRight = ({ isOpen }: { isOpen: boolean }) => (
   <svg
@@ -48,11 +49,14 @@ type DefaultListViewProps = {
   isGitRepo?: boolean;
   isGitWorktree?: boolean;
   showGitHistory?: boolean;
+  enableGitHistoryToggle?: boolean;
   onToggleGitHistory?: () => void;
   onCreateWorktree?: () => void;
   onSwitchWorktree?: () => void;
   onRemoveWorktree?: () => void;
   onOpenScheduledAgentTasks?: () => void;
+  currentViewMode?: MainContentViewMode;
+  onViewModeChange?: (mode: MainContentViewMode) => void;
   menuOverlay?: React.ReactNode;
 };
 
@@ -411,11 +415,14 @@ export function DefaultListView({
   isGitRepo = false,
   isGitWorktree = false,
   showGitHistory = true,
+  enableGitHistoryToggle = true,
   onToggleGitHistory,
   onCreateWorktree,
   onSwitchWorktree,
   onRemoveWorktree,
   onOpenScheduledAgentTasks,
+  currentViewMode = "task-kanban",
+  onViewModeChange,
   menuOverlay = null,
 }: DefaultListViewProps) {
   const inputRef = React.useRef<HTMLInputElement>(null);
@@ -423,6 +430,7 @@ export function DefaultListView({
   const menuRef = React.useRef<HTMLDivElement | null>(null);
   const [isMenuOpen, setIsMenuOpen] = React.useState(false);
   const [isSortMenuOpen, setIsSortMenuOpen] = React.useState(false);
+  const [isViewMenuOpen, setIsViewMenuOpen] = React.useState(false);
   const [editingRoot, setEditingRoot] = React.useState(false);
   const [rootDraft, setRootDraft] = React.useState(root || "");
   const [rootRenaming, setRootRenaming] = React.useState(false);
@@ -438,6 +446,9 @@ export function DefaultListView({
     sortMode === "size-desc" ||
     sortMode === "size-asc";
   const isRootView = !!root && (!!path ? path === root : true);
+  const showTaskKanban = currentViewMode === "task-kanban";
+  const showFileBrowser = currentViewMode === "file-browser";
+  const currentViewLabel = showTaskKanban ? "任务看板" : "文件浏览";
 
   React.useEffect(() => {
     if (!editingRoot) {
@@ -553,15 +564,17 @@ export function DefaultListView({
             flexShrink: 0,
           }}
         >
-          <div
-            style={{
-              fontSize: "11px",
-              color: "var(--text-secondary)",
-              opacity: 0.6,
-            }}
-          >
-            {sortedEntries.length}项
-          </div>
+          {showFileBrowser ? (
+            <div
+              style={{
+                fontSize: "11px",
+                color: "var(--text-secondary)",
+                opacity: 0.6,
+              }}
+            >
+              {sortedEntries.length}项
+            </div>
+          ) : null}
           <div ref={menuRef} style={{ position: "relative" }}>
             <button
               type="button"
@@ -570,6 +583,7 @@ export function DefaultListView({
                   const nextOpen = !open;
                   if (nextOpen) {
                     setIsSortMenuOpen(false);
+                    setIsViewMenuOpen(false);
                   }
                   return nextOpen;
                 });
@@ -618,7 +632,10 @@ export function DefaultListView({
               >
                 <button
                   type="button"
-                  onClick={() => setIsSortMenuOpen((open) => !open)}
+                  onClick={() => {
+                    setIsSortMenuOpen((open) => !open);
+                    setIsViewMenuOpen(false);
+                  }}
                   style={{
                     width: "100%",
                     border: "none",
@@ -733,6 +750,86 @@ export function DefaultListView({
                     })}
                   </>
                 ) : null}
+                <button
+                  type="button"
+                  onClick={() => {
+                    setIsViewMenuOpen((open) => !open);
+                    setIsSortMenuOpen(false);
+                  }}
+                  style={{
+                    width: "100%",
+                    border: "none",
+                    background: "transparent",
+                    color: "var(--text-primary)",
+                    borderRadius: "8px",
+                    padding: "8px 10px",
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "8px",
+                    textAlign: "left",
+                    cursor: "pointer",
+                    fontSize: "12px",
+                  }}
+                  aria-expanded={isViewMenuOpen}
+                >
+                  <span style={{ flex: 1 }}>当前视图</span>
+                  <span
+                    style={{ color: "var(--text-secondary)", fontSize: "11px" }}
+                  >
+                    {currentViewLabel}
+                  </span>
+                  <ChevronRight isOpen={isViewMenuOpen} />
+                </button>
+                {isViewMenuOpen ? (
+                  <>
+                    {([
+                      ["task-kanban", "任务看板"],
+                      ["file-browser", "文件浏览"],
+                    ] as const).map(([mode, label]) => {
+                      const active = currentViewMode === mode;
+                      return (
+                        <button
+                          key={mode}
+                          type="button"
+                          onClick={() => {
+                            onViewModeChange?.(mode);
+                            setIsMenuOpen(false);
+                            setIsSortMenuOpen(false);
+                            setIsViewMenuOpen(false);
+                          }}
+                          style={{
+                            width: "100%",
+                            border: "none",
+                            background: active
+                              ? "var(--selection-bg)"
+                              : "transparent",
+                            color: active
+                              ? "var(--accent-color)"
+                              : "var(--text-primary)",
+                            borderRadius: "8px",
+                            padding: "8px 10px",
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "space-between",
+                            textAlign: "left",
+                            cursor: "pointer",
+                            fontSize: "12px",
+                          }}
+                        >
+                          <span>{label}</span>
+                          <span
+                            style={{
+                              fontSize: "11px",
+                              opacity: active ? 1 : 0,
+                            }}
+                          >
+                            ✓
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </>
+                ) : null}
                 <div
                   style={{
                     height: "1px",
@@ -742,7 +839,7 @@ export function DefaultListView({
                 />
                 {isRootView ? (
                   <>
-                    {isGitRepo ? (
+                    {isGitRepo && enableGitHistoryToggle ? (
                       <button
                         type="button"
                         onClick={() => {
@@ -1084,110 +1181,112 @@ export function DefaultListView({
       </header>
 
       <div style={{ flex: 1, minHeight: 0, overflow: "auto" }}>
-        {topContent ? (
-          <div style={{ padding: "24px 16px 0" }}>{topContent}</div>
+        {showTaskKanban && topContent ? (
+          <div style={{ padding: "8px 16px 24px" }}>{topContent}</div>
         ) : null}
-        <div style={{ padding: topContent ? "4px 16px 24px" : "24px 16px" }}>
-          {errorMessage ? (
-            <div
-              style={{
-                padding: "18px 16px",
-                borderRadius: "12px",
-                border: "1px solid rgba(245, 158, 11, 0.28)",
-                background: "rgba(245, 158, 11, 0.08)",
-                color: "var(--text-primary)",
-              }}
-            >
+        {showFileBrowser ? (
+          <div style={{ padding: "24px 16px" }}>
+            {errorMessage ? (
               <div
                 style={{
-                  fontSize: "14px",
-                  fontWeight: 600,
-                  marginBottom: "6px",
+                  padding: "18px 16px",
+                  borderRadius: "12px",
+                  border: "1px solid rgba(245, 158, 11, 0.28)",
+                  background: "rgba(245, 158, 11, 0.08)",
+                  color: "var(--text-primary)",
                 }}
               >
-                当前目录无法访问
-              </div>
-              <div
-                style={{
-                  fontSize: "12px",
-                  color: "var(--text-secondary)",
-                  lineHeight: 1.5,
-                }}
-              >
-                {errorMessage}
-              </div>
-            </div>
-          ) : null}
-          <div
-            style={{
-              display: "flex",
-              flexDirection: "column",
-              gap: "4px",
-              width: "100%",
-            }}
-          >
-            {sortedEntries.map((entry) => (
-              <div
-                key={entry.path}
-                onClick={() => onItemClick?.(entry)}
-                style={{
-                  background: "transparent",
-                  border: "1px solid transparent",
-                  borderRadius: "8px",
-                  padding: "6px 10px",
-                  display: "flex",
-                  alignItems: "center",
-                  gap: "8px",
-                  transition: "all 0.2s cubic-bezier(0.4, 0, 0.2, 1)",
-                  cursor: "pointer",
-                  transform: "translateZ(0)",
-                  willChange: "background-color",
-                }}
-                onMouseEnter={(e) => {
-                  e.currentTarget.style.background = "rgba(0, 0, 0, 0.03)";
-                }}
-                onMouseLeave={(e) => {
-                  e.currentTarget.style.background = "transparent";
-                }}
-              >
-                <FileEntryIcon entry={entry} />
                 <div
                   style={{
-                    minWidth: 0,
-                    flex: 1,
-                    fontWeight: 500,
-                    fontSize: "13px",
-                    whiteSpace: "nowrap",
-                    overflow: "hidden",
-                    textOverflow: "ellipsis",
-                    color: "var(--text-primary)",
+                    fontSize: "14px",
+                    fontWeight: 600,
+                    marginBottom: "6px",
                   }}
                 >
-                  {entry.name}
+                  当前目录无法访问
                 </div>
-                {showCompactMeta ? (
+                <div
+                  style={{
+                    fontSize: "12px",
+                    color: "var(--text-secondary)",
+                    lineHeight: 1.5,
+                  }}
+                >
+                  {errorMessage}
+                </div>
+              </div>
+            ) : null}
+            <div
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                gap: "4px",
+                width: "100%",
+              }}
+            >
+              {sortedEntries.map((entry) => (
+                <div
+                  key={entry.path}
+                  onClick={() => onItemClick?.(entry)}
+                  style={{
+                    background: "transparent",
+                    border: "1px solid transparent",
+                    borderRadius: "8px",
+                    padding: "6px 10px",
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "8px",
+                    transition: "all 0.2s cubic-bezier(0.4, 0, 0.2, 1)",
+                    cursor: "pointer",
+                    transform: "translateZ(0)",
+                    willChange: "background-color",
+                  }}
+                  onMouseEnter={(e) => {
+                    e.currentTarget.style.background = "rgba(0, 0, 0, 0.03)";
+                  }}
+                  onMouseLeave={(e) => {
+                    e.currentTarget.style.background = "transparent";
+                  }}
+                >
+                  <FileEntryIcon entry={entry} />
                   <div
                     style={{
-                      flexShrink: 0,
-                      minWidth: "76px",
-                      textAlign: "right",
-                      fontSize: "11px",
-                      color: "var(--text-secondary)",
-                      opacity: 0.88,
-                      fontVariantNumeric: "tabular-nums",
+                      minWidth: 0,
+                      flex: 1,
+                      fontWeight: 500,
+                      fontSize: "13px",
+                      whiteSpace: "nowrap",
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                      color: "var(--text-primary)",
                     }}
                   >
-                    {sortMode === "mtime-desc" || sortMode === "mtime-asc"
-                      ? formatCompactTime(entry.mtime)
-                      : !entry.is_dir
-                        ? formatCompactSize(entry.size)
-                        : ""}
+                    {entry.name}
                   </div>
-                ) : null}
-              </div>
-            ))}
+                  {showCompactMeta ? (
+                    <div
+                      style={{
+                        flexShrink: 0,
+                        minWidth: "76px",
+                        textAlign: "right",
+                        fontSize: "11px",
+                        color: "var(--text-secondary)",
+                        opacity: 0.88,
+                        fontVariantNumeric: "tabular-nums",
+                      }}
+                    >
+                      {sortMode === "mtime-desc" || sortMode === "mtime-asc"
+                        ? formatCompactTime(entry.mtime)
+                        : !entry.is_dir
+                          ? formatCompactSize(entry.size)
+                          : ""}
+                    </div>
+                  ) : null}
+                </div>
+              ))}
+            </div>
           </div>
-        </div>
+        ) : null}
       </div>
     </div>
   );

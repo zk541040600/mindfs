@@ -25,6 +25,8 @@ interface LauncherNode {
 interface DownloadInput {
   url?: string;
   filename?: string;
+  dataBase64?: string;
+  mimeType?: string;
 }
 
 interface DownloadBytesInput {
@@ -227,21 +229,29 @@ export class MindFSNativeBridge {
     return '';
   }
 
-  downloadBase64(rawInput: string): string {
-    const input = parseDownloadBytesInput(rawInput);
-    const filename = sanitizeFilename(`${input.filename ?? ''}`.trim());
-    if (!filename) {
-      return 'download filename is required';
-    }
-    if (!this.context) {
-      return 'Harmony context is not ready';
+  saveBase64(rawInput: string): string {
+    const input = parseDownloadInput(rawInput);
+    const dataBase64 = `${input.dataBase64 ?? ''}`.trim();
+    const filename = sanitizeFilename(`${input.filename ?? ''}`.trim()) || 'download';
+    if (!dataBase64) {
+      return 'download content is empty';
     }
     try {
-      const data = decodeBase64(`${input.data ?? ''}`.trim());
-      this.startDownloadBytes(data, filename);
+      const data = decodeBase64(dataBase64);
+      const targetPath = uniqueDownloadPath(environment.getUserDownloadDir(), filename);
+      const file = fileIo.openSync(
+        targetPath,
+        fileIo.OpenMode.WRITE_ONLY | fileIo.OpenMode.CREATE | fileIo.OpenMode.TRUNC
+      );
+      try {
+        fileIo.writeSync(file.fd, data.buffer);
+        fileIo.fsyncSync(file.fd);
+      } finally {
+        fileIo.closeSync(file);
+      }
       return '';
     } catch (error) {
-      return `invalid download data: ${errorSummary(error as Error)}`;
+      return `Failed to save download: ${errorSummary(error)}`;
     }
   }
 

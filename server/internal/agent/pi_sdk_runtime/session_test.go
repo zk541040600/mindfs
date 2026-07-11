@@ -904,8 +904,11 @@ func TestRuntimeModelModeControls(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if modes.CurrentModeID != "off" || len(modes.Modes) == 0 {
+	if modes.CurrentModeID != "off" || len(modes.Modes) < 7 {
 		t.Fatalf("modes = %+v", modes)
+	}
+	if modes.Modes[len(modes.Modes)-1].ID != "max" {
+		t.Fatalf("last mode = %+v, want max", modes.Modes[len(modes.Modes)-1])
 	}
 	if err := sess.SetMode(ctx, "high"); err != nil {
 		t.Fatal(err)

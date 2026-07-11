@@ -35,15 +35,15 @@ type Process struct {
 	client    *mindfsClient
 	waitCh    chan error
 
-	mu           sync.RWMutex
-	sessions     map[string]*sessionState // sessionKey -> state
-	sessionsByID map[string]*sessionState // ACP session id -> state
-	capability   CapabilitySnapshot
-	models       *acp.SessionModelState
-	modes        *acp.SessionModeState
-	commands     []acp.AvailableCommand
-	stderrHint   stderrHintState
-	activePrompt activePromptState
+	mu            sync.RWMutex
+	sessions      map[string]*sessionState // sessionKey -> state
+	sessionsByID  map[string]*sessionState // ACP session id -> state
+	capability    CapabilitySnapshot
+	modes         *acp.SessionModeState
+	configOptions []acp.SessionConfigOption
+	commands      []acp.AvailableCommand
+	stderrHint    stderrHintState
+	activePrompt  activePromptState
 
 	pendingPermissionMu sync.Mutex
 	pendingPermissions  map[string]*pendingPermissionRequest
@@ -72,8 +72,8 @@ var stderrMessagePattern = regexp.MustCompile(`"message"\s*:\s*"([^"]+)"`)
 
 type sessionState struct {
 	ID            acp.SessionId
-	models        *acp.SessionModelState
 	modes         *acp.SessionModeState
+	configOptions []acp.SessionConfigOption
 	commands      []acp.AvailableCommand
 	contextWindow types.ContextWindow
 	onUpdate      func(SessionUpdate)
@@ -110,18 +110,6 @@ func (s *sessionState) getOnUpdate() func(SessionUpdate) {
 	return s.onUpdate
 }
 
-func (s *sessionState) setModels(models *acp.SessionModelState) {
-	s.mu.Lock()
-	s.models = models
-	s.mu.Unlock()
-}
-
-func (s *sessionState) getModels() *acp.SessionModelState {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.models
-}
-
 func (s *sessionState) setModes(modes *acp.SessionModeState) {
 	s.mu.Lock()
 	s.modes = modes
@@ -132,6 +120,18 @@ func (s *sessionState) getModes() *acp.SessionModeState {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.modes
+}
+
+func (s *sessionState) setConfigOptions(options []acp.SessionConfigOption) {
+	s.mu.Lock()
+	s.configOptions = cloneConfigOptions(options)
+	s.mu.Unlock()
+}
+
+func (s *sessionState) getConfigOptions() []acp.SessionConfigOption {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return cloneConfigOptions(s.configOptions)
 }
 
 func (s *sessionState) setCommands(commands []acp.AvailableCommand) {
@@ -182,6 +182,7 @@ const (
 	UpdateTypeThoughtChunk UpdateType = "thought_chunk"
 	UpdateTypeToolCall     UpdateType = "tool_call"
 	UpdateTypeToolUpdate   UpdateType = "tool_update"
+	UpdateTypePlan         UpdateType = "plan_update"
 	UpdateTypeMessageDone  UpdateType = "message_done"
 	UpdateTypeExtensionUI  UpdateType = "extension_ui"
 )
@@ -232,6 +233,12 @@ func (c *mindfsClient) SessionUpdate(ctx context.Context, params acp.SessionNoti
 			c.proc.modes = state
 			c.proc.mu.Unlock()
 		}
+	}
+	if params.Update.ConfigOptionUpdate != nil {
+		session.setConfigOptions(params.Update.ConfigOptionUpdate.ConfigOptions)
+		c.proc.mu.Lock()
+		c.proc.configOptions = cloneConfigOptions(params.Update.ConfigOptionUpdate.ConfigOptions)
+		c.proc.mu.Unlock()
 	}
 	if params.Update.UsageUpdate != nil {
 		current := session.getContextWindow()
@@ -545,8 +552,8 @@ func (c *mindfsClient) WaitForTerminalExit(ctx context.Context, params acp.WaitF
 	return acp.WaitForTerminalExitResponse{}, nil
 }
 
-func (c *mindfsClient) KillTerminalCommand(ctx context.Context, params acp.KillTerminalCommandRequest) (acp.KillTerminalCommandResponse, error) {
-	return acp.KillTerminalCommandResponse{}, nil
+func (c *mindfsClient) KillTerminal(ctx context.Context, params acp.KillTerminalRequest) (acp.KillTerminalResponse, error) {
+	return acp.KillTerminalResponse{}, nil
 }
 
 func (c *mindfsClient) HandleExtensionMethod(_ context.Context, method string, params json.RawMessage) (any, error) {
@@ -690,21 +697,19 @@ func (p *Process) NewSession(ctx context.Context, sessionKey, cwd string) error 
 		log.Printf("[agent/acp] new_session.resp.raw agent=%s session_key=%s resp=%s", p.agentLabel(), sessionKey, string(raw))
 	}
 	sess := &sessionState{
-		ID:     resp.SessionId,
-		models: resp.Models,
-		modes:  resp.Modes,
+		ID:            resp.SessionId,
+		modes:         resp.Modes,
+		configOptions: cloneConfigOptions(resp.ConfigOptions),
 	}
 	p.mu.Lock()
 	if _, ok := p.sessions[sessionKey]; ok {
 		p.mu.Unlock()
 		return nil
 	}
-	if resp.Models != nil {
-		p.models = resp.Models
-	}
 	if resp.Modes != nil {
 		p.modes = resp.Modes
 	}
+	p.configOptions = cloneConfigOptions(resp.ConfigOptions)
 	p.sessions[sessionKey] = sess
 	p.sessionsByID[string(resp.SessionId)] = sess
 	p.mu.Unlock()
@@ -719,7 +724,7 @@ func (p *Process) ResumeSession(ctx context.Context, sessionKey, sessionID, cwd 
 	}
 	p.mu.Unlock()
 
-	resp, err := p.conn.UnstableResumeSession(ctx, acp.UnstableResumeSessionRequest{
+	resp, err := p.conn.ResumeSession(ctx, acp.ResumeSessionRequest{
 		Cwd:        cwd,
 		McpServers: []acp.McpServer{},
 		SessionId:  acp.SessionId(strings.TrimSpace(sessionID)),
@@ -728,27 +733,8 @@ func (p *Process) ResumeSession(ctx context.Context, sessionKey, sessionID, cwd 
 		return err
 	}
 	sess := &sessionState{
-		ID: acp.SessionId(strings.TrimSpace(sessionID)),
-	}
-	if resp.Models != nil {
-		modelState := &acp.SessionModelState{
-			CurrentModelId: acp.ModelId(resp.Models.CurrentModelId),
-			AvailableModels: func() []acp.ModelInfo {
-				if len(resp.Models.AvailableModels) == 0 {
-					return nil
-				}
-				items := make([]acp.ModelInfo, 0, len(resp.Models.AvailableModels))
-				for _, model := range resp.Models.AvailableModels {
-					items = append(items, acp.ModelInfo{
-						ModelId:     acp.ModelId(model.ModelId),
-						Name:        model.Name,
-						Description: model.Description,
-					})
-				}
-				return items
-			}(),
-		}
-		sess.models = modelState
+		ID:            acp.SessionId(strings.TrimSpace(sessionID)),
+		configOptions: cloneConfigOptions(resp.ConfigOptions),
 	}
 	if resp.Modes != nil {
 		sess.modes = resp.Modes
@@ -758,12 +744,10 @@ func (p *Process) ResumeSession(ctx context.Context, sessionKey, sessionID, cwd 
 		p.mu.Unlock()
 		return nil
 	}
-	if sess.models != nil {
-		p.models = sess.models
-	}
 	if sess.modes != nil {
 		p.modes = sess.modes
 	}
+	p.configOptions = cloneConfigOptions(resp.ConfigOptions)
 	p.sessions[sessionKey] = sess
 	p.sessionsByID[string(sess.ID)] = sess
 	p.mu.Unlock()
@@ -902,10 +886,10 @@ func (p *Process) Capability() CapabilitySnapshot {
 	return p.capability
 }
 
-func (p *Process) ModelState() *acp.SessionModelState {
+func (p *Process) ConfigOptions() []acp.SessionConfigOption {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	return p.models
+	return cloneConfigOptions(p.configOptions)
 }
 
 func (p *Process) ModeState() *acp.SessionModeState {
@@ -919,25 +903,48 @@ func (p *Process) SetModel(ctx context.Context, sessionKey, model string) error 
 	if sess == nil || strings.TrimSpace(model) == "" {
 		return nil
 	}
-	_, err := p.conn.UnstableSetSessionModel(ctx, acp.UnstableSetSessionModelRequest{
-		SessionId: sess.ID,
-		ModelId:   acp.UnstableModelId(strings.TrimSpace(model)),
-	})
-	if err == nil {
-		if state := sess.getModels(); state != nil {
-			state.CurrentModelId = acp.ModelId(strings.TrimSpace(model))
-			sess.setModels(state)
-			p.mu.Lock()
-			p.models = state
-			p.mu.Unlock()
-		}
+	options := sess.getConfigOptions()
+	option, ok := findSelectConfigOption(options, acp.SessionConfigOptionCategoryModel)
+	if !ok {
+		return nil
 	}
-	return err
+	resp, err := p.conn.SetSessionConfigOption(ctx, acp.SetSessionConfigOptionRequest{
+		ValueId: &acp.SetSessionConfigOptionValueId{
+			ConfigId:  option.Id,
+			SessionId: sess.ID,
+			Value:     acp.SessionConfigValueId(strings.TrimSpace(model)),
+		},
+	})
+	if err != nil {
+		return err
+	}
+	sess.setConfigOptions(resp.ConfigOptions)
+	p.mu.Lock()
+	p.configOptions = cloneConfigOptions(resp.ConfigOptions)
+	p.mu.Unlock()
+	return nil
 }
 
 func (p *Process) SetMode(ctx context.Context, sessionKey, mode string) error {
 	sess := p.getSessionByKey(sessionKey)
 	if sess == nil || strings.TrimSpace(mode) == "" {
+		return nil
+	}
+	if option, ok := findSelectConfigOption(sess.getConfigOptions(), acp.SessionConfigOptionCategoryMode); ok {
+		resp, err := p.conn.SetSessionConfigOption(ctx, acp.SetSessionConfigOptionRequest{
+			ValueId: &acp.SetSessionConfigOptionValueId{
+				ConfigId:  option.Id,
+				SessionId: sess.ID,
+				Value:     acp.SessionConfigValueId(strings.TrimSpace(mode)),
+			},
+		})
+		if err != nil {
+			return err
+		}
+		sess.setConfigOptions(resp.ConfigOptions)
+		p.mu.Lock()
+		p.configOptions = cloneConfigOptions(resp.ConfigOptions)
+		p.mu.Unlock()
 		return nil
 	}
 	_, err := p.conn.SetSessionMode(ctx, acp.SetSessionModeRequest{
@@ -956,12 +963,38 @@ func (p *Process) SetMode(ctx context.Context, sessionKey, mode string) error {
 	return err
 }
 
-func (p *Process) SessionModelState(sessionKey string) *acp.SessionModelState {
+func (p *Process) SetThoughtLevel(ctx context.Context, sessionKey, effort string) error {
+	sess := p.getSessionByKey(sessionKey)
+	if sess == nil || strings.TrimSpace(effort) == "" {
+		return nil
+	}
+	option, ok := findSelectConfigOption(sess.getConfigOptions(), acp.SessionConfigOptionCategoryThoughtLevel)
+	if !ok {
+		return nil
+	}
+	resp, err := p.conn.SetSessionConfigOption(ctx, acp.SetSessionConfigOptionRequest{
+		ValueId: &acp.SetSessionConfigOptionValueId{
+			ConfigId:  option.Id,
+			SessionId: sess.ID,
+			Value:     acp.SessionConfigValueId(strings.TrimSpace(effort)),
+		},
+	})
+	if err != nil {
+		return err
+	}
+	sess.setConfigOptions(resp.ConfigOptions)
+	p.mu.Lock()
+	p.configOptions = cloneConfigOptions(resp.ConfigOptions)
+	p.mu.Unlock()
+	return nil
+}
+
+func (p *Process) SessionConfigOptions(sessionKey string) []acp.SessionConfigOption {
 	sess := p.getSessionByKey(sessionKey)
 	if sess == nil {
 		return nil
 	}
-	return sess.getModels()
+	return sess.getConfigOptions()
 }
 
 func (p *Process) SessionModeState(sessionKey string) *acp.SessionModeState {
@@ -1021,6 +1054,8 @@ func wrapSessionUpdate(sessionID string, update acp.SessionUpdate) SessionUpdate
 		result.Type = UpdateTypeToolCall
 	case update.ToolCallUpdate != nil:
 		result.Type = UpdateTypeToolUpdate
+	case update.Plan != nil || update.PlanUpdate != nil:
+		result.Type = UpdateTypePlan
 	}
 	return result
 }

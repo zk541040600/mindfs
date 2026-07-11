@@ -1,7 +1,6 @@
 package com.mindfs.app;
 
 import android.app.DownloadManager;
-import android.content.ContentResolver;
 import android.content.ContentValues;
 import android.content.Context;
 import android.net.Uri;
@@ -62,87 +61,33 @@ public class NativeDownloadPlugin extends Plugin {
 
     @PluginMethod
     public void saveBase64(PluginCall call) {
-        String data = call.getString("data");
+        String dataBase64 = call.getString("dataBase64");
         String filename = sanitizeFilename(call.getString("filename"));
-        if (TextUtils.isEmpty(data)) {
-            call.reject("data is required");
+        String mimeType = call.getString("mimeType");
+
+        if (TextUtils.isEmpty(dataBase64)) {
+            call.reject("download content is empty");
             return;
         }
         if (TextUtils.isEmpty(filename)) {
             filename = "download";
         }
+        if (TextUtils.isEmpty(mimeType)) {
+            mimeType = "application/octet-stream";
+        }
+
         try {
-            Uri uri = saveBase64ToDownloads(getContext(), data, filename);
+            byte[] data = Base64.decode(dataBase64, Base64.DEFAULT);
+            String path = saveBytesToDownloads(getContext(), data, filename, mimeType);
+
             JSObject result = new JSObject();
             result.put("filename", filename);
             result.put("directory", Environment.DIRECTORY_DOWNLOADS);
-            result.put("uri", uri.toString());
+            result.put("path", path);
             call.resolve(result);
         } catch (Exception ex) {
             call.reject("Failed to save download: " + ex.getMessage(), ex);
         }
-    }
-
-    static Uri saveBase64ToDownloads(Context context, String data, String filename) throws Exception {
-        byte[] bytes = Base64.decode(data, Base64.DEFAULT);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            ContentResolver resolver = context.getContentResolver();
-            ContentValues values = new ContentValues();
-            values.put(MediaStore.MediaColumns.DISPLAY_NAME, filename);
-            values.put(MediaStore.MediaColumns.MIME_TYPE, "application/octet-stream");
-            values.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS);
-            values.put(MediaStore.MediaColumns.IS_PENDING, 1);
-            Uri uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
-            if (uri == null) {
-                throw new IllegalStateException("failed to create download entry");
-            }
-            try (OutputStream out = resolver.openOutputStream(uri)) {
-                if (out == null) {
-                    throw new IllegalStateException("failed to open download entry");
-                }
-                out.write(bytes);
-            } catch (Exception ex) {
-                resolver.delete(uri, null, null);
-                throw ex;
-            }
-            ContentValues done = new ContentValues();
-            done.put(MediaStore.MediaColumns.IS_PENDING, 0);
-            resolver.update(uri, done, null, null);
-            return uri;
-        }
-
-        File downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
-        try {
-            return writeBytesToUniqueFile(downloadsDir, filename, bytes);
-        } catch (Exception publicWriteError) {
-            File appDownloadsDir = context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
-            if (appDownloadsDir == null) {
-                throw publicWriteError;
-            }
-            return writeBytesToUniqueFile(appDownloadsDir, filename, bytes);
-        }
-    }
-
-    private static Uri writeBytesToUniqueFile(File directory, String filename, byte[] bytes) throws Exception {
-        if (!directory.exists() && !directory.mkdirs()) {
-            throw new IllegalStateException("failed to create downloads directory");
-        }
-        File target = uniqueDownloadFile(directory, filename);
-        try (OutputStream out = new FileOutputStream(target)) {
-            out.write(bytes);
-        }
-        return Uri.fromFile(target);
-    }
-
-    private static File uniqueDownloadFile(File directory, String filename) {
-        File candidate = new File(directory, filename);
-        int dotIndex = filename.lastIndexOf('.');
-        String base = dotIndex > 0 ? filename.substring(0, dotIndex) : filename;
-        String ext = dotIndex > 0 ? filename.substring(dotIndex) : "";
-        for (int index = 1; candidate.exists(); index += 1) {
-            candidate = new File(directory, base + " (" + index + ")" + ext);
-        }
-        return candidate;
     }
 
     static long enqueueDownload(DownloadManager downloadManager, String url, String filename) {
@@ -169,6 +114,80 @@ public class NativeDownloadPlugin extends Plugin {
         }
 
         return downloadManager.enqueue(request);
+    }
+
+    static String saveBytesToDownloads(Context context, byte[] data, String filename, String mimeType) throws Exception {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            ContentValues values = new ContentValues();
+            values.put(MediaStore.Downloads.DISPLAY_NAME, filename);
+            values.put(MediaStore.Downloads.MIME_TYPE, mimeType);
+            values.put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS);
+            values.put(MediaStore.Downloads.IS_PENDING, 1);
+
+            Uri uri = context.getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
+            if (uri == null) {
+                throw new IllegalStateException("MediaStore insert returned null");
+            }
+
+            try (OutputStream output = context.getContentResolver().openOutputStream(uri)) {
+                if (output == null) {
+                    throw new IllegalStateException("MediaStore output stream unavailable");
+                }
+                output.write(data);
+                output.flush();
+            } catch (Exception ex) {
+                context.getContentResolver().delete(uri, null, null);
+                throw ex;
+            }
+
+            ContentValues done = new ContentValues();
+            done.put(MediaStore.Downloads.IS_PENDING, 0);
+            context.getContentResolver().update(uri, done, null, null);
+            return uri.toString();
+        }
+
+        File downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
+        try {
+            return writeBytesToUniqueFile(downloadsDir, filename, data);
+        } catch (Exception publicWriteError) {
+            File appDownloadsDir = context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
+            if (appDownloadsDir == null) {
+                throw publicWriteError;
+            }
+            return writeBytesToUniqueFile(appDownloadsDir, filename, data);
+        }
+    }
+
+    private static String writeBytesToUniqueFile(File directory, String filename, byte[] data) throws Exception {
+        if (!directory.exists() && !directory.mkdirs()) {
+            throw new IllegalStateException("Downloads directory unavailable");
+        }
+        File outputFile = uniqueFile(directory, filename);
+        try (OutputStream output = new FileOutputStream(outputFile)) {
+            output.write(data);
+            output.flush();
+        }
+        return outputFile.getAbsolutePath();
+    }
+
+    private static File uniqueFile(File directory, String filename) {
+        File candidate = new File(directory, filename);
+        if (!candidate.exists()) {
+            return candidate;
+        }
+        String base = filename;
+        String ext = "";
+        int dot = filename.lastIndexOf('.');
+        if (dot > 0) {
+            base = filename.substring(0, dot);
+            ext = filename.substring(dot);
+        }
+        int index = 1;
+        do {
+            candidate = new File(directory, base + " (" + index + ")" + ext);
+            index += 1;
+        } while (candidate.exists());
+        return candidate;
     }
 
     static String sanitizeFilename(String filename) {

@@ -104,6 +104,7 @@ type ActionBarProps = {
   onSessionClick?: () => void;
   onToggleLeftSidebar?: () => void;
   onToggleRightSidebar?: () => void;
+  sidebarsSwapped?: boolean;
 };
 
 function wsStatusMeta(status: WSStatus): {
@@ -425,6 +426,7 @@ export function ActionBar({
   onToggleLeftSidebar,
   onToggleRightSidebar,
   mobileEnterKeySends = false,
+  sidebarsSwapped = false,
 }: ActionBarProps) {
   const [mode, setMode] = useState<SessionMode>("chat");
   const [agent, setAgent] = useState("");
@@ -882,7 +884,7 @@ export function ActionBar({
         requestAnimationFrame(() => editorRef.current?.focus());
       }
     }
-  }, [serializedInput, pendingAttachments, isConnected, sending, mode, agent, planSessionKey, planRootId, onSetPlanMode, isMobile, model, agentMode, onSendMessage, currentRootId, supportsEffort, effort, supportsServiceTier, fastService, shell]);
+  }, [serializedInput, pendingAttachments, isConnected, sending, mode, agent, currentRootId, planSessionKey, planRootId, onSetPlanMode, isMobile, model, agentMode, onSendMessage, supportsEffort, effort, supportsServiceTier, fastService, shell]);
 
   const handleCancel = useCallback(async () => {
     const sessionKey = currentSession?.key;
@@ -1099,6 +1101,34 @@ export function ActionBar({
   const editorRightInset = isMultiLine ? 14 : mode === "command" ? (isMobile ? 92 : 116) : isMobile ? 124 : 148;
   const editorBottomInset = isMultiLine ? 44 : 12;
   const editorMinHeight = 44;
+  const mobileFileSidebarButton = isMobile ? (
+    <button
+      type="button"
+      onClick={onToggleLeftSidebar}
+      style={{ width: "30px", height: "44px", borderRadius: "0", border: "none", background: "transparent", color: "var(--text-secondary)", display: "inline-flex", alignItems: "center", justifyContent: "center", cursor: "pointer", opacity: 0.86, outline: "none", boxShadow: "none", WebkitTapHighlightColor: "transparent" as any, overflow: "hidden" }}
+      aria-label="打开文件侧栏"
+      title="文件侧栏"
+    >
+      <svg xmlns="http://www.w3.org/2000/svg" width="30" height="30" viewBox="0 0 24 24" fill="none">
+        <path fill="currentColor" d="M3 3h6v4H3zm12 7h6v4h-6zm0 7h6v4h-6zm-2-4H7v5h6v2H5V9h2v2h6z" style={{ transform: "scale(1.28)", transformOrigin: "12px 12px" }} />
+      </svg>
+    </button>
+  ) : null;
+  const mobileSessionSidebarButton = isMobile ? (
+    <button
+      type="button"
+      onClick={onToggleRightSidebar}
+      style={{ width: "30px", height: "44px", borderRadius: "0", border: "none", background: "transparent", color: "var(--text-secondary)", display: "inline-flex", alignItems: "center", justifyContent: "center", cursor: "pointer", opacity: 0.86, outline: "none", boxShadow: "none", WebkitTapHighlightColor: "transparent" as any, overflow: "hidden" }}
+      aria-label="打开会话侧栏"
+      title="会话侧栏"
+    >
+      <svg xmlns="http://www.w3.org/2000/svg" width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3.8" strokeLinecap="round">
+        <line x1="6" y1="4" x2="18" y2="4" />
+        <line x1="6" y1="12" x2="18" y2="12" />
+        <line x1="6" y1="20" x2="18" y2="20" />
+      </svg>
+    </button>
+  ) : null;
 
   return (
     <div style={{ width: "100%", minWidth: 0, padding: isMobile ? "0 0 var(--mindfs-actionbar-bottom-padding, calc(env(safe-area-inset-bottom, 0px) + 2px))" : "0 16px 12px", display: "flex", justifyContent: "center", boxSizing: "border-box", background: "var(--content-bg)" }}>
@@ -1264,19 +1294,7 @@ export function ActionBar({
           </div>
         ) : null}
         <div style={{ display: "grid", gridTemplateColumns: isMobile ? "30px minmax(0, 1fr) 30px" : "1fr", alignItems: "center", gap: isMobile ? "1px" : 0, padding: isMobile ? "0 1px" : 0, minWidth: 0, maxWidth: "100%" }}>
-          {isMobile ? (
-            <button
-              type="button"
-              onClick={onToggleLeftSidebar}
-              style={{ width: "30px", height: "44px", borderRadius: "0", border: "none", background: "transparent", color: "var(--text-secondary)", display: "inline-flex", alignItems: "center", justifyContent: "center", cursor: "pointer", opacity: 0.86, outline: "none", boxShadow: "none", WebkitTapHighlightColor: "transparent" as any, overflow: "hidden" }}
-              aria-label="打开文件侧栏"
-              title="文件侧栏"
-            >
-              <svg xmlns="http://www.w3.org/2000/svg" width="30" height="30" viewBox="0 0 24 24" fill="none">
-                <path fill="currentColor" d="M3 3h6v4H3zm12 7h6v4h-6zm0 7h6v4h-6zm-2-4H7v5h6v2H5V9h2v2h6z" style={{ transform: "scale(1.28)", transformOrigin: "12px 12px" }} />
-              </svg>
-            </button>
-          ) : null}
+          {sidebarsSwapped ? mobileSessionSidebarButton : mobileFileSidebarButton}
 
           <div
             style={{
@@ -1569,34 +1587,36 @@ export function ActionBar({
 
               <ModeSelector mode={mode} onModeChange={setMode} compact={true} disabled={isModeLocked} />
               {mode !== "command" ? (
-                <AgentSelector
-                  agent={agent}
-                  model={model}
-                  mode={agentMode}
-                  effort={effort}
-                  agents={agents}
-                  onAgentChange={(nextAgent, nextModel) => {
-                    const nextStatus = agents.find((item) => item.name === nextAgent);
-                    const defaults = getAgentDefaults(nextStatus, nextModel);
-                    setAgent(nextAgent);
-                    setModel(defaults.model);
-                    setAgentMode(defaults.mode);
-                    setEffort(defaults.effort);
-                    setFastService(defaults.fastService);
-                  }}
-                  onModeChange={(nextAgentMode) => setAgentMode(nextAgentMode || "")}
-                  onEffortChange={(nextEffort) => setEffort(nextEffort || "")}
-                  fastService={fastService}
-                  onFastServiceChange={(nextFastService) => setFastService(nextFastService || "")}
-                  onAgentRefresh={handleAgentRefresh}
-                  onAgentRestart={async (targetAgent) => {
-                    await restartAgent(targetAgent);
-                    const items = await fetchAgents({ force: true, refreshAgent: targetAgent });
-                    setAgents(items);
-                  }}
-                  compact={true}
-                  warnUnavailable={isSelectedAgentUnavailable}
-                />
+                <div>
+                  <AgentSelector
+                    agent={agent}
+                    model={model}
+                    mode={agentMode}
+                    effort={effort}
+                    agents={agents}
+                    onAgentChange={(nextAgent, nextModel) => {
+                      const nextStatus = agents.find((item) => item.name === nextAgent);
+                      const defaults = getAgentDefaults(nextStatus, nextModel);
+                      setAgent(nextAgent);
+                      setModel(defaults.model);
+                      setAgentMode(defaults.mode);
+                      setEffort(defaults.effort);
+                      setFastService(defaults.fastService);
+                    }}
+                    onModeChange={(nextAgentMode) => setAgentMode(nextAgentMode || "")}
+                    onEffortChange={(nextEffort) => setEffort(nextEffort || "")}
+                    fastService={fastService}
+                    onFastServiceChange={(nextFastService) => setFastService(nextFastService || "")}
+                    onAgentRefresh={handleAgentRefresh}
+                    onAgentRestart={async (targetAgent) => {
+                      await restartAgent(targetAgent);
+                      const items = await fetchAgents({ force: true, refreshAgent: targetAgent });
+                      setAgents(items);
+                    }}
+                    compact={true}
+                    warnUnavailable={isSelectedAgentUnavailable}
+                  />
+                </div>
               ) : (
                 <ShellSelector
                   shell={shell}
@@ -1666,21 +1686,7 @@ export function ActionBar({
           </div>
           </div>
 
-          {isMobile ? (
-            <button
-              type="button"
-              onClick={onToggleRightSidebar}
-              style={{ width: "30px", height: "44px", borderRadius: "0", border: "none", background: "transparent", color: "var(--text-secondary)", display: "inline-flex", alignItems: "center", justifyContent: "center", cursor: "pointer", opacity: 0.86, outline: "none", boxShadow: "none", WebkitTapHighlightColor: "transparent" as any, overflow: "hidden" }}
-              aria-label="打开会话侧栏"
-              title="会话侧栏"
-            >
-              <svg xmlns="http://www.w3.org/2000/svg" width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3.8" strokeLinecap="round">
-                <line x1="6" y1="4" x2="18" y2="4" />
-                <line x1="6" y1="12" x2="18" y2="12" />
-                <line x1="6" y1="20" x2="18" y2="20" />
-              </svg>
-            </button>
-          ) : null}
+          {sidebarsSwapped ? mobileFileSidebarButton : mobileSessionSidebarButton}
         </div>
         {attachedFileContext ? (
           <div style={{ display: "flex", flexWrap: "wrap", gap: "6px", padding: isMobile ? "6px 4px 0" : "0 4px" }}>

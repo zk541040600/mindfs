@@ -206,7 +206,8 @@ type ReadFileOutput struct {
 }
 
 type GitStatusInput struct {
-	RootID string
+	RootID   string
+	RootPath string
 }
 
 type GitStatusOutput struct {
@@ -214,8 +215,9 @@ type GitStatusOutput struct {
 }
 
 type GitDiffInput struct {
-	RootID string
-	Path   string
+	RootID   string
+	RepoPath string
+	Path     string
 }
 
 type GitDiffOutput struct {
@@ -252,6 +254,18 @@ type GitCommitDiffOutput struct {
 	Diff gitview.DiffResult
 }
 
+type GitRelatedFileDiffInput struct {
+	RootID   string
+	RepoPath string
+	RepoKind string
+	Head     string
+	Path     string
+}
+
+type GitRelatedFileDiffOutput struct {
+	Diff gitview.RelatedFileDiffResult
+}
+
 func (s *Service) ReadFile(ctx context.Context, in ReadFileInput) (ReadFileOutput, error) {
 	if err := s.ensureRegistry(); err != nil {
 		return ReadFileOutput{}, err
@@ -283,6 +297,17 @@ func (s *Service) ReadFile(ctx context.Context, in ReadFileInput) (ReadFileOutpu
 }
 
 func (s *Service) GetGitStatus(ctx context.Context, in GitStatusInput) (GitStatusOutput, error) {
+	if strings.TrimSpace(in.RootPath) != "" {
+		rootPath := filepath.Clean(strings.TrimSpace(in.RootPath))
+		if !filepath.IsAbs(rootPath) {
+			return GitStatusOutput{}, errors.New("path must be absolute")
+		}
+		status, err := gitview.InspectStatus(ctx, rootPath)
+		if err != nil {
+			return GitStatusOutput{}, err
+		}
+		return GitStatusOutput{Status: status}, nil
+	}
 	if err := s.ensureRegistry(); err != nil {
 		return GitStatusOutput{}, err
 	}
@@ -308,17 +333,30 @@ func (s *Service) GetGitDiff(ctx context.Context, in GitDiffInput) (GitDiffOutpu
 	if strings.TrimSpace(in.Path) == "" {
 		return GitDiffOutput{}, errors.New("path required")
 	}
-	path, err := root.NormalizePath(in.Path)
+	path := strings.TrimSpace(in.Path)
+	repoPath := strings.TrimSpace(in.RepoPath)
+	rootPath := root.RootPath
+	if repoPath != "" {
+		if !filepath.IsAbs(repoPath) {
+			return GitDiffOutput{}, errors.New("repo path must be absolute")
+		}
+		rootPath = filepath.Clean(repoPath)
+	} else {
+		var err error
+		path, err = root.NormalizePath(path)
+		if err != nil {
+			return GitDiffOutput{}, err
+		}
+	}
+	diff, err := gitview.ReadDiff(ctx, rootPath, path)
 	if err != nil {
 		return GitDiffOutput{}, err
 	}
-	diff, err := gitview.ReadDiff(ctx, root.RootPath, path)
-	if err != nil {
-		return GitDiffOutput{}, err
-	}
-	meta, err := root.GetFileMeta(path)
-	if err != nil {
-		meta = nil
+	var meta []fs.FileMetaEntry
+	if repoPath == "" || sameManagedDirPath(repoPath, root.RootPath) {
+		if value, err := root.GetFileMeta(path); err == nil {
+			meta = value
+		}
 	}
 	diff.FileMeta = fillFileMetaSessionInfo(ctx, s, in.RootID, meta)
 	return GitDiffOutput{Diff: diff}, nil
@@ -385,6 +423,101 @@ func (s *Service) GetGitCommitDiff(ctx context.Context, in GitCommitDiffInput) (
 	}
 	diff.FileMeta = fillFileMetaSessionInfo(ctx, s, in.RootID, meta)
 	return GitCommitDiffOutput{Diff: diff}, nil
+}
+
+func (s *Service) GetGitRelatedFileDiff(ctx context.Context, in GitRelatedFileDiffInput) (GitRelatedFileDiffOutput, error) {
+	if err := s.ensureRegistry(); err != nil {
+		return GitRelatedFileDiffOutput{}, err
+	}
+	root, err := s.Registry.GetRoot(in.RootID)
+	if err != nil {
+		return GitRelatedFileDiffOutput{}, err
+	}
+	if strings.TrimSpace(in.Path) == "" {
+		return GitRelatedFileDiffOutput{}, errors.New("path required")
+	}
+	rootPath, repoPath, path, head, err := resolveGitRelatedFileDiffTarget(ctx, root, in)
+	if err != nil {
+		return GitRelatedFileDiffOutput{}, err
+	}
+	diff, err := gitview.ReadRelatedFileDiff(ctx, rootPath, head, path)
+	if err != nil {
+		return GitRelatedFileDiffOutput{}, err
+	}
+	var meta []fs.FileMetaEntry
+	if repoPath == "" || sameManagedDirPath(repoPath, root.RootPath) {
+		if value, err := root.GetFileMeta(path); err == nil {
+			meta = value
+		}
+	}
+	diff.FileMeta = fillFileMetaSessionInfo(ctx, s, in.RootID, meta)
+	return GitRelatedFileDiffOutput{Diff: diff}, nil
+}
+
+func resolveGitRelatedFileDiffTarget(ctx context.Context, root fs.RootInfo, in GitRelatedFileDiffInput) (string, string, string, string, error) {
+	path := strings.TrimSpace(in.Path)
+	repoPath := strings.TrimSpace(in.RepoPath)
+	rootPath := root.RootPath
+	head := strings.TrimSpace(in.Head)
+	var normalizedRootRelPath string
+	if repoPath != "" {
+		if !filepath.IsAbs(repoPath) {
+			return "", "", "", "", errors.New("repo path must be absolute")
+		}
+		rootPath = filepath.Clean(repoPath)
+		if value, err := root.NormalizePath(path); err == nil {
+			normalizedRootRelPath = value
+		}
+	} else {
+		value, err := root.NormalizePath(path)
+		if err != nil {
+			return "", "", "", "", err
+		}
+		path = value
+		normalizedRootRelPath = value
+	}
+	if normalizedRootRelPath != "" {
+		if fallbackRepoPath, fallbackRelPath, fallbackHead, ok := resolveTaskWorktreeRelatedFile(ctx, root.RootPath, normalizedRootRelPath); ok {
+			rootPath = fallbackRepoPath
+			repoPath = fallbackRepoPath
+			path = fallbackRelPath
+			if head == "" {
+				head = fallbackHead
+			}
+		}
+	}
+	return rootPath, repoPath, path, head, nil
+}
+
+func resolveTaskWorktreeRelatedFile(ctx context.Context, rootPath, relPath string) (string, string, string, bool) {
+	relPath = filepath.ToSlash(strings.TrimSpace(relPath))
+	if relPath == "" {
+		return "", "", "", false
+	}
+	if !strings.HasPrefix(relPath, ".worktree/task-") {
+		return "", "", "", false
+	}
+	absPath := filepath.Clean(filepath.Join(rootPath, filepath.FromSlash(relPath)))
+	if resolvedAbsPath, err := filepath.EvalSymlinks(absPath); err == nil {
+		absPath = filepath.Clean(resolvedAbsPath)
+	}
+	repo, err := gitview.ResolveRepositoryForPath(ctx, absPath)
+	if err != nil || strings.TrimSpace(repo.Path) == "" {
+		return "", "", "", false
+	}
+	repoPath := filepath.Clean(repo.Path)
+	rootClean := filepath.Clean(rootPath)
+	if resolvedRootPath, err := filepath.EvalSymlinks(rootClean); err == nil {
+		rootClean = filepath.Clean(resolvedRootPath)
+	}
+	if sameManagedDirPath(repoPath, rootClean) {
+		return "", "", "", false
+	}
+	fileRel, err := filepath.Rel(repoPath, absPath)
+	if err != nil || fileRel == "." || filepath.IsAbs(fileRel) || strings.HasPrefix(fileRel, ".."+string(filepath.Separator)) || fileRel == ".." {
+		return "", "", "", false
+	}
+	return repoPath, filepath.ToSlash(fileRel), strings.TrimSpace(repo.Head), true
 }
 
 func resolveUploadDir(root fs.RootInfo, dir string) (string, string, error) {
