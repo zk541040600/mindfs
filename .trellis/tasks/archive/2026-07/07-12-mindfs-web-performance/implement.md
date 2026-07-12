@@ -39,4 +39,4 @@
 
 - [x] Present the required one-shot commit plan and obtain confirmation.
 - [x] Commit only approved source, tests, task evidence, and spec updates; exclude generated dist, binaries, logs, backups, and temporary analysis.
-- [ ] Validate task metadata and archive the task; record the completed session afterward.
+- [x] Validate task metadata and archive the task. The completed session is recorded afterward as repository bookkeeping.

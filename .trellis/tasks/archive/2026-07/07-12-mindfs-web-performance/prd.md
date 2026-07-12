@@ -35,4 +35,4 @@ Reduce MindFS cold-start transfer and JavaScript startup work, and bound high-fr
 - [x] `go test ./...`, `go vet ./...`, web typecheck/build, app-shell builds, complete Playwright, bridge syntax, and whitespace checks pass.
 - [x] Bundle comparison and residual trade-offs are recorded in task evidence.
 - [x] If deployment is approved, direct and relay/static behavior, response encoding, browser loading, service health, and rollback readiness are verified against the running service.
-- [ ] Approved commits are created, the session is recorded, task metadata validates, and the task is archived.
+- [x] Approved source/evidence commits are created, task metadata validates, and the task is archived; the completed session is recorded afterward as repository bookkeeping.
