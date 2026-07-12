@@ -57,4 +57,4 @@
 - [x] Record validation evidence, deployment SHA/PIDs, rollback paths, and residual agent-configuration risks in the task.
 - [x] Present the required one-shot commit plan for confirmation.
 - [x] Commit only user-approved files; do not include unrelated or operational artifacts.
-- [ ] Validate task metadata and archive the task; record the completed session afterward.
+- [x] Validate task metadata and archive the task. The completed session is recorded afterward as repository bookkeeping.

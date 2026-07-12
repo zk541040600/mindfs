@@ -1,4 +1,4 @@
 {"_example": "Fill with {\"file\": \"<path>\", \"reason\": \"<why>\"}. Put spec/research files only — no code paths. Run `python3 .trellis/scripts/get_context.py --mode packages` to list available specs. Delete this line once real entries are added."}
 {"file": ".trellis/spec/backend/index.md", "reason": "Backend API, persistence, shutdown, and test ownership."}
 {"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "Browser-WebSocket-API-session-store state contract spans multiple layers."}
-{"file": ".trellis/tasks/07-12-mindfs-web-reliability/research/runtime-evidence.md", "reason": "Observed failures, confirmed root causes, and live validation boundary."}
+{"file": ".trellis/tasks/archive/2026-07/07-12-mindfs-web-reliability/research/runtime-evidence.md", "reason": "Observed failures, confirmed root causes, and live validation boundary."}
