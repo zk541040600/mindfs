@@ -1324,7 +1324,17 @@ func (h *HTTPHandler) serveStaticAsset(w http.ResponseWriter, r *http.Request) b
 			serveRewrittenStaticAsset(w, r, assetPath)
 			return true
 		}
-		http.ServeFile(w, r, assetPath)
+		selectedPath, encoding, varies := selectStaticAssetRepresentation(assetPath, r.Header.Get("Accept-Encoding"))
+		if varies {
+			addVaryHeader(w.Header(), "Accept-Encoding")
+		}
+		if encoding != "" {
+			if contentType := mime.TypeByExtension(filepath.Ext(assetPath)); contentType != "" {
+				w.Header().Set("Content-Type", contentType)
+			}
+			w.Header().Set("Content-Encoding", encoding)
+		}
+		http.ServeFile(w, r, selectedPath)
 		return true
 	}
 
@@ -1421,6 +1431,112 @@ func renderFallbackFrontend(content, notice string) string {
 	}
 	out = strings.ReplaceAll(out, "__FALLBACK_NOTICE__", noticeHTML)
 	return out
+}
+
+type staticAssetRepresentation struct {
+	path     string
+	encoding string
+	quality  float64
+	priority int
+}
+
+func selectStaticAssetRepresentation(assetPath, acceptEncoding string) (string, string, bool) {
+	brotliPath := assetPath + ".br"
+	gzipPath := assetPath + ".gz"
+	brotliAvailable := isRegularFile(brotliPath)
+	gzipAvailable := isRegularFile(gzipPath)
+	varies := brotliAvailable || gzipAvailable
+	if !varies {
+		return assetPath, "", false
+	}
+
+	candidates := make([]staticAssetRepresentation, 0, 2)
+	if brotliAvailable {
+		candidates = append(candidates, staticAssetRepresentation{
+			path:     brotliPath,
+			encoding: "br",
+			quality:  acceptedEncodingQuality(acceptEncoding, "br"),
+			priority: 2,
+		})
+	}
+	if gzipAvailable {
+		candidates = append(candidates, staticAssetRepresentation{
+			path:     gzipPath,
+			encoding: "gzip",
+			quality:  acceptedEncodingQuality(acceptEncoding, "gzip"),
+			priority: 1,
+		})
+	}
+
+	selected := staticAssetRepresentation{}
+	for _, candidate := range candidates {
+		if candidate.quality <= 0 {
+			continue
+		}
+		if candidate.quality > selected.quality ||
+			(candidate.quality == selected.quality && candidate.priority > selected.priority) {
+			selected = candidate
+		}
+	}
+	if selected.encoding == "" {
+		return assetPath, "", true
+	}
+	return selected.path, selected.encoding, true
+}
+
+func acceptedEncodingQuality(headerValue, encoding string) float64 {
+	explicitQuality := -1.0
+	wildcardQuality := -1.0
+	for _, rawItem := range strings.Split(headerValue, ",") {
+		parts := strings.Split(rawItem, ";")
+		name := strings.ToLower(strings.TrimSpace(parts[0]))
+		if name == "" {
+			continue
+		}
+		quality := 1.0
+		for _, rawParam := range parts[1:] {
+			key, value, ok := strings.Cut(rawParam, "=")
+			if !ok || !strings.EqualFold(strings.TrimSpace(key), "q") {
+				continue
+			}
+			parsed, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
+			if err != nil || parsed < 0 || parsed > 1 {
+				quality = 0
+				continue
+			}
+			quality = parsed
+		}
+		if name == strings.ToLower(encoding) {
+			explicitQuality = quality
+			continue
+		}
+		if name == "*" {
+			wildcardQuality = quality
+		}
+	}
+	if explicitQuality >= 0 {
+		return explicitQuality
+	}
+	if wildcardQuality >= 0 {
+		return wildcardQuality
+	}
+	return 0
+}
+
+func isRegularFile(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
+}
+
+func addVaryHeader(header http.Header, value string) {
+	for _, current := range header.Values("Vary") {
+		for _, item := range strings.Split(current, ",") {
+			if strings.EqualFold(strings.TrimSpace(item), value) {
+				return
+			}
+		}
+	}
+	header.Add("Vary", value)
 }
 
 func applyStaticCacheHeaders(w http.ResponseWriter, cleanPath string) {

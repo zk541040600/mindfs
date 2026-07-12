@@ -85,6 +85,164 @@ func TestPathForStaticAssetCleansURLPaths(t *testing.T) {
 	}
 }
 
+func TestServeStaticAssetNegotiatesPrecompressedRepresentations(t *testing.T) {
+	staticDir := t.TempDir()
+	assetsDir := filepath.Join(staticDir, "assets")
+	if err := os.Mkdir(assetsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	identity := []byte("console.log('identity')")
+	brotli := []byte("brotli-representation")
+	gzip := []byte("gzip-representation")
+	assetPath := filepath.Join(assetsDir, "index-test.js")
+	if err := os.WriteFile(assetPath, identity, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(assetPath+".br", brotli, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(assetPath+".gz", gzip, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tt := range []struct {
+		name           string
+		method         string
+		requestPath    string
+		acceptEncoding string
+		wantEncoding   string
+		wantBody       []byte
+	}{
+		{
+			name:           "brotli preferred on equal quality",
+			method:         http.MethodGet,
+			requestPath:    "/assets/index-test.js",
+			acceptEncoding: "gzip, br",
+			wantEncoding:   "br",
+			wantBody:       brotli,
+		},
+		{
+			name:           "higher gzip quality wins",
+			method:         http.MethodGet,
+			requestPath:    "/assets/index-test.js",
+			acceptEncoding: "br;q=0.2, gzip;q=0.8",
+			wantEncoding:   "gzip",
+			wantBody:       gzip,
+		},
+		{
+			name:           "disabled encodings use identity",
+			method:         http.MethodGet,
+			requestPath:    "/assets/index-test.js",
+			acceptEncoding: "br;q=0, gzip;q=0",
+			wantBody:       identity,
+		},
+		{
+			name:        "missing header uses identity",
+			method:      http.MethodGet,
+			requestPath: "/assets/index-test.js",
+			wantBody:    identity,
+		},
+		{
+			name:           "relay alias negotiates brotli",
+			method:         http.MethodGet,
+			requestPath:    "/mindfs-assets/index-test.js",
+			acceptEncoding: "br",
+			wantEncoding:   "br",
+			wantBody:       brotli,
+		},
+		{
+			name:           "head exposes compressed representation headers",
+			method:         http.MethodHead,
+			requestPath:    "/assets/index-test.js",
+			acceptEncoding: "gzip",
+			wantEncoding:   "gzip",
+			wantBody:       nil,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			handler := &HTTPHandler{StaticDir: staticDir}
+			req := httptest.NewRequest(tt.method, tt.requestPath, nil)
+			if tt.acceptEncoding != "" {
+				req.Header.Set("Accept-Encoding", tt.acceptEncoding)
+			}
+			resp := httptest.NewRecorder()
+			resp.Header().Set("Vary", "Origin")
+
+			if !handler.serveStaticAsset(resp, req) {
+				t.Fatal("serveStaticAsset returned false")
+			}
+			if got := resp.Header().Get("Content-Encoding"); got != tt.wantEncoding {
+				t.Fatalf("Content-Encoding = %q, want %q", got, tt.wantEncoding)
+			}
+			if got := resp.Header().Get("Content-Type"); !strings.Contains(got, "javascript") {
+				t.Fatalf("Content-Type = %q, want JavaScript", got)
+			}
+			vary := strings.Join(resp.Header().Values("Vary"), ",")
+			if !strings.Contains(vary, "Origin") || !strings.Contains(vary, "Accept-Encoding") {
+				t.Fatalf("Vary = %q, want Origin and Accept-Encoding", vary)
+			}
+			if got := resp.Header().Get("Cache-Control"); got != "public, max-age=31536000, immutable" {
+				t.Fatalf("Cache-Control = %q", got)
+			}
+			if !bytes.Equal(resp.Body.Bytes(), tt.wantBody) {
+				t.Fatalf("body = %q, want %q", resp.Body.Bytes(), tt.wantBody)
+			}
+		})
+	}
+}
+
+func TestAcceptedEncodingQuality(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		header   string
+		encoding string
+		want     float64
+	}{
+		{name: "explicit default", header: "gzip, br", encoding: "br", want: 1},
+		{name: "case insensitive", header: "BR;Q=0.7", encoding: "br", want: 0.7},
+		{name: "wildcard fallback", header: "*;q=0.4", encoding: "gzip", want: 0.4},
+		{name: "explicit disable overrides wildcard", header: "br;q=0, *;q=0.8", encoding: "br", want: 0},
+		{name: "invalid quality disables encoding", header: "gzip;q=invalid", encoding: "gzip", want: 0},
+		{name: "unlisted encoding rejected", header: "zstd", encoding: "br", want: 0},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := acceptedEncodingQuality(tt.header, tt.encoding); got != tt.want {
+				t.Fatalf("acceptedEncodingQuality(%q, %q) = %v, want %v", tt.header, tt.encoding, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestServeStaticAssetFallsBackWithoutPrecompressedSibling(t *testing.T) {
+	staticDir := t.TempDir()
+	assetPath := filepath.Join(staticDir, "assets", "index-test.js")
+	if err := os.Mkdir(filepath.Dir(assetPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	identity := []byte("console.log('identity')")
+	if err := os.WriteFile(assetPath, identity, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	handler := &HTTPHandler{StaticDir: staticDir}
+	req := httptest.NewRequest(http.MethodGet, "/assets/index-test.js", nil)
+	req.Header.Set("Accept-Encoding", "br, gzip")
+	resp := httptest.NewRecorder()
+
+	if !handler.serveStaticAsset(resp, req) {
+		t.Fatal("serveStaticAsset returned false")
+	}
+	if got := resp.Header().Get("Content-Encoding"); got != "" {
+		t.Fatalf("Content-Encoding = %q, want identity", got)
+	}
+	if got := resp.Header().Get("Vary"); got != "" {
+		t.Fatalf("Vary = %q without alternative representations", got)
+	}
+	if !bytes.Equal(resp.Body.Bytes(), identity) {
+		t.Fatalf("body = %q, want %q", resp.Body.Bytes(), identity)
+	}
+}
+
 func TestServeFrontendIndexRewritesRelayedAssetRefsForReleaseVersion(t *testing.T) {
 	staticDir := t.TempDir()
 	if err := os.Mkdir(filepath.Join(staticDir, "assets"), 0o755); err != nil {

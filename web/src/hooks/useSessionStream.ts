@@ -516,38 +516,72 @@ export function useSessionStream(
       sessionPending && sessionService.isSessionStreaming(sessionKey),
     );
 
+    let streamFrame: number | null = null;
+    const scheduleStreamVersion = () => {
+      if (streamFrame !== null) {
+        return;
+      }
+      streamFrame = window.requestAnimationFrame(() => {
+        streamFrame = null;
+        setStreamVersion((value) => value + 1);
+      });
+    };
+    const flushScheduledStreamVersion = () => {
+      if (streamFrame === null) {
+        return;
+      }
+      window.cancelAnimationFrame(streamFrame);
+      streamFrame = null;
+      setStreamVersion((value) => value + 1);
+    };
+    const publishStreamVersion = () => {
+      if (streamFrame !== null) {
+        window.cancelAnimationFrame(streamFrame);
+        streamFrame = null;
+      }
+      setStreamVersion((value) => value + 1);
+    };
+
     const unsubscribe = sessionService.subscribe(sessionKey, {
       onStream: (event) => {
-        setStreamVersion((value) => value + 1);
         if (event.type === "recovery") {
+          publishStreamVersion();
           setStreamStatusText(event.data?.message || "遇到错误，重试中...");
           setIsStreaming(true);
           return;
         }
-        if (event.type === "message_chunk") {
-          setStreamStatusText("");
-        }
         if (event.type === "message_done") {
+          publishStreamVersion();
           return;
         }
         if (event.type === "error") {
+          publishStreamVersion();
           setStreamStatusText("");
           setIsStreaming(false);
-        } else {
-          setIsStreaming(true);
+          return;
         }
+        scheduleStreamVersion();
+        if (event.type === "message_chunk") {
+          setStreamStatusText("");
+        }
+        setIsStreaming(true);
       },
       onDone: () => {
+        flushScheduledStreamVersion();
         setStreamStatusText("");
         setIsStreaming(false);
       },
       onError: () => {
+        flushScheduledStreamVersion();
         setStreamStatusText("");
         setIsStreaming(false);
       },
     });
 
     return () => {
+      if (streamFrame !== null) {
+        window.cancelAnimationFrame(streamFrame);
+      }
       unsubscribe();
     };
   }, [sessionKey, sessionPending]);

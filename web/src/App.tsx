@@ -6,7 +6,6 @@ import React, {
   useState,
 } from "react";
 import { getViewModeSystemPrompt } from "./renderer/viewCatalog";
-import { Renderer } from "./renderer/Renderer";
 import {
   clearCachedSessionsForRoot,
   deleteCachedSession,
@@ -100,8 +99,6 @@ import { isNativeShellRuntime } from "./services/runtime";
 import { AppShell } from "./layout/AppShell";
 import { ModeIcon } from "./components/ModeIcon";
 import { FileTree } from "./components/FileTree";
-import { FileViewer } from "./components/FileViewer";
-import { GitDiffViewer } from "./components/GitDiffViewer";
 import { GitHistoryPanel } from "./components/GitHistoryPanel";
 import { GitStatusPanel } from "./components/GitStatusPanel";
 import { SessionViewer } from "./components/SessionViewer";
@@ -113,8 +110,6 @@ import { AgentMenuList } from "./components/AgentMenuList";
 import { ActionBar } from "./components/ActionBar";
 import { ToastContainer } from "./components/Toast";
 import { BottomSheet } from "./components/BottomSheet";
-import { ScheduledAgentTaskDialog } from "./components/ScheduledAgentTaskDialog";
-import { TaskTemplateDialog } from "./components/TaskTemplateDialog";
 import { renderToolIcon } from "./components/stream/ToolCallCard";
 import TokenEditor, { type TokenEditorHandle } from "./components/editor/TokenEditor";
 import {
@@ -150,6 +145,42 @@ import {
   type StageTemplate,
   type TaskTemplate,
 } from "./services/tasks";
+
+const Renderer = React.lazy(() =>
+  import("./renderer/Renderer").then((module) => ({ default: module.Renderer })),
+);
+const FileViewer = React.lazy(() =>
+  import("./components/FileViewer").then((module) => ({ default: module.FileViewer })),
+);
+const GitDiffViewer = React.lazy(() =>
+  import("./components/GitDiffViewer").then((module) => ({ default: module.GitDiffViewer })),
+);
+const ScheduledAgentTaskDialog = React.lazy(() =>
+  import("./components/ScheduledAgentTaskDialog").then((module) => ({ default: module.ScheduledAgentTaskDialog })),
+);
+const TaskTemplateDialog = React.lazy(() =>
+  import("./components/TaskTemplateDialog").then((module) => ({ default: module.TaskTemplateDialog })),
+);
+
+function LazyFeatureFallback({ label }: { label: string }) {
+  return (
+    <div
+      role="status"
+      style={{
+        display: "flex",
+        flex: 1,
+        minHeight: 0,
+        alignItems: "center",
+        justifyContent: "center",
+        padding: "16px",
+        color: "var(--text-secondary)",
+        fontSize: "12px",
+      }}
+    >
+      {label}
+    </div>
+  );
+}
 
 // 类型定义
 type SessionMode = "chat" | "plugin" | "command";
@@ -13148,16 +13179,18 @@ export function App({ onGoHome }: AppProps) {
   ) : null;
   if (gitDiff) {
     workspaceView = (
-      <GitDiffViewer
-        diff={gitDiff}
-        root={currentRootId}
-        sideBySide={gitDiffSideBySide}
-        onPathClick={handleGitDiffPathClick}
-        onSessionClick={(sessionKey) =>
-          handleSessionChipClick(sessionKey, currentRootIdRef.current)
-        }
-        onSelectionChange={handleViewerSelectionChange}
-      />
+      <React.Suspense fallback={<LazyFeatureFallback label="正在加载 Git 差异..." />}>
+        <GitDiffViewer
+          diff={gitDiff}
+          root={currentRootId}
+          sideBySide={gitDiffSideBySide}
+          onPathClick={handleGitDiffPathClick}
+          onSessionClick={(sessionKey) =>
+            handleSessionChipClick(sessionKey, currentRootIdRef.current)
+          }
+          onSelectionChange={handleViewerSelectionChange}
+        />
+      </React.Suspense>
     );
   } else if (file) {
     if (pluginRender && pluginRender.output) {
@@ -13219,14 +13252,16 @@ export function App({ onGoHome }: AppProps) {
               padding: 12,
             }}
           >
-            <Renderer
-              key={pluginRendererKey}
-              tree={pluginRender.output.tree as any}
-              initialState={
-                (pluginRender.output.data || {}) as Record<string, unknown>
-              }
-              handlers={pluginHandlers}
-            />
+            <React.Suspense fallback={<LazyFeatureFallback label="正在加载插件界面..." />}>
+              <Renderer
+                key={pluginRendererKey}
+                tree={pluginRender.output.tree as any}
+                initialState={
+                  (pluginRender.output.data || {}) as Record<string, unknown>
+                }
+                handlers={pluginHandlers}
+              />
+            </React.Suspense>
           </div>
         </div>
       );
@@ -13304,23 +13339,25 @@ export function App({ onGoHome }: AppProps) {
               </button>
             </div>
           ) : null}
-          <FileViewer
-            file={file}
-            isVisible={!selectedSession}
-            onSelectionChange={handleViewerSelectionChange}
-            initialScrollTop={
-              fileScrollPositionsRef.current[currentFileScrollKey] || 0
-            }
-            onScrollTopChange={handleFileScrollTopChange}
-            onSessionClick={(sessionKey) =>
-              handleSessionChipClick(
-                sessionKey,
-                file?.root || currentRootIdRef.current,
-              )
-            }
-            onPathClick={handleFileViewerPathClick}
-            onFileClick={handleFileViewerFileClick}
-          />
+          <React.Suspense fallback={<LazyFeatureFallback label="正在加载文件查看器..." />}>
+            <FileViewer
+              file={file}
+              isVisible={!selectedSession}
+              onSelectionChange={handleViewerSelectionChange}
+              initialScrollTop={
+                fileScrollPositionsRef.current[currentFileScrollKey] || 0
+              }
+              onScrollTopChange={handleFileScrollTopChange}
+              onSessionClick={(sessionKey) =>
+                handleSessionChipClick(
+                  sessionKey,
+                  file?.root || currentRootIdRef.current,
+                )
+              }
+              onPathClick={handleFileViewerPathClick}
+              onFileClick={handleFileViewerFileClick}
+            />
+          </React.Suspense>
         </div>
       );
     }
@@ -14757,19 +14794,27 @@ export function App({ onGoHome }: AppProps) {
           </section>
         </div>
       ) : null}
-      <ScheduledAgentTaskDialog
-        open={scheduledAgentDialogOpen}
-        rootId={currentRootId}
-        agents={availableAgents}
-        onClose={() => setScheduledAgentDialogOpen(false)}
-      />
-      <TaskTemplateDialog
-        open={taskTemplateDialogOpen}
-        agents={availableAgents}
-        template={taskTemplateDialogTemplate}
-        onClose={() => setTaskTemplateDialogOpen(false)}
-        onSaved={handleTaskTemplateSaved}
-      />
+      {scheduledAgentDialogOpen ? (
+        <React.Suspense fallback={<LazyFeatureFallback label="正在加载定时任务..." />}>
+          <ScheduledAgentTaskDialog
+            open
+            rootId={currentRootId}
+            agents={availableAgents}
+            onClose={() => setScheduledAgentDialogOpen(false)}
+          />
+        </React.Suspense>
+      ) : null}
+      {taskTemplateDialogOpen ? (
+        <React.Suspense fallback={<LazyFeatureFallback label="正在加载任务模板..." />}>
+          <TaskTemplateDialog
+            open
+            agents={availableAgents}
+            template={taskTemplateDialogTemplate}
+            onClose={() => setTaskTemplateDialogOpen(false)}
+            onSaved={handleTaskTemplateSaved}
+          />
+        </React.Suspense>
+      ) : null}
       <ToastContainer />
     </>
   );

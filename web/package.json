@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vite build",
+    "build": "vite build && node scripts/check-build-performance.mjs dist",
     "build:android": "rimraf ../android/app/src/main/assets/public && VITE_APP_SHELL=1 vite build --outDir ../android/app/src/main/assets/public --emptyOutDir",
     "build:harmony": "rimraf ../harmony/entry/src/main/resources/rawfile/public && VITE_APP_SHELL=1 VITE_NATIVE_PLATFORM=harmony vite build --outDir ../harmony/entry/src/main/resources/rawfile/public --emptyOutDir",
     "test:extension-ui": "playwright test tests/extension-ui.spec.ts",

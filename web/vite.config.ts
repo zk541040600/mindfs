@@ -1,6 +1,11 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import {
+  brotliCompressSync,
+  constants as zlibConstants,
+  gzipSync,
+} from "node:zlib";
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
@@ -42,6 +47,7 @@ function listShellBundleAssets(bundle: Record<string, BundleItem>): string[] {
     .filter((item) => item.fileName !== "service-worker.js")
     .filter((item) => !item.fileName.endsWith(".map"))
     .filter((item) => item.fileName.startsWith("assets/index-"))
+    .filter((item) => !item.fileName.endsWith(".br") && !item.fileName.endsWith(".gz"))
     .map((item) => `./${item.fileName}`)
     .sort();
 }
@@ -266,6 +272,71 @@ function appShellExcludeAssetsPlugin() {
   };
 }
 
+function precompressWebAssetsPlugin() {
+  let resolvedOutDir = "";
+
+  return {
+    name: "mindfs-precompress-web-assets",
+    apply: "build" as const,
+    configResolved(config: { build: { outDir: string } }) {
+      resolvedOutDir = config.build.outDir;
+    },
+    closeBundle() {
+      if (process.env.VITE_APP_SHELL === "1" || !resolvedOutDir) {
+        return;
+      }
+      const assetsDir = path.join(resolvedOutDir, "assets");
+      if (!fs.existsSync(assetsDir)) {
+        return;
+      }
+
+      const visit = (currentDir: string) => {
+        for (const entry of fs.readdirSync(currentDir, { withFileTypes: true })) {
+          const absolutePath = path.join(currentDir, entry.name);
+          if (entry.isDirectory()) {
+            visit(absolutePath);
+            continue;
+          }
+          const extension = path.extname(entry.name).toLowerCase();
+          if (extension !== ".js" && extension !== ".css") {
+            continue;
+          }
+          const identity = fs.readFileSync(absolutePath);
+          if (identity.length < 1024) {
+            continue;
+          }
+          const representations = [
+            {
+              suffix: ".br",
+              content: brotliCompressSync(identity, {
+                params: {
+                  [zlibConstants.BROTLI_PARAM_QUALITY]: 9,
+                },
+              }),
+            },
+            {
+              suffix: ".gz",
+              content: gzipSync(identity, { level: 9 }),
+            },
+          ];
+          for (const representation of representations) {
+            const outputPath = absolutePath + representation.suffix;
+            if (representation.content.length < identity.length) {
+              fs.writeFileSync(outputPath, representation.content);
+              continue;
+            }
+            if (fs.existsSync(outputPath)) {
+              fs.rmSync(outputPath);
+            }
+          }
+        }
+      };
+
+      visit(assetsDir);
+    },
+  };
+}
+
 function autoPrecachePlugin() {
   return {
     name: "mindfs-auto-precache",
@@ -297,7 +368,14 @@ function autoPrecachePlugin() {
 
 export default defineConfig({
   base: "./",
-  plugins: [tailwindcss(), react(), appShellHTMLPlugin(), appShellExcludeAssetsPlugin(), autoPrecachePlugin()],
+  plugins: [
+    tailwindcss(),
+    react(),
+    appShellHTMLPlugin(),
+    appShellExcludeAssetsPlugin(),
+    autoPrecachePlugin(),
+    precompressWebAssetsPlugin(),
+  ],
   server: {
     host: "0.0.0.0",
     proxy: {
