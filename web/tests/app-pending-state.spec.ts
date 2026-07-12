@@ -41,6 +41,7 @@ async function openPendingApp(
   page: Page,
   replyingState: { current: boolean },
   onWSMessage?: (message: string) => void,
+  serverPendingState: { current: boolean } = { current: true },
 ) {
   let socket: WebSocketRoute | null = null;
 
@@ -107,11 +108,16 @@ async function openPendingApp(
       return;
     }
     if (path === "/api/sessions") {
-      await fulfillJSON(route, [pendingSession]);
+      await fulfillJSON(route, [
+        { ...pendingSession, pending: serverPendingState.current },
+      ]);
       return;
     }
     if (path === `/api/sessions/${sessionKey}`) {
-      await fulfillJSON(route, pendingSession);
+      await fulfillJSON(route, {
+        ...pendingSession,
+        pending: serverPendingState.current,
+      });
       return;
     }
     if (path === `/api/sessions/${sessionKey}/related-files`) {
@@ -358,7 +364,7 @@ test("ignores late stream events after cancelling a pending turn", async ({ page
   await expect(page.getByText("late chunk after cancel")).toHaveCount(0);
 });
 
-test("keeps a newer pending turn when a stale cancel acknowledgement arrives", async ({ page }) => {
+test("keeps a newer active stream when stale callbacks and terminals arrive", async ({ page }) => {
   const replying = { current: true };
   let cancelSeen = false;
   let newRequestId = "";
@@ -398,6 +404,46 @@ test("keeps a newer pending turn when a stale cancel acknowledgement arrives", a
     }),
   );
   await expect(page.getByText("已发送，等待响应...")).toBeVisible();
+  app.socket?.send(
+    JSON.stringify({
+      type: "session.stream",
+      payload: {
+        root_id: rootId,
+        session_key: sessionKey,
+        request_id: newRequestId,
+        event: {
+          type: "message_chunk",
+          data: { content: "new turn is streaming" },
+        },
+      },
+    }),
+  );
+  await expect
+    .poll(() =>
+      page.evaluate(async (key) => {
+        const { sessionService } = await import("/src/services/session.ts");
+        return sessionService.isSessionStreaming(key);
+      }, sessionKey),
+    )
+    .toBe(true);
+
+  app.socket?.send(
+    JSON.stringify({
+      type: "session.stream",
+      payload: {
+        root_id: rootId,
+        session_key: sessionKey,
+        request_id: "old-request",
+        event: {
+          type: "message_chunk",
+          data: { content: "late old turn chunk" },
+        },
+      },
+    }),
+  );
+  await page.waitForTimeout(150);
+  await expect(page.getByText("late old turn chunk")).toHaveCount(0);
+  await expect(page.getByText("new turn is streaming")).toBeVisible();
 
   app.socket?.send(
     JSON.stringify({
@@ -407,12 +453,46 @@ test("keeps a newer pending turn when a stale cancel acknowledgement arrives", a
         root_id: rootId,
         session_key: sessionKey,
         request_id: "old-request",
+        stale: true,
       },
     }),
   );
 
   await page.waitForTimeout(150);
-  await expect(page.getByText("已发送，等待响应...")).toBeVisible();
+  await expect(page.getByText("new turn is streaming")).toBeVisible();
+  await expect(page.getByText("正在生成...")).toBeVisible();
+  await expect
+    .poll(() =>
+      page.evaluate(async (key) => {
+        const { sessionService } = await import("/src/services/session.ts");
+        return sessionService.isSessionStreaming(key);
+      }, sessionKey),
+    )
+    .toBe(true);
+
+  app.socket?.send(
+    JSON.stringify({
+      id: "done-old",
+      type: "session.done",
+      payload: {
+        root_id: rootId,
+        session_key: sessionKey,
+        request_id: "old-request",
+      },
+    }),
+  );
+
+  await page.waitForTimeout(150);
+  await expect(page.getByText("new turn is streaming")).toBeVisible();
+  await expect(page.getByText("正在生成...")).toBeVisible();
+  await expect
+    .poll(() =>
+      page.evaluate(async (key) => {
+        const { sessionService } = await import("/src/services/session.ts");
+        return sessionService.isSessionStreaming(key);
+      }, sessionKey),
+    )
+    .toBe(true);
 
   replying.current = false;
   app.socket?.send(
@@ -427,6 +507,15 @@ test("keeps a newer pending turn when a stale cancel acknowledgement arrives", a
     }),
   );
   await expect(page.getByText("已发送，等待响应...")).toHaveCount(0);
+  await expect(page.getByText("正在生成...")).toHaveCount(0);
+  await expect
+    .poll(() =>
+      page.evaluate(async (key) => {
+        const { sessionService } = await import("/src/services/session.ts");
+        return sessionService.isSessionStreaming(key);
+      }, sessionKey),
+    )
+    .toBe(false);
 });
 
 test("ignores request-less stale cancel acknowledgement after a new turn starts", async ({ page }) => {
@@ -611,6 +700,85 @@ test("allows a resumed stream after cancel tombstone timeout without a terminal 
   await expect(page.getByText("正在生成...")).toBeVisible();
 });
 
+test("actively probes a stale open websocket while the page is visible", async ({ page }) => {
+  const replying = { current: false };
+  const serverPending = { current: false };
+  const sentMessages: string[] = [];
+  const app = await openPendingApp(
+    page,
+    replying,
+    (message) => sentMessages.push(message),
+    serverPending,
+  );
+
+  await page.evaluate(async () => {
+    const { sessionService } = await import("/src/services/session.ts");
+    const service = sessionService as any;
+    service.activeProbeId = null;
+    service.lastSocketActivityAt = Date.now() - service.probeIntervalMs - 1;
+    service.ensureReconnectLoop();
+  });
+
+  await expect
+    .poll(() =>
+      sentMessages.some((message) => {
+        try {
+          return JSON.parse(message)?.type === "ping";
+        } catch {
+          return false;
+        }
+      }),
+    )
+    .toBe(true);
+
+  const ping = sentMessages
+    .map((message) => {
+      try {
+        return JSON.parse(message);
+      } catch {
+        return null;
+      }
+    })
+    .find((message) => message?.type === "ping");
+  app.socket?.send(
+    JSON.stringify({ id: ping?.id, type: "pong", payload: {} }),
+  );
+});
+
+test("clears stale pending when restarted server reports no active turn", async ({ page }) => {
+  const replying = { current: true };
+  const serverPending = { current: true };
+  const app = await openPendingApp(page, replying, undefined, serverPending);
+
+  await expect(page.getByText("已发送，等待响应...")).toBeVisible();
+  app.socket?.send(
+    JSON.stringify({
+      type: "session.stream",
+      payload: {
+        root_id: rootId,
+        session_key: sessionKey,
+        request_id: "restart-interrupted-request",
+        event: {
+          type: "message_chunk",
+          data: { content: "partial response before restart" },
+        },
+      },
+    }),
+  );
+  await expect(page.getByText("partial response before restart")).toBeVisible();
+
+  replying.current = false;
+  serverPending.current = false;
+  const previousSocket = app.socket;
+  await previousSocket?.close({ code: 1001, reason: "synthetic server restart" });
+  await expect.poll(() => app.socket !== previousSocket).toBe(true);
+
+  await expect(page.getByText("已发送，等待响应...")).toHaveCount(0, {
+    timeout: 7000,
+  });
+  await expect(page.getByText("左滑蓝环开始新会话...")).toBeVisible();
+});
+
 test("keeps pending when replying-sessions drops before terminal event", async ({ page }) => {
   const replying = { current: true };
   const app = await openPendingApp(page, replying);
@@ -739,6 +907,41 @@ test("keeps the latest Pi stream and goal state across background refresh", asyn
   await expect(page.getByText("repair browser history")).toHaveCount(1);
   await expect(page.getByText("原因：restart approval required")).toBeVisible();
   await expect(page.getByText("live Pi answer survives refresh")).toBeVisible();
+});
+
+test("rolls back optimistic pending when websocket send throws", async ({ page }) => {
+  const replying = { current: true };
+  const app = await openPendingApp(page, replying);
+  await expect(page.getByText("已发送，等待响应...")).toBeVisible();
+
+  replying.current = false;
+  app.socket?.send(
+    JSON.stringify({
+      id: "initial-request",
+      type: "session.done",
+      payload: {
+        root_id: rootId,
+        session_key: sessionKey,
+      },
+    }),
+  );
+  await expect(page.getByText("已发送，等待响应...")).toHaveCount(0);
+
+  await page.evaluate(async () => {
+    const { sessionService } = await import("/src/services/session.ts");
+    const socket = (sessionService as any).ws;
+    socket.send = () => {
+      throw new Error("synthetic websocket send failure");
+    };
+  });
+
+  const editor = page.locator(".token-editor-input").first();
+  await editor.click();
+  await editor.fill("message whose socket send throws");
+  await page.keyboard.press("Enter");
+
+  await expect(page.getByText("消息发送失败：连接未就绪，请稍后重试")).toBeVisible();
+  await expect(page.getByText("已发送，等待响应...")).toHaveCount(0);
 });
 
 test("treats top-level session.error as terminal for reconnecting clients", async ({ page }) => {

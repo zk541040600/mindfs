@@ -24,6 +24,7 @@ type StreamHub struct {
 	sessionClients  map[string]map[string]struct{}
 	pendingSessions map[string]*SessionPendingState
 	replayStates    map[string]*ClientReplayState
+	activeRequests  map[string]string
 	completed       map[string]*CompletedSessionState
 }
 
@@ -66,6 +67,7 @@ const (
 type ClientReplayState struct {
 	Status      ClientStreamStatus
 	ReplayIndex int
+	RequestID   string
 }
 
 type CompletedSessionState struct {
@@ -95,6 +97,7 @@ type PendingSessionSnapshot struct {
 type replayStep struct {
 	events []StreamEvent
 	live   bool
+	valid  bool
 }
 
 var clearSessionPendingReplayWait = 2 * time.Second
@@ -111,6 +114,7 @@ func NewStreamHub(e2eeManager *e2ee.Manager) *StreamHub {
 		sessionClients:  make(map[string]map[string]struct{}),
 		pendingSessions: make(map[string]*SessionPendingState),
 		replayStates:    make(map[string]*ClientReplayState),
+		activeRequests:  make(map[string]string),
 		completed:       make(map[string]*CompletedSessionState),
 	}
 }
@@ -139,14 +143,18 @@ func cloneUserExchange(msg *PendingUserMessage) *session.Exchange {
 	}
 }
 
-func buildSessionStreamResponse(rootID, sessionKey string, event *StreamEvent) WSResponse {
+func buildSessionStreamResponse(rootID, sessionKey, requestID string, event *StreamEvent) WSResponse {
+	payload := map[string]any{
+		"root_id":     rootID,
+		"session_key": sessionKey,
+		"event":       event,
+	}
+	if strings.TrimSpace(requestID) != "" {
+		payload["request_id"] = requestID
+	}
 	return WSResponse{
-		Type: "session.stream",
-		Payload: map[string]any{
-			"root_id":     rootID,
-			"session_key": sessionKey,
-			"event":       event,
-		},
+		Type:    "session.stream",
+		Payload: payload,
 	}
 }
 
@@ -184,6 +192,12 @@ func buildSessionCancelledResponse(responseID, rootID, sessionKey, requestID str
 		Type:    "session.cancelled",
 		Payload: payload,
 	}
+}
+
+func buildStaleSessionCancelledResponse(responseID, rootID, sessionKey, requestID string) WSResponse {
+	resp := buildSessionCancelledResponse(responseID, rootID, sessionKey, requestID, false)
+	resp.Payload["stale"] = true
+	return resp
 }
 
 func buildSessionErrorResponse(rootID, sessionKey, requestID, code, message string, replay bool) WSResponse {
@@ -235,7 +249,7 @@ func buildSlashCommandDoneResponse(rootID, sessionKey, command, requestID string
 	}
 }
 
-func buildSessionUserMessageResponse(rootID, sessionKey, sessionType, sessionName, agentName, model, mode, effort, fastService string, planMode bool, content string, timestamp time.Time, queued bool) WSResponse {
+func buildSessionUserMessageResponse(rootID, sessionKey, requestID, sessionType, sessionName, agentName, model, mode, effort, fastService string, planMode bool, content string, timestamp time.Time, queued bool) WSResponse {
 	queueState := "active"
 	if queued {
 		queueState = "dequeued"
@@ -255,37 +269,45 @@ func buildSessionUserMessageResponse(rootID, sessionKey, sessionType, sessionNam
 	if strings.TrimSpace(sessionName) != "" {
 		sessionPayload["name"] = sessionName
 	}
-	return WSResponse{
-		Type: "session.user_message",
-		Payload: map[string]any{
-			"root_id":     rootID,
-			"session_key": sessionKey,
-			"session":     sessionPayload,
-			"exchange": map[string]any{
-				"role":         "user",
-				"agent":        agentName,
-				"model":        model,
-				"mode":         mode,
-				"effort":       effort,
-				"fast_service": fastService,
-				"content":      content,
-				"timestamp":    timestamp,
-				"queued":       queued,
-				"queue_state":  queueState,
-			},
+	payload := map[string]any{
+		"root_id":     rootID,
+		"session_key": sessionKey,
+		"session":     sessionPayload,
+		"exchange": map[string]any{
+			"role":         "user",
+			"agent":        agentName,
+			"model":        model,
+			"mode":         mode,
+			"effort":       effort,
+			"fast_service": fastService,
+			"content":      content,
+			"timestamp":    timestamp,
+			"queued":       queued,
+			"queue_state":  queueState,
 		},
+	}
+	if strings.TrimSpace(requestID) != "" {
+		payload["request_id"] = requestID
+	}
+	return WSResponse{
+		Type:    "session.user_message",
+		Payload: payload,
 	}
 }
 
-func buildSessionQueueUpdatedResponse(rootID, sessionKey string, queue []QueuedUserMessage, frozen bool) WSResponse {
+func buildSessionQueueUpdatedResponse(rootID, sessionKey, requestID string, queue []QueuedUserMessage, frozen bool) WSResponse {
+	payload := map[string]any{
+		"root_id":      rootID,
+		"session_key":  sessionKey,
+		"queue":        queue,
+		"queue_frozen": frozen,
+	}
+	if strings.TrimSpace(requestID) != "" {
+		payload["request_id"] = requestID
+	}
 	return WSResponse{
-		Type: "session.queue.updated",
-		Payload: map[string]any{
-			"root_id":      rootID,
-			"session_key":  sessionKey,
-			"queue":        queue,
-			"queue_frozen": frozen,
-		},
+		Type:    "session.queue.updated",
+		Payload: payload,
 	}
 }
 
@@ -302,6 +324,20 @@ func (h *StreamHub) clearReplayStatesForSessionLocked(sessionKey string) {
 	for _, replayKey := range h.getReplayKeyListLocked(sessionKey, "") {
 		delete(h.replayStates, replayKey)
 	}
+}
+
+func (h *StreamHub) requestMatchesLocked(sessionKey, requestID string) bool {
+	current, scoped := h.activeRequests[sessionKey]
+	if !scoped || strings.TrimSpace(current) == "" {
+		return true
+	}
+	return strings.TrimSpace(current) == strings.TrimSpace(requestID)
+}
+
+func (h *StreamHub) currentRequestID(sessionKey string) string {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.activeRequests[sessionKey]
 }
 
 func (h *StreamHub) RegisterClient(clientID string, conn *websocket.Conn) {
@@ -395,9 +431,14 @@ func (h *StreamHub) getAllClientIDs() []string {
 }
 
 func (h *StreamHub) SetPendingUser(rootID, sessionKey, sessionTitle, agent, model, mode, effort, fastService string, planMode bool, content string) *PendingUserMessage {
+	return h.setPendingUserForRequest(rootID, sessionKey, "", sessionTitle, agent, model, mode, effort, fastService, planMode, content)
+}
+
+func (h *StreamHub) setPendingUserForRequest(rootID, sessionKey, requestID, sessionTitle, agent, model, mode, effort, fastService string, planMode bool, content string) *PendingUserMessage {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	state := h.ensurePendingSessionLocked(sessionKey)
+	h.activeRequests[sessionKey] = strings.TrimSpace(requestID)
 	delete(h.completed, sessionKey)
 	state.RootID = rootID
 	state.SessionTitle = strings.TrimSpace(sessionTitle)
@@ -613,6 +654,7 @@ func (h *StreamHub) SetPendingReply(rootID, sessionKey, sessionTitle string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	state := h.ensurePendingSessionLocked(sessionKey)
+	h.activeRequests[sessionKey] = ""
 	delete(h.completed, sessionKey)
 	state.RootID = rootID
 	state.SessionTitle = strings.TrimSpace(sessionTitle)
@@ -620,6 +662,7 @@ func (h *StreamHub) SetPendingReply(rootID, sessionKey, sessionTitle string) {
 	if state.UpdatedAt.IsZero() {
 		state.UpdatedAt = time.Now().UTC()
 	}
+	h.clearReplayStatesForSessionLocked(sessionKey)
 }
 
 func (h *StreamHub) GetPendingUserExchange(sessionKey string) *session.Exchange {
@@ -648,8 +691,15 @@ func (h *StreamHub) PendingSessionSnapshot(sessionKey string) PendingSessionSnap
 }
 
 func (h *StreamHub) AppendReplyEvent(sessionKey string, event StreamEvent) bool {
+	return h.appendReplyEventForRequest(sessionKey, "", event)
+}
+
+func (h *StreamHub) appendReplyEventForRequest(sessionKey, requestID string, event StreamEvent) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if !h.requestMatchesLocked(sessionKey, requestID) {
+		return false
+	}
 	if h.completed[sessionKey] != nil {
 		return false
 	}
@@ -777,18 +827,25 @@ func (h *StreamHub) ListReplyingSessions() []ReplyingSessionState {
 
 func (h *StreamHub) ReplayPending(rootID, clientID, sessionKey string) {
 	h.mu.Lock()
+	requestID := h.activeRequests[sessionKey]
 	h.replayStates[pendingClientKey(clientID, sessionKey)] = &ClientReplayState{
 		Status:      ClientStreamStatusReplay,
 		ReplayIndex: 0,
+		RequestID:   requestID,
 	}
 	h.mu.Unlock()
 
-	h.replayQueueToClient(rootID, clientID, sessionKey)
+	h.replayQueueToClient(rootID, clientID, sessionKey, requestID)
 	for {
-		step := h.collectReplayStep(clientID, sessionKey)
-		h.replayStepToClient(rootID, clientID, sessionKey, step.events)
+		step := h.collectReplayStep(clientID, sessionKey, requestID)
+		if !step.valid {
+			return
+		}
+		if !h.replayStepToClient(rootID, clientID, sessionKey, requestID, step.events) {
+			return
+		}
 		if step.live {
-			h.replayCompletionToClient(rootID, clientID, sessionKey)
+			h.replayCompletionToClient(rootID, clientID, sessionKey, requestID)
 			return
 		}
 	}
@@ -807,8 +864,12 @@ func (h *StreamHub) HasReplayClients(rootID, sessionKey string) bool {
 }
 
 func (h *StreamHub) ClearSessionPending(sessionKey string) {
+	h.clearSessionPendingForRequest(sessionKey, "")
+}
+
+func (h *StreamHub) clearSessionPendingForRequest(sessionKey, requestID string) bool {
 	if blank(sessionKey) {
-		return
+		return false
 	}
 	deadline := time.Now().Add(clearSessionPendingReplayWait)
 	for h.HasReplayClients("", sessionKey) {
@@ -819,6 +880,9 @@ func (h *StreamHub) ClearSessionPending(sessionKey string) {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if !h.requestMatchesLocked(sessionKey, requestID) {
+		return false
+	}
 	state := h.pendingSessions[sessionKey]
 	if state != nil && len(state.Queue) > 0 {
 		state.Active = false
@@ -830,6 +894,7 @@ func (h *StreamHub) ClearSessionPending(sessionKey string) {
 		delete(h.pendingSessions, sessionKey)
 	}
 	h.clearReplayStatesForSessionLocked(sessionKey)
+	return true
 }
 
 func (h *StreamHub) SendToClient(clientID string, resp WSResponse) {
@@ -852,29 +917,45 @@ func (h *StreamHub) BroadcastAll(resp WSResponse) {
 }
 
 func (h *StreamHub) BroadcastSessionStream(rootID, sessionKey string, event *StreamEvent) {
+	h.broadcastSessionStreamForRequest(rootID, sessionKey, "", event)
+}
+
+func (h *StreamHub) broadcastSessionStreamForRequest(rootID, sessionKey, requestID string, event *StreamEvent) bool {
 	if event == nil {
-		return
+		return false
 	}
-	if !h.AppendReplyEvent(sessionKey, *event) {
-		return
+	if !h.appendReplyEventForRequest(sessionKey, requestID, *event) {
+		return false
 	}
 	for _, clientID := range h.GetSessionClientIDs(sessionKey, true) {
-		resp := buildSessionStreamResponse(rootID, sessionKey, event)
+		resp := buildSessionStreamResponse(rootID, sessionKey, requestID, event)
 		h.SendToClient(clientID, resp)
 	}
+	return true
+}
+
+func (h *StreamHub) recordSessionTerminal(sessionKey string, terminal CompletedSessionState) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if !h.requestMatchesLocked(sessionKey, terminal.RequestID) {
+		return false
+	}
+	if h.terminalAlreadyRecordedLocked(sessionKey, terminal.RequestID) {
+		return false
+	}
+	terminal.Completed = time.Now().UTC()
+	h.completed[sessionKey] = &terminal
+	return true
 }
 
 func (h *StreamHub) BroadcastSessionDone(rootID, sessionKey, requestID string) {
-	h.mu.Lock()
-	if h.terminalAlreadyRecordedLocked(sessionKey, requestID) {
-		h.mu.Unlock()
+	if !h.recordSessionTerminal(sessionKey, CompletedSessionState{RequestID: requestID}) {
 		return
 	}
-	h.completed[sessionKey] = &CompletedSessionState{
-		RequestID: requestID,
-		Completed: time.Now().UTC(),
-	}
-	h.mu.Unlock()
+	h.sendSessionDone(rootID, sessionKey, requestID)
+}
+
+func (h *StreamHub) sendSessionDone(rootID, sessionKey, requestID string) {
 	resp := buildSessionDoneResponse(rootID, sessionKey, requestID, false)
 	for _, clientID := range h.GetSessionClientIDs(sessionKey, false) {
 		h.SendToClient(clientID, resp)
@@ -882,18 +963,15 @@ func (h *StreamHub) BroadcastSessionDone(rootID, sessionKey, requestID string) {
 }
 
 func (h *StreamHub) BroadcastSessionCancelled(rootID, sessionKey, responseID, requestID string) {
-	h.mu.Lock()
-	if h.terminalAlreadyRecordedLocked(sessionKey, requestID) {
-		h.mu.Unlock()
-		return
-	}
-	h.completed[sessionKey] = &CompletedSessionState{
+	if !h.recordSessionTerminal(sessionKey, CompletedSessionState{
 		RequestID: requestID,
 		Cancelled: true,
-		Completed: time.Now().UTC(),
+	}) {
+		return
 	}
-	h.mu.Unlock()
-	h.ClearSessionPending(sessionKey)
+	if !h.clearSessionPendingForRequest(sessionKey, requestID) {
+		return
+	}
 	resp := buildSessionCancelledResponse(responseID, rootID, sessionKey, requestID, false)
 	for _, clientID := range h.GetSessionClientIDs(sessionKey, false) {
 		h.SendToClient(clientID, resp)
@@ -901,18 +979,17 @@ func (h *StreamHub) BroadcastSessionCancelled(rootID, sessionKey, responseID, re
 }
 
 func (h *StreamHub) BroadcastSessionError(rootID, sessionKey, requestID, code, message string) {
-	h.mu.Lock()
-	if h.terminalAlreadyRecordedLocked(sessionKey, requestID) {
-		h.mu.Unlock()
-		return
-	}
-	h.completed[sessionKey] = &CompletedSessionState{
+	if !h.recordSessionTerminal(sessionKey, CompletedSessionState{
 		RequestID:    requestID,
 		ErrorCode:    code,
 		ErrorMessage: message,
-		Completed:    time.Now().UTC(),
+	}) {
+		return
 	}
-	h.mu.Unlock()
+	h.sendSessionError(rootID, sessionKey, requestID, code, message)
+}
+
+func (h *StreamHub) sendSessionError(rootID, sessionKey, requestID, code, message string) {
 	resp := buildSessionErrorResponse(rootID, sessionKey, requestID, code, message, false)
 	for _, clientID := range h.GetSessionClientIDs(sessionKey, false) {
 		h.SendToClient(clientID, resp)
@@ -942,8 +1019,27 @@ func (h *StreamHub) BroadcastSessionUserMessage(
 	excludeClientID string,
 	queued bool,
 ) {
-	pendingUser := h.SetPendingUser(rootID, sessionKey, sessionName, agentName, model, mode, effort, fastService, planMode, content)
-	resp := buildSessionUserMessageResponse(rootID, sessionKey, sessionType, sessionName, agentName, model, mode, effort, fastService, planMode, content, pendingUser.Timestamp, queued)
+	h.broadcastSessionUserMessageForRequest(rootID, sessionKey, "", sessionType, sessionName, agentName, model, mode, effort, fastService, planMode, content, excludeClientID, queued)
+}
+
+func (h *StreamHub) broadcastSessionUserMessageForRequest(
+	rootID string,
+	sessionKey string,
+	requestID string,
+	sessionType string,
+	sessionName string,
+	agentName string,
+	model string,
+	mode string,
+	effort string,
+	fastService string,
+	planMode bool,
+	content string,
+	excludeClientID string,
+	queued bool,
+) {
+	pendingUser := h.setPendingUserForRequest(rootID, sessionKey, requestID, sessionName, agentName, model, mode, effort, fastService, planMode, content)
+	resp := buildSessionUserMessageResponse(rootID, sessionKey, requestID, sessionType, sessionName, agentName, model, mode, effort, fastService, planMode, content, pendingUser.Timestamp, queued)
 	for _, clientID := range h.GetSessionClientIDs(sessionKey, false) {
 		if clientID == excludeClientID {
 			continue
@@ -954,7 +1050,7 @@ func (h *StreamHub) BroadcastSessionUserMessage(
 
 func (h *StreamHub) BroadcastSessionQueueUpdated(rootID, sessionKey string, queue []QueuedUserMessage) {
 	_, _, frozen := h.queueSnapshot(sessionKey)
-	resp := buildSessionQueueUpdatedResponse(rootID, sessionKey, queue, frozen)
+	resp := buildSessionQueueUpdatedResponse(rootID, sessionKey, "", queue, frozen)
 	for _, clientID := range h.GetSessionClientIDs(sessionKey, false) {
 		h.SendToClient(clientID, resp)
 	}
@@ -1016,66 +1112,89 @@ func (h *StreamHub) getConnLock(conn *websocket.Conn) *sync.Mutex {
 	return created
 }
 
-func (h *StreamHub) collectReplayStep(clientID, sessionKey string) replayStep {
+func (h *StreamHub) collectReplayStep(clientID, sessionKey, requestID string) replayStep {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	return h.nextReplayStepLocked(clientID, sessionKey)
+	return h.nextReplayStepLocked(clientID, sessionKey, requestID)
 }
 
-func (h *StreamHub) nextReplayStepLocked(clientID, sessionKey string) replayStep {
+func (h *StreamHub) nextReplayStepLocked(clientID, sessionKey, requestID string) replayStep {
 	clientKey := pendingClientKey(clientID, sessionKey)
 	replay := h.replayStates[clientKey]
-	if replay == nil {
-		return replayStep{live: true}
+	if replay == nil || replay.RequestID != requestID || !h.requestMatchesLocked(sessionKey, requestID) {
+		return replayStep{}
 	}
 	state := h.pendingSessions[sessionKey]
 	if state == nil {
 		replay.Status = ClientStreamStatusLive
-		return replayStep{live: true}
+		return replayStep{live: true, valid: true}
 	}
 	if replay.ReplayIndex >= len(state.ReplyingList) {
 		replay.Status = ClientStreamStatusLive
-		return replayStep{live: true}
+		return replayStep{live: true, valid: true}
 	}
 	start := replay.ReplayIndex
 	end := len(state.ReplyingList)
 	events := append([]StreamEvent(nil), state.ReplyingList[start:end]...)
 	replay.ReplayIndex = end
-	return replayStep{events: events}
+	return replayStep{events: events, valid: true}
 }
 
-func (h *StreamHub) replayStepToClient(rootID, clientID, sessionKey string, events []StreamEvent) {
+func (h *StreamHub) replayRequestCurrent(clientID, sessionKey, requestID string) bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	replay := h.replayStates[pendingClientKey(clientID, sessionKey)]
+	return replay != nil && replay.RequestID == requestID && h.requestMatchesLocked(sessionKey, requestID)
+}
+
+func (h *StreamHub) replayStepToClient(rootID, clientID, sessionKey, requestID string, events []StreamEvent) bool {
 	for i := range events {
-		h.SendToClient(clientID, buildSessionStreamResponse(rootID, sessionKey, &events[i]))
+		if !h.replayRequestCurrent(clientID, sessionKey, requestID) {
+			return false
+		}
+		h.SendToClient(clientID, buildSessionStreamResponse(rootID, sessionKey, requestID, &events[i]))
 	}
+	return true
 }
 
-func (h *StreamHub) replayQueueToClient(rootID, clientID, sessionKey string) {
+func (h *StreamHub) replayQueueToClient(rootID, clientID, sessionKey, requestID string) bool {
 	stateRoot, queue, frozen := h.queueSnapshot(sessionKey)
 	if rootID == "" {
 		rootID = stateRoot
 	}
 	if rootID == "" || len(queue) == 0 {
-		return
+		return true
 	}
-	h.SendToClient(clientID, buildSessionQueueUpdatedResponse(rootID, sessionKey, queue, frozen))
+	if !h.replayRequestCurrent(clientID, sessionKey, requestID) {
+		return false
+	}
+	h.SendToClient(clientID, buildSessionQueueUpdatedResponse(rootID, sessionKey, requestID, queue, frozen))
+	return true
 }
 
-func (h *StreamHub) replayCompletionToClient(rootID, clientID, sessionKey string) {
+func (h *StreamHub) replayCompletionToClient(rootID, clientID, sessionKey, replayRequestID string) {
 	if blank(rootID) || blank(clientID) || blank(sessionKey) {
 		return
 	}
-	h.mu.Lock()
+	h.mu.RLock()
+	if !h.requestMatchesLocked(sessionKey, replayRequestID) {
+		h.mu.RUnlock()
+		return
+	}
 	completed := h.completed[sessionKey]
 	if completed == nil {
-		h.mu.Unlock()
+		h.mu.RUnlock()
 		return
 	}
 	requestID := completed.RequestID
+	if strings.TrimSpace(replayRequestID) != "" && strings.TrimSpace(requestID) != strings.TrimSpace(replayRequestID) {
+		h.mu.RUnlock()
+		return
+	}
 	errorCode := completed.ErrorCode
 	errorMessage := completed.ErrorMessage
 	cancelled := completed.Cancelled
-	h.mu.Unlock()
+	h.mu.RUnlock()
 	if strings.TrimSpace(errorMessage) != "" {
 		h.SendToClient(clientID, buildSessionErrorResponse(rootID, sessionKey, requestID, errorCode, errorMessage, true))
 		return

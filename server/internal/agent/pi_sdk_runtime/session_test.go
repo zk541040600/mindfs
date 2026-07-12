@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -16,6 +17,25 @@ import (
 	agenttypes "mindfs/server/internal/agent/types"
 )
 
+const messageEndFallbackDelay = 1500 * time.Millisecond
+
+func TestSanitizeDiagnosticLineRedactsSecretsAndBoundsOutput(t *testing.T) {
+	bearerSecret := strings.Repeat("a", 64)
+	apiSecret := strings.Repeat("b", 40)
+	raw := "Authorization: Bearer " + bearerSecret + " api_key=" + apiSecret + " " + strings.Repeat("x", 1000)
+
+	got := sanitizeDiagnosticLine(raw)
+	if strings.Contains(got, bearerSecret) || strings.Contains(got, apiSecret) {
+		t.Fatalf("diagnostic line leaked a secret: %q", got)
+	}
+	if !strings.Contains(got, "[REDACTED:token]") || !strings.Contains(got, "[REDACTED:secret]") {
+		t.Fatalf("diagnostic line missing redaction markers: %q", got)
+	}
+	if len(got) > 503 {
+		t.Fatalf("diagnostic line length = %d, want at most 503 bytes", len(got))
+	}
+}
+
 func TestPreviewTruncatesUTF8Safely(t *testing.T) {
 	got := preview(strings.Repeat("界", 180))
 	if !utf8.ValidString(got) {
@@ -23,6 +43,48 @@ func TestPreviewTruncatesUTF8Safely(t *testing.T) {
 	}
 	if !strings.HasSuffix(got, "...") {
 		t.Fatalf("preview missing ellipsis: %q", got)
+	}
+}
+
+func TestMergeEnvUsesRuntimeWorkingDirectory(t *testing.T) {
+	parentPWD := t.TempDir()
+	runtimePWD := t.TempDir()
+	t.Setenv("PWD", parentPWD)
+	t.Setenv("MINDFS_PI_ENV_TEST", "parent")
+
+	values := make(map[string]string)
+	for _, entry := range mergeEnv(map[string]string{"MINDFS_PI_ENV_TEST": "runtime"}, runtimePWD) {
+		key, value, ok := strings.Cut(entry, "=")
+		if ok {
+			values[key] = value
+		}
+	}
+	if got := values["PWD"]; got != runtimePWD {
+		t.Fatalf("PWD = %q, want runtime root %q", got, runtimePWD)
+	}
+	if got := values["MINDFS_PI_ENV_TEST"]; got != "runtime" {
+		t.Fatalf("MINDFS_PI_ENV_TEST = %q, want runtime override", got)
+	}
+}
+
+func TestResponseFromEOFFallsBackToProcessExit(t *testing.T) {
+	err := responseFromError(io.EOF).error()
+	if err == nil || !strings.Contains(err.Error(), "pi sdk runtime process exited") {
+		t.Fatalf("responseFromError(io.EOF) = %v", err)
+	}
+}
+
+func TestSessionClosedErrorPreservesProcessExit(t *testing.T) {
+	sess := &session{
+		closed:             make(chan struct{}),
+		pending:            make(map[string]chan bridgeResponse),
+		pendingExtensionUI: make(map[string]string),
+	}
+	sess.closeWithError(errors.New("exit status 17"))
+
+	err := sess.closedError()
+	if err == nil || !strings.Contains(err.Error(), "pi sdk runtime process exited: exit status 17") {
+		t.Fatalf("closedError() = %v", err)
 	}
 }
 
@@ -92,6 +154,41 @@ func openTestSessionWithModelMode(t *testing.T, scenario, model, mode string) ag
 	return sess
 }
 
+func TestRuntimeCloseAllReapsTrackedSessions(t *testing.T) {
+	runtime := NewRuntime()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	sess, err := runtime.OpenSession(ctx, OpenOptions{
+		AgentName:    "pi",
+		SessionKey:   "sdk-close-all",
+		RootPath:     repoRoot(t),
+		Command:      "pi",
+		TestScenario: "prompt-stream",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	runtime.CloseAll()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		runtime.mu.Lock()
+		remaining := len(runtime.sessions)
+		runtime.mu.Unlock()
+		if remaining == 0 {
+			if tracked, ok := sess.(*session); !ok || !tracked.Closed() {
+				t.Fatalf("closed session state = %#v", sess)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	runtime.mu.Lock()
+	remaining := len(runtime.sessions)
+	runtime.mu.Unlock()
+	t.Fatalf("runtime still tracks %d session(s) after CloseAll", remaining)
+}
+
 func TestStartPayloadForOptionsUsesSDKRuntimeForProbe(t *testing.T) {
 	payload := startPayloadForOptions(OpenOptions{
 		Model: "provider/model",
@@ -155,7 +252,9 @@ func TestApplyStartResponseUpdatesSessionState(t *testing.T) {
 		t.Fatal(err)
 	}
 	sess := &session{sessionID: "synthetic-session", model: "old/model", mode: "off"}
-	sess.applyStartResponse(bridgeResponse{Data: data})
+	if err := sess.applyStartResponse(bridgeResponse{Data: data}, true); err != nil {
+		t.Fatal(err)
+	}
 	if got := sess.SessionID(); got != "019eb637-77d1-7567-ab40-4e22386a40c1" {
 		t.Fatalf("SessionID = %q, want real SDK session id", got)
 	}
@@ -177,7 +276,9 @@ func TestApplyStartResponseAcceptsStringModel(t *testing.T) {
 		t.Fatal(err)
 	}
 	sess := &session{sessionID: "synthetic-session", model: "old/model", mode: "off"}
-	sess.applyStartResponse(bridgeResponse{Data: data})
+	if err := sess.applyStartResponse(bridgeResponse{Data: data}, true); err != nil {
+		t.Fatal(err)
+	}
 	if got := sess.SessionID(); got != "real-session" {
 		t.Fatalf("SessionID = %q, want real-session", got)
 	}
@@ -186,6 +287,53 @@ func TestApplyStartResponseAcceptsStringModel(t *testing.T) {
 	}
 	if got := sess.mode; got != "medium" {
 		t.Fatalf("mode = %q, want medium", got)
+	}
+}
+
+func TestApplyStartResponseRequiresProductionSessionID(t *testing.T) {
+	data, err := json.Marshal(map[string]any{"scenario": "test-runtime"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess := &session{sessionID: "mindfs-session-key"}
+	if err := sess.applyStartResponse(bridgeResponse{Data: data}, true); err == nil || !strings.Contains(err.Error(), "missing sessionId") {
+		t.Fatalf("production start validation error = %v", err)
+	}
+	if err := sess.applyStartResponse(bridgeResponse{Data: data}, false); err != nil {
+		t.Fatalf("test runtime start metadata rejected: %v", err)
+	}
+}
+
+func TestApplyStartResponseRejectsMalformedData(t *testing.T) {
+	sess := &session{}
+	err := sess.applyStartResponse(bridgeResponse{Data: json.RawMessage(`{"sessionId":`)}, true)
+	if err == nil || !strings.Contains(err.Error(), "decode failed") {
+		t.Fatalf("malformed start response error = %v", err)
+	}
+}
+
+func TestAutoRetrySuccessClearsTransientTurnError(t *testing.T) {
+	sess := &session{sessionID: "synthetic-session"}
+	sess.handleEvent([]byte(`{"type":"auto_retry_start","errorMessage":"temporary upstream failure"}`), "auto_retry_start")
+	sess.handleEvent([]byte(`{"type":"auto_retry_end","success":true,"attempt":1}`), "auto_retry_end")
+
+	sess.mu.RLock()
+	lastErr := sess.lastTurnErr
+	sess.mu.RUnlock()
+	if lastErr != "" {
+		t.Fatalf("lastTurnErr after successful retry = %q", lastErr)
+	}
+}
+
+func TestAutoRetryFailureUsesFinalError(t *testing.T) {
+	sess := &session{sessionID: "synthetic-session"}
+	sess.handleEvent([]byte(`{"type":"auto_retry_end","success":false,"attempt":3,"finalError":"retry exhausted"}`), "auto_retry_end")
+
+	sess.mu.RLock()
+	lastErr := sess.lastTurnErr
+	sess.mu.RUnlock()
+	if lastErr != "retry exhausted" {
+		t.Fatalf("lastTurnErr after failed retry = %q, want retry exhausted", lastErr)
 	}
 }
 
@@ -376,7 +524,8 @@ func TestRuntimeUIDemoEmitsExtensionUIAndAcceptsResponses(t *testing.T) {
 }
 
 func TestRuntimeRealSDKExtensionUIRoundTripCompletesTurn(t *testing.T) {
-	root := repoRoot(t)
+	repo := repoRoot(t)
+	runtimeRoot := t.TempDir()
 	agentDir := filepath.Join(t.TempDir(), "agent")
 	extensionDir := filepath.Join(agentDir, "extensions")
 	if err := os.MkdirAll(extensionDir, 0o755); err != nil {
@@ -401,9 +550,10 @@ export default function mindfsUIRoundTrip(pi) {
 	sess, err := NewRuntime().OpenSession(ctx, OpenOptions{
 		AgentName:  "pi",
 		SessionKey: "sdk-real-ui-test",
-		RootPath:   root,
+		RootPath:   runtimeRoot,
 		Command:    "pi",
 		Probe:      true,
+		ProbePath:  filepath.Join(repo, "server", "internal", "agent", "pi_sdk_bridge", "probe.mjs"),
 		AgentDir:   agentDir,
 	})
 	if err != nil {
@@ -416,17 +566,21 @@ export default function mindfsUIRoundTrip(pi) {
 	go func() {
 		done <- sess.SendMessage(ctx, "/mindfs-ui-roundtrip")
 	}()
-	waitForEvent(t, events, mu, agenttypes.EventTypeExtensionUI)
-
 	var selectReq agenttypes.ExtensionUIRequest
-	for _, ev := range snapshotEvents(events, mu) {
-		if ev.Type != agenttypes.EventTypeExtensionUI {
-			continue
+	selectDeadline := time.Now().Add(10 * time.Second)
+	for selectReq.ID == "" && time.Now().Before(selectDeadline) {
+		for _, ev := range snapshotEvents(events, mu) {
+			if ev.Type != agenttypes.EventTypeExtensionUI {
+				continue
+			}
+			req, ok := ev.Data.(agenttypes.ExtensionUIRequest)
+			if ok && req.Method == "select" {
+				selectReq = req
+				break
+			}
 		}
-		req, ok := ev.Data.(agenttypes.ExtensionUIRequest)
-		if ok && req.Method == "select" {
-			selectReq = req
-			break
+		if selectReq.ID == "" {
+			time.Sleep(10 * time.Millisecond)
 		}
 	}
 	if selectReq.ID == "" {
@@ -916,6 +1070,47 @@ func TestRuntimeSettlementWakesExistingAndFollowUpWaiters(t *testing.T) {
 	}
 }
 
+func TestRuntimeSettlementWaitsForQueuedFollowUp(t *testing.T) {
+	sess := &session{closed: make(chan struct{})}
+	_, settled := sess.registerSettlementWaiter()
+
+	sess.handleEvent([]byte(`{"type":"queue_update","steering":[],"followUp":["queued"]}`), "queue_update")
+	sess.handleEvent([]byte(`{"type":"runtime_settled","reason":"cancelled_turn"}`), "runtime_settled")
+	select {
+	case err := <-settled:
+		t.Fatalf("old runtime settlement released queued follow-up: %v", err)
+	default:
+	}
+
+	sess.handleEvent([]byte(`{"type":"queue_update","steering":[],"followUp":[]}`), "queue_update")
+	sess.handleEvent([]byte(`{"type":"runtime_settled","reason":"follow_up_done"}`), "runtime_settled")
+	select {
+	case err := <-settled:
+		if err != nil {
+			t.Fatalf("follow-up settlement error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("follow-up waiter did not settle after its queue drained")
+	}
+}
+
+func TestRuntimeIdleTimeoutSettlesDespiteQueuedFollowUp(t *testing.T) {
+	sess := &session{closed: make(chan struct{})}
+	_, settled := sess.registerSettlementWaiter()
+	sess.handleEvent([]byte(`{"type":"queue_update","steering":[],"followUp":["stuck"]}`), "queue_update")
+	sess.handleEvent([]byte(`{"type":"recovery","message":"Pi SDK prompt idle timeout after 120000ms"}`), "recovery")
+	sess.handleEvent([]byte(`{"type":"runtime_settled","reason":"sdk_prompt_idle_timeout"}`), "runtime_settled")
+
+	select {
+	case err := <-settled:
+		if err == nil || !strings.Contains(err.Error(), "idle timeout") {
+			t.Fatalf("idle timeout settlement error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("idle timeout did not release waiter with a stuck follow-up")
+	}
+}
+
 func TestRuntimeNormalizesWhitelistedGoalState(t *testing.T) {
 	sess := openTestSession(t, "goal-state-settled")
 	events, mu := collectSessionEvents(sess)
@@ -1031,6 +1226,18 @@ func TestRuntimeModelModeControls(t *testing.T) {
 	}
 	if modes.CurrentModeID != "max" {
 		t.Fatalf("CurrentModeID = %q, want max", modes.CurrentModeID)
+	}
+}
+
+func TestRuntimeListModesReportsClosedSession(t *testing.T) {
+	sess := openTestSessionWithModelMode(t, "runtime-controls", "", "")
+	if err := sess.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := sess.ListModes(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "session closed") {
+		t.Fatalf("ListModes on closed runtime error = %v", err)
 	}
 }
 

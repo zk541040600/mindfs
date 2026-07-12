@@ -20,6 +20,20 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+func TestSessionStreamResponseIncludesRequestIDPayload(t *testing.T) {
+	resp := buildSessionStreamResponse("root", "session", "msg-123", &StreamEvent{Type: "message_chunk"})
+	if got := resp.Payload["request_id"]; got != "msg-123" {
+		t.Fatalf("payload request_id = %#v, want msg-123", got)
+	}
+}
+
+func TestReplayQueueResponseIncludesRequestIDPayload(t *testing.T) {
+	resp := buildSessionQueueUpdatedResponse("root", "session", "msg-123", nil, false)
+	if got := resp.Payload["request_id"]; got != "msg-123" {
+		t.Fatalf("payload request_id = %#v, want msg-123", got)
+	}
+}
+
 func TestSessionDoneResponseIncludesRequestIDPayload(t *testing.T) {
 	resp := buildSessionDoneResponse("root", "session", "msg-123", false)
 	if resp.ID != "msg-123" {
@@ -40,6 +54,16 @@ func TestSessionCancelledResponseIncludesRequestIDAndReplay(t *testing.T) {
 	}
 	if got := resp.Payload["replay"]; got != true {
 		t.Fatalf("payload replay = %#v, want true", got)
+	}
+}
+
+func TestStaleSessionCancelledResponseIsNonTerminalHint(t *testing.T) {
+	resp := buildStaleSessionCancelledResponse("cancel-123", "root", "session", "old-request")
+	if got := resp.Payload["stale"]; got != true {
+		t.Fatalf("payload stale = %#v, want true", got)
+	}
+	if _, replay := resp.Payload["replay"]; replay {
+		t.Fatalf("stale response unexpectedly marked for replay: %#v", resp.Payload)
 	}
 }
 
@@ -184,6 +208,35 @@ func TestStreamHubCancellationDropsLateStreamAndCannotBecomeDone(t *testing.T) {
 	}
 }
 
+func TestStreamHubRejectsStaleCallbacksAfterNewTurnStarts(t *testing.T) {
+	hub := NewStreamHub(nil)
+	hub.setPendingUserForRequest("root", "session", "request-A", "title", "pi", "model", "", "", "", false, "turn A")
+	hub.BroadcastSessionCancelled("root", "session", "cancel-A", "request-A")
+	hub.setPendingUserForRequest("root", "session", "request-B", "title", "pi", "model", "", "", "", false, "turn B")
+
+	if accepted := hub.appendReplyEventForRequest("session", "request-A", StreamEvent{
+		Type: "message_chunk",
+		Data: agenttypes.MessageChunk{Content: "late A"},
+	}); accepted {
+		t.Fatal("late turn A stream was accepted after turn B started")
+	}
+	hub.BroadcastSessionDone("root", "session", "request-A")
+	hub.BroadcastSessionError("root", "session", "request-A", "session.message_failed", "late A failure")
+
+	hub.mu.RLock()
+	terminal := hub.completed["session"]
+	hub.mu.RUnlock()
+	if terminal != nil {
+		t.Fatalf("stale terminal = %#v, want turn B to remain active", terminal)
+	}
+	if accepted := hub.appendReplyEventForRequest("session", "request-B", StreamEvent{
+		Type: "message_chunk",
+		Data: agenttypes.MessageChunk{Content: "turn B"},
+	}); !accepted {
+		t.Fatal("current turn B stream was rejected")
+	}
+}
+
 func TestRunSessionMessageFailureBroadcastsErrorWithoutDone(t *testing.T) {
 	rootDir := t.TempDir()
 	registry := rootfs.NewRegistry(filepath.Join(t.TempDir(), "registry.json"))
@@ -236,6 +289,54 @@ func TestRunSessionMessageFailureBroadcastsErrorWithoutDone(t *testing.T) {
 	}
 	if len(loaded.Exchanges) != 1 || loaded.Exchanges[0].Role != "user" {
 		t.Fatalf("exchanges = %#v, want user-only failure persistence", loaded.Exchanges)
+	}
+}
+
+func TestRunSessionMessageCancellationBroadcastsTerminal(t *testing.T) {
+	rootDir := t.TempDir()
+	registry := rootfs.NewRegistry(filepath.Join(t.TempDir(), "registry.json"))
+	root, err := registry.Upsert(rootDir)
+	if err != nil {
+		t.Fatalf("registry.Upsert: %v", err)
+	}
+	pool := agent.NewPool(agent.Config{Agents: []agent.Definition{{
+		Name:     "pi",
+		Command:  writeCancelledPiSDKForWSTest(t),
+		Protocol: agent.ProtocolPiSDK,
+	}}})
+	defer pool.CloseAll()
+	appContext := &AppContext{Dirs: registry, Agents: pool}
+	manager, err := appContext.GetSessionManager(root.ID)
+	if err != nil {
+		t.Fatalf("GetSessionManager: %v", err)
+	}
+	created, err := manager.Create(context.Background(), session.CreateInput{Type: session.TypeChat, Agent: "pi", Name: "cancellation test"})
+	if err != nil {
+		t.Fatalf("Create session: %v", err)
+	}
+
+	handler := &WSHandler{AppContext: appContext}
+	handler.runSessionMessage(sessionMessageJob{
+		RootID:      root.ID,
+		Key:         created.Key,
+		RequestID:   "request-cancelled",
+		SessionType: session.TypeChat,
+		SessionName: created.Name,
+		User: PendingUserMessage{
+			Agent:   "pi",
+			Content: "cancel this turn",
+		},
+	})
+
+	hub := appContext.GetSessionStreamHub()
+	hub.mu.RLock()
+	terminal := hub.completed[created.Key]
+	hub.mu.RUnlock()
+	if terminal == nil || terminal.RequestID != "request-cancelled" || !terminal.Cancelled {
+		t.Fatalf("terminal state = %#v, want request-scoped cancellation", terminal)
+	}
+	if hub.IsSessionReplying(created.Key) {
+		t.Fatal("cancelled session remained pending")
 	}
 }
 
@@ -382,6 +483,150 @@ func TestTurnUpdateTrackerWaitIdleTimesOutWhenUpdateNeverEnds(t *testing.T) {
 
 	if tracker.WaitIdle(context.Background(), 10*time.Millisecond, 30*time.Millisecond) {
 		t.Fatal("expected WaitIdle to time out while update remains in-flight")
+	}
+}
+
+func TestSessionJobShutdownWaitsForAcceptedQueueDrain(t *testing.T) {
+	handler := &WSHandler{}
+	parentStarted := make(chan struct{})
+	releaseParent := make(chan struct{})
+	childStarted := make(chan struct{})
+	releaseChild := make(chan struct{})
+	childAdmission := make(chan bool, 1)
+
+	if !handler.startSessionJob(false, func() {
+		close(parentStarted)
+		<-releaseParent
+		childAdmission <- handler.startSessionJob(true, func() {
+			close(childStarted)
+			<-releaseChild
+		})
+	}) {
+		t.Fatal("initial browser message job was rejected")
+	}
+	<-parentStarted
+
+	handler.BeginSessionShutdown()
+	if handler.startSessionJob(false, func() {}) {
+		t.Fatal("new browser message job was accepted after shutdown began")
+	}
+
+	waitCtx, cancelWait := context.WithTimeout(context.Background(), time.Second)
+	defer cancelWait()
+	waitDone := make(chan error, 1)
+	go func() {
+		waitDone <- handler.WaitSessionJobs(waitCtx)
+	}()
+
+	close(releaseParent)
+	if admitted := <-childAdmission; !admitted {
+		t.Fatal("accepted queued continuation was rejected during shutdown drain")
+	}
+	<-childStarted
+	select {
+	case err := <-waitDone:
+		t.Fatalf("WaitSessionJobs returned before queued continuation settled: %v", err)
+	case <-time.After(30 * time.Millisecond):
+	}
+
+	close(releaseChild)
+	select {
+	case err := <-waitDone:
+		if err != nil {
+			t.Fatalf("WaitSessionJobs returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("WaitSessionJobs did not finish after accepted chain drained")
+	}
+}
+
+func TestSessionShutdownPersistsAcceptedQueuedMessages(t *testing.T) {
+	ctx := context.Background()
+	rootDir := t.TempDir()
+	registry := rootfs.NewRegistry(filepath.Join(t.TempDir(), "registry.json"))
+	root, err := registry.Upsert(rootDir)
+	if err != nil {
+		t.Fatalf("registry.Upsert: %v", err)
+	}
+	manager := session.NewManager(root)
+	created, err := manager.Create(ctx, session.CreateInput{Type: session.TypeChat, Agent: "pi", Name: "shutdown drain"})
+	if err != nil {
+		t.Fatalf("Create session: %v", err)
+	}
+
+	promptMarker := filepath.Join(t.TempDir(), "prompt-started")
+	pool := agent.NewPool(agent.Config{Agents: []agent.Definition{{
+		Name:     "pi",
+		Command:  writeShutdownBlockingPiSDKForWSTest(t),
+		Protocol: agent.ProtocolPiSDK,
+		Env:      map[string]string{"MINDFS_TEST_PROMPT_MARKER": promptMarker},
+	}}})
+	defer pool.CloseAll()
+	appContext := &AppContext{Dirs: registry, Agents: pool}
+	appContext.mu.Lock()
+	appContext.roots = map[string]*RootContext{
+		root.ID: {Session: manager},
+	}
+	appContext.mu.Unlock()
+	handler := &WSHandler{AppContext: appContext}
+
+	if !handler.startSessionJob(false, func() {
+		handler.runSessionMessage(sessionMessageJob{
+			RootID:      root.ID,
+			Key:         created.Key,
+			RequestID:   "request-active",
+			SessionType: session.TypeChat,
+			SessionName: created.Name,
+			User: PendingUserMessage{
+				Agent:   "pi",
+				Content: "persist active input",
+			},
+		})
+	}) {
+		t.Fatal("active message job was rejected")
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, statErr := os.Stat(promptMarker); statErr == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("active Pi prompt did not start")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	hub := appContext.GetSessionStreamHub()
+	hub.EnqueueSessionMessage(root.ID, created.Key, created.Name, QueuedUserMessage{
+		ID: "request-queued",
+		PendingUserMessage: PendingUserMessage{
+			Agent:     "pi",
+			Content:   "persist queued input",
+			Timestamp: time.Now().UTC(),
+		},
+	})
+
+	handler.BeginSessionShutdown()
+	pool.CloseAll()
+	waitCtx, cancelWait := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelWait()
+	if err := handler.WaitSessionJobs(waitCtx); err != nil {
+		t.Fatalf("WaitSessionJobs: %v", err)
+	}
+
+	loaded, err := manager.Get(ctx, created.Key, 0)
+	if err != nil {
+		t.Fatalf("Get drained session: %v", err)
+	}
+	if len(loaded.Exchanges) != 2 {
+		t.Fatalf("drained exchanges = %#v, want two persisted user inputs", loaded.Exchanges)
+	}
+	if loaded.Exchanges[0].Role != "user" || loaded.Exchanges[0].Content != "persist active input" {
+		t.Fatalf("first drained exchange = %#v", loaded.Exchanges[0])
+	}
+	if loaded.Exchanges[1].Role != "user" || loaded.Exchanges[1].Content != "persist queued input" {
+		t.Fatalf("second drained exchange = %#v", loaded.Exchanges[1])
 	}
 }
 
@@ -599,6 +844,71 @@ for line in sys.stdin:
         send({"id": req_id, "type": "response", "command": typ, "success": True, "data": {"sessionId": "ws-failing-pi", "isStreaming": False, "pendingMessageCount": 0}})
     elif typ == "prompt":
         send({"id": req_id, "type": "response", "command": typ, "success": False, "error": {"code": "E_UPSTREAM", "message": "upstream unavailable"}})
+    else:
+        send({"id": req_id, "type": "response", "command": typ, "success": True, "data": {}})
+`
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake pi sdk: %v", err)
+	}
+	return path
+}
+
+func writeCancelledPiSDKForWSTest(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "fake-node")
+	script := `#!/usr/bin/env python3
+import json
+import sys
+
+def send(obj):
+    print(json.dumps(obj), flush=True)
+
+for line in sys.stdin:
+    req = json.loads(line)
+    req_id = req.get("id")
+    typ = req.get("type")
+    if typ == "start_sdk_runtime":
+        send({"id": req_id, "type": "response", "command": typ, "success": True, "data": {"sessionId": "ws-cancelled-pi"}})
+    elif typ == "get_state":
+        send({"id": req_id, "type": "response", "command": typ, "success": True, "data": {"sessionId": "ws-cancelled-pi", "isStreaming": False, "pendingMessageCount": 0}})
+    elif typ == "prompt":
+        send({"id": req_id, "type": "response", "command": typ, "success": True, "data": {"runtime": "sdk"}})
+        send({"type": "agent_start"})
+        send({"type": "runtime_settled", "reason": "upstream_cancelled", "errorMessage": "operation cancelled"})
+    else:
+        send({"id": req_id, "type": "response", "command": typ, "success": True, "data": {}})
+`
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake pi sdk: %v", err)
+	}
+	return path
+}
+
+func writeShutdownBlockingPiSDKForWSTest(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "fake-node")
+	script := `#!/usr/bin/env python3
+import json
+import os
+import sys
+
+marker = os.environ.get("MINDFS_TEST_PROMPT_MARKER", "")
+
+def send(obj):
+    print(json.dumps(obj), flush=True)
+
+for line in sys.stdin:
+    req = json.loads(line)
+    req_id = req.get("id")
+    typ = req.get("type")
+    if typ == "start_sdk_runtime":
+        send({"id": req_id, "type": "response", "command": typ, "success": True, "data": {"sessionId": "ws-shutdown-pi"}})
+    elif typ == "get_state":
+        send({"id": req_id, "type": "response", "command": typ, "success": True, "data": {"sessionId": "ws-shutdown-pi", "isStreaming": False, "pendingMessageCount": 0}})
+    elif typ == "prompt":
+        if marker:
+            open(marker, "w", encoding="utf-8").close()
+        send({"id": req_id, "type": "response", "command": typ, "success": True, "data": {"runtime": "sdk"}})
     else:
         send({"id": req_id, "type": "response", "command": typ, "success": True, "data": {}})
 `

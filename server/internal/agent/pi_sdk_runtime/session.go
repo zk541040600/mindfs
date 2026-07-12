@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"mindfs/server/internal/agent/diagnostic"
 	pisdkbridge "mindfs/server/internal/agent/pi_sdk_bridge"
 	agenttypes "mindfs/server/internal/agent/types"
 )
@@ -24,7 +25,6 @@ const (
 	defaultNodeCommand                = "node"
 	defaultCommandTimeout             = 30 * time.Second
 	startupTimeout                    = 45 * time.Second
-	messageEndFallbackDelay           = 1500 * time.Millisecond
 	maxBufferedEventsBeforeSubscriber = 256
 )
 
@@ -69,7 +69,7 @@ func (r *Runtime) OpenSession(ctx context.Context, opts OpenOptions) (agenttypes
 	if rootPath := strings.TrimSpace(opts.RootPath); rootPath != "" {
 		cmd.Dir = rootPath
 	}
-	cmd.Env = mergeEnv(opts.Env)
+	cmd.Env = mergeEnv(opts.Env, cmd.Dir)
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -107,9 +107,17 @@ func (r *Runtime) OpenSession(ctx context.Context, opts OpenOptions) (agenttypes
 		closed:             make(chan struct{}),
 	}
 	r.register(s)
-	go s.readLoop(stdout)
-	go s.stderrLoop(stderr)
-	go s.waitLoop()
+	var outputReaders sync.WaitGroup
+	outputReaders.Add(2)
+	go func() {
+		defer outputReaders.Done()
+		s.readLoop(stdout)
+	}()
+	go func() {
+		defer outputReaders.Done()
+		s.stderrLoop(stderr)
+	}()
+	go s.waitLoop(&outputReaders)
 
 	startCtx, cancel := context.WithTimeout(ctx, startupTimeout)
 	defer cancel()
@@ -119,7 +127,10 @@ func (r *Runtime) OpenSession(ctx context.Context, opts OpenOptions) (agenttypes
 		_ = s.Close()
 		return nil, err
 	}
-	s.applyStartResponse(startResp)
+	if err := s.applyStartResponse(startResp, strings.TrimSpace(opts.TestScenario) == ""); err != nil {
+		_ = s.Close()
+		return nil, err
+	}
 	return s, nil
 }
 
@@ -147,10 +158,10 @@ func startPayloadForOptions(opts OpenOptions) map[string]any {
 	return payload
 }
 
-// applyStartResponse mirrors SDK startup metadata into the runtime cache before the first prompt is persisted.
-func (s *session) applyStartResponse(resp bridgeResponse) {
+// applyStartResponse validates startup metadata before mirroring it into the runtime cache.
+func (s *session) applyStartResponse(resp bridgeResponse, requireSessionID bool) error {
 	if len(resp.Data) == 0 {
-		return
+		return errors.New("pi sdk runtime start response missing data")
 	}
 	var data struct {
 		SessionID     string          `json:"sessionId"`
@@ -158,7 +169,10 @@ func (s *session) applyStartResponse(resp bridgeResponse) {
 		Model         json.RawMessage `json:"model"`
 	}
 	if err := json.Unmarshal(resp.Data, &data); err != nil {
-		return
+		return fmt.Errorf("pi sdk runtime start response decode failed: %w", err)
+	}
+	if requireSessionID && strings.TrimSpace(data.SessionID) == "" {
+		return errors.New("pi sdk runtime start response missing sessionId")
 	}
 	s.mu.Lock()
 	if sessionID := strings.TrimSpace(data.SessionID); sessionID != "" {
@@ -171,6 +185,7 @@ func (s *session) applyStartResponse(resp bridgeResponse) {
 		s.model = model
 	}
 	s.mu.Unlock()
+	return nil
 }
 
 // parseStartResponseModel accepts both current object-shaped SDK models and older string-shaped model ids.
@@ -263,6 +278,7 @@ type session struct {
 	model                   string
 	mode                    string
 	contextStats            agenttypes.ContextWindow
+	pendingMessageCount     int
 	eventBacklog            []agenttypes.Event
 	seenText                bool
 	seenThinking            bool
@@ -272,12 +288,12 @@ type session struct {
 	turnComplete            bool
 	turn                    agenttypes.TurnCanceler
 	settlementMu            sync.Mutex
-	settlementEpoch         uint64
 	settlementWaiterSeq     uint64
 	settlementWaiters       map[uint64]chan error
 
 	closeOnce sync.Once
 	closed    chan struct{}
+	closeErr  error
 }
 
 type bridgeResponse struct {
@@ -301,7 +317,7 @@ func resolveNodeCommand(command string) string {
 	return command
 }
 
-func mergeEnv(extra map[string]string) []string {
+func mergeEnv(extra map[string]string, cwd string) []string {
 	env := os.Environ()
 	for key, value := range extra {
 		key = strings.TrimSpace(key)
@@ -309,6 +325,9 @@ func mergeEnv(extra map[string]string) []string {
 			continue
 		}
 		env = append(env, key+"="+value)
+	}
+	if cwd = strings.TrimSpace(cwd); cwd != "" {
+		env = append(env, "PWD="+cwd)
 	}
 	return env
 }
@@ -337,7 +356,7 @@ func (s *session) requestWithID(ctx context.Context, id string, payload map[stri
 	select {
 	case <-s.closed:
 		s.mu.Unlock()
-		return bridgeResponse{}, errors.New("pi sdk runtime session closed")
+		return bridgeResponse{}, s.closedError()
 	default:
 	}
 	s.pending[id] = ch
@@ -359,7 +378,7 @@ func (s *session) requestWithID(ctx context.Context, id string, payload map[stri
 		return bridgeResponse{}, ctx.Err()
 	case <-s.closed:
 		s.deletePending(id)
-		return bridgeResponse{}, errors.New("pi sdk runtime session closed")
+		return bridgeResponse{}, s.closedError()
 	}
 }
 
@@ -398,7 +417,7 @@ func (r bridgeResponse) error() error {
 }
 
 func responseFromError(err error) bridgeResponse {
-	if err == nil {
+	if err == nil || errors.Is(err, io.EOF) {
 		err = errors.New("pi sdk runtime process exited")
 	}
 	raw, _ := json.Marshal(map[string]string{"code": "E_CLOSED", "message": err.Error()})
@@ -433,10 +452,13 @@ func (s *session) readLoop(stdout io.Reader) {
 			s.handleLine(strings.TrimRight(line, "\r\n"))
 		}
 		if err != nil {
-			if !errors.Is(err, io.EOF) && !s.isClosed() {
+			if !errors.Is(err, io.EOF) && !s.Closed() {
 				log.Printf("[agent/pi-sdk] stdout.error session=%s err=%v", s.sessionKey, err)
+				s.failPending(err)
+				if s.cmd != nil && s.cmd.Process != nil {
+					_ = s.cmd.Process.Kill()
+				}
 			}
-			s.failPending(err)
 			return
 		}
 	}
@@ -446,17 +468,25 @@ func (s *session) stderrLoop(stderr io.Reader) {
 	scanner := bufio.NewScanner(stderr)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
+		line := sanitizeDiagnosticLine(scanner.Text())
 		if line != "" {
 			log.Printf("[agent/pi-sdk][stderr] agent=%s %s", s.agentName, line)
 		}
 	}
+	if err := scanner.Err(); err != nil && !s.Closed() {
+		log.Printf("[agent/pi-sdk] stderr.error session=%s agent=%s err=%v", s.sessionKey, s.agentName, err)
+	}
 }
 
-func (s *session) waitLoop() {
+func (s *session) waitLoop(outputReaders *sync.WaitGroup) {
+	outputReaders.Wait()
 	err := s.cmd.Wait()
-	if err != nil && !s.isClosed() {
-		log.Printf("[agent/pi-sdk] process.exit session=%s err=%v", s.sessionKey, err)
+	if !s.Closed() {
+		exitCode := -1
+		if s.cmd.ProcessState != nil {
+			exitCode = s.cmd.ProcessState.ExitCode()
+		}
+		log.Printf("[agent/pi-sdk] process.exit session=%s agent=%s exit_code=%d err=%v", s.sessionKey, s.agentName, exitCode, err)
 	}
 	s.closeWithError(err)
 	if s.runtime != nil {
@@ -466,9 +496,22 @@ func (s *session) waitLoop() {
 
 func (s *session) closeWithError(err error) {
 	s.closeOnce.Do(func() {
+		if err == nil {
+			err = errors.New("pi sdk runtime process exited")
+		} else {
+			err = fmt.Errorf("pi sdk runtime process exited: %w", err)
+		}
+		s.closeErr = err
 		close(s.closed)
 		s.failPending(err)
 	})
+}
+
+func (s *session) closedError() error {
+	if s.closeErr != nil {
+		return s.closeErr
+	}
+	return errors.New("pi sdk runtime session closed")
 }
 
 func (s *session) failPending(err error) {
@@ -593,8 +636,10 @@ func (s *session) handleEvent(raw []byte, eventType string) {
 	case "tool_execution_end":
 		s.handleToolExecutionEnd(raw)
 	case "recovery", "auto_retry_start", "auto_retry_end", "compaction_start", "compaction_end":
-		s.handleRecovery(raw)
-	case "queue_update", "turn_start", "session_info_changed":
+		s.handleRecovery(raw, eventType)
+	case "queue_update":
+		s.handleQueueUpdate(raw)
+	case "turn_start", "session_info_changed":
 	default:
 		log.Printf("[agent/pi-sdk] stdout.ignored_event session=%s type=%q", s.sessionKey, eventType)
 	}
@@ -860,15 +905,37 @@ func (s *session) handleContextWindow(raw []byte) {
 	s.mu.Unlock()
 }
 
-func (s *session) handleRecovery(raw []byte) {
+func (s *session) handleQueueUpdate(raw []byte) {
+	var ev struct {
+		Steering []json.RawMessage `json:"steering"`
+		FollowUp []json.RawMessage `json:"followUp"`
+	}
+	if err := json.Unmarshal(raw, &ev); err != nil {
+		return
+	}
+	s.mu.Lock()
+	s.pendingMessageCount = len(ev.Steering) + len(ev.FollowUp)
+	s.mu.Unlock()
+}
+
+func (s *session) handleRecovery(raw []byte, eventType string) {
 	var ev struct {
 		Message      string `json:"message"`
 		ErrorMessage string `json:"errorMessage"`
+		FinalError   string `json:"finalError"`
+		Success      *bool  `json:"success"`
 	}
 	_ = json.Unmarshal(raw, &ev)
+	if eventType == "auto_retry_end" && ev.Success != nil && *ev.Success {
+		s.setLastTurnErr("")
+		return
+	}
 	message := strings.TrimSpace(ev.Message)
 	if message == "" {
 		message = strings.TrimSpace(ev.ErrorMessage)
+	}
+	if message == "" {
+		message = strings.TrimSpace(ev.FinalError)
 	}
 	if message == "" {
 		return
@@ -910,6 +977,7 @@ func (s *session) handleAgentEnd(raw []byte) {
 // handleRuntimeSettled completes the MindFS turn at the SDK's authoritative idle boundary.
 func (s *session) handleRuntimeSettled(raw []byte) {
 	var ev struct {
+		Reason        string `json:"reason"`
 		Error         string `json:"error"`
 		ErrorMessage  string `json:"errorMessage"`
 		FailureReason string `json:"failureReason"`
@@ -921,6 +989,13 @@ func (s *session) handleRuntimeSettled(raw []byte) {
 	}
 	if message == "" {
 		message = strings.TrimSpace(ev.FailureReason)
+	}
+	s.mu.RLock()
+	pendingMessages := s.pendingMessageCount
+	s.mu.RUnlock()
+	if message == "" && pendingMessages > 0 && strings.TrimSpace(ev.Reason) != "sdk_prompt_idle_timeout" {
+		log.Printf("[agent/pi-sdk] runtime.settlement_deferred session=%s pending=%d reason=%q", s.sessionKey, pendingMessages, strings.TrimSpace(ev.Reason))
+		return
 	}
 	if message != "" {
 		s.setLastTurnErr(message)
@@ -1245,7 +1320,6 @@ func (s *session) unregisterSettlementWaiter(waiterID uint64) {
 
 func (s *session) signalSettlement(err error) {
 	s.settlementMu.Lock()
-	s.settlementEpoch++
 	waiters := s.settlementWaiters
 	s.settlementWaiters = make(map[uint64]chan error)
 	s.settlementMu.Unlock()
@@ -1347,7 +1421,7 @@ func (s *session) waitForTurn(ctx context.Context, waiterID uint64, settlement <
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-s.closed:
-		return errors.New("pi sdk runtime session closed")
+		return s.closedError()
 	}
 }
 
@@ -1498,7 +1572,9 @@ func (s *session) SetPlanMode(_ context.Context, _ bool) error {
 }
 
 func (s *session) ListModes(ctx context.Context) (agenttypes.ModeList, error) {
-	_ = s.refreshState(ctx)
+	if err := s.refreshState(ctx); err != nil {
+		return agenttypes.ModeList{}, err
+	}
 	modes := []agenttypes.ModeInfo{
 		{ID: "off", Name: "Thinking: off"},
 		{ID: "minimal", Name: "Thinking: minimal"},
@@ -1637,6 +1713,7 @@ func (s *session) RuntimeActivity(ctx context.Context) (agenttypes.RuntimeActivi
 	if strings.TrimSpace(data.SessionID) != "" {
 		s.sessionID = strings.TrimSpace(data.SessionID)
 	}
+	s.pendingMessageCount = data.PendingMessageCount
 	if strings.TrimSpace(data.ThinkingLevel) != "" {
 		s.mode = strings.TrimSpace(data.ThinkingLevel)
 	}
@@ -2098,6 +2175,7 @@ func rawValueString(value any) string {
 
 func (s *session) Close() error {
 	s.closeOnce.Do(func() {
+		s.closeErr = errors.New("pi sdk runtime session closed")
 		close(s.closed)
 		if s.stdin != nil {
 			_ = s.stdin.Close()
@@ -2105,18 +2183,23 @@ func (s *session) Close() error {
 		if s.cmd != nil && s.cmd.Process != nil {
 			_ = s.cmd.Process.Kill()
 		}
-		s.failPending(errors.New("pi sdk runtime session closed"))
+		s.failPending(s.closeErr)
 	})
 	return nil
 }
 
-func (s *session) isClosed() bool {
+// Closed reports whether the Pi SDK bridge process lifecycle has ended.
+func (s *session) Closed() bool {
 	select {
 	case <-s.closed:
 		return true
 	default:
 		return false
 	}
+}
+
+func sanitizeDiagnosticLine(line string) string {
+	return preview(diagnostic.Redact(line))
 }
 
 func preview(s string) string {

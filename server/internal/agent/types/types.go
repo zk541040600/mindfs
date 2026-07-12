@@ -3,7 +3,6 @@ package types
 import (
 	"context"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -454,11 +453,11 @@ type TurnCanceler struct {
 
 func (t *TurnCanceler) Begin(parent context.Context) (context.Context, uint64) {
 	turnCtx, cancel := context.WithCancel(parent)
-	turnID := atomic.AddUint64(&t.turnID, 1)
 
 	t.mu.Lock()
+	t.turnID++
+	turnID := t.turnID
 	t.cancel = cancel
-	t.turnID = turnID
 	t.mu.Unlock()
 
 	return turnCtx, turnID

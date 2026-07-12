@@ -55,6 +55,10 @@ type WSHandler struct {
 	githubOnce      sync.Once
 	requestMu       sync.Mutex
 	requests        map[string]time.Time
+	sessionJobMu    sync.Mutex
+	sessionJobs     int
+	sessionJobsIdle chan struct{}
+	sessionShutdown bool
 }
 
 type StreamEvent struct {
@@ -138,6 +142,78 @@ func (t *turnUpdateTracker) WaitIdle(ctx context.Context, settleWindow, maxWait 
 			return false
 		case <-ticker.C:
 		}
+	}
+}
+
+func (h *WSHandler) startSessionJob(allowDuringShutdown bool, run func()) bool {
+	if h == nil || run == nil {
+		return false
+	}
+	h.sessionJobMu.Lock()
+	if h.sessionShutdown && !allowDuringShutdown {
+		h.sessionJobMu.Unlock()
+		return false
+	}
+	if h.sessionJobs == 0 {
+		h.sessionJobsIdle = make(chan struct{})
+	}
+	h.sessionJobs++
+	h.sessionJobMu.Unlock()
+
+	go func() {
+		defer h.finishSessionJob()
+		run()
+	}()
+	return true
+}
+
+func (h *WSHandler) finishSessionJob() {
+	if h == nil {
+		return
+	}
+	h.sessionJobMu.Lock()
+	defer h.sessionJobMu.Unlock()
+	if h.sessionJobs <= 0 {
+		return
+	}
+	h.sessionJobs--
+	if h.sessionJobs == 0 && h.sessionJobsIdle != nil {
+		close(h.sessionJobsIdle)
+		h.sessionJobsIdle = nil
+	}
+}
+
+// BeginSessionShutdown rejects new browser message jobs while accepted work drains.
+func (h *WSHandler) BeginSessionShutdown() {
+	if h == nil {
+		return
+	}
+	h.sessionJobMu.Lock()
+	h.sessionShutdown = true
+	h.sessionJobMu.Unlock()
+}
+
+// WaitSessionJobs waits for accepted browser messages and queued continuations to settle.
+func (h *WSHandler) WaitSessionJobs(ctx context.Context) error {
+	if h == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	h.sessionJobMu.Lock()
+	if h.sessionJobs == 0 {
+		h.sessionJobMu.Unlock()
+		return nil
+	}
+	idle := h.sessionJobsIdle
+	h.sessionJobMu.Unlock()
+
+	select {
+	case <-idle:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
@@ -484,7 +560,11 @@ func (h *WSHandler) handleWSRequest(ctx context.Context, conn *websocket.Conn, c
 	case "ping":
 		h.handleWSPing(conn, clientID, req)
 	case "session.message":
-		go h.handleSessionMessage(ctx, conn, clientID, req)
+		if !h.startSessionJob(false, func() {
+			h.handleSessionMessage(ctx, conn, clientID, req)
+		}) {
+			h.sendWSError(conn, clientID, req.ID, "server_shutting_down", "server is shutting down; retry after reconnect")
+		}
 	case "session.slash_command.run":
 		go h.handleSessionSlashCommandRun(ctx, conn, clientID, req)
 	case "session.plan_mode.set":
@@ -913,7 +993,7 @@ func (h *WSHandler) runSessionMessage(job sessionMessageJob) {
 		ClientCtx:    job.ClientCtx,
 		OnStart: func() {
 			h.AppContext.ClearTaskAuxFlagsForSession(rootID, key)
-			streamHub.BroadcastSessionUserMessage(rootID, key, job.SessionType, job.SessionName, job.User.Agent, job.User.Model, job.User.Mode, job.User.Effort, job.User.FastService, job.User.PlanMode, job.User.Content, job.ExcludeClientID, job.Queued)
+			streamHub.broadcastSessionUserMessageForRequest(rootID, key, requestID, job.SessionType, job.SessionName, job.User.Agent, job.User.Model, job.User.Mode, job.User.Effort, job.User.FastService, job.User.PlanMode, job.User.Content, job.ExcludeClientID, job.Queued)
 		},
 		OnUpdate: func(update agenttypes.Event) {
 			updateTracker.Begin()
@@ -921,7 +1001,7 @@ func (h *WSHandler) runSessionMessage(job sessionMessageJob) {
 			if updateToEvent(update) == nil {
 				return
 			}
-			h.AppContext.BroadcastSessionUpdate(rootID, key, update)
+			h.AppContext.broadcastSessionUpdateForRequest(rootID, key, requestID, update)
 		},
 		OnSubSessionCreated: func(created *session.Session) {
 			h.broadcastSessionMetaUpdated(rootID, created)
@@ -949,8 +1029,24 @@ func (h *WSHandler) runSessionMessage(job sessionMessageJob) {
 		},
 	})
 	if err != nil {
+		if errors.Is(err, usecase.ErrSessionRequestAlreadyCompleted) {
+			log.Printf("[ws] session.message.duplicate_completed root=%s session=%s request=%s action=replay_done", rootID, key, requestID)
+			h.AppContext.BroadcastSessionDone(rootID, key, requestID)
+			h.startNextQueuedSessionMessage(rootID, key)
+			return
+		}
+		if errors.Is(err, usecase.ErrSessionRequestInterrupted) {
+			log.Printf("[ws] session.message.duplicate_interrupted root=%s session=%s request=%s action=fail_without_replay", rootID, key, requestID)
+			h.AppContext.BroadcastSessionErrorForRequest(rootID, key, requestID, "消息已在服务重启前保存，但执行结果无法确认；为避免重复操作未自动重试，请重新发送。")
+			h.startNextQueuedSessionMessage(rootID, key)
+			return
+		}
 		if errors.Is(err, context.Canceled) {
 			log.Printf("[ws] session.message.cancelled root=%s session=%s request=%s", rootID, key, requestID)
+			streamHub.BroadcastSessionCancelled(rootID, key, requestID, requestID)
+			if !streamHub.IsSessionReplying(key) {
+				h.startNextQueuedSessionMessage(rootID, key)
+			}
 			return
 		}
 		if ok := updateTracker.WaitIdle(msgCtx, sessionDoneSettleWindow, sessionDoneMaxWait); !ok {
@@ -988,7 +1084,7 @@ func (h *WSHandler) startNextQueuedSessionMessage(rootID, key string) {
 		sessionName = current.Name
 		shell = current.Shell
 	}
-	go h.runSessionMessage(sessionMessageJob{
+	job := sessionMessageJob{
 		RootID:      rootID,
 		Key:         key,
 		RequestID:   item.ID,
@@ -998,8 +1094,12 @@ func (h *WSHandler) startNextQueuedSessionMessage(rootID, key string) {
 		User:        item.PendingUserMessage,
 		ClientCtx:   item.ClientCtx,
 		Queued:      true,
-	})
-
+	}
+	if !h.startSessionJob(true, func() {
+		h.runSessionMessage(job)
+	}) {
+		log.Printf("[ws] session.queue.drain_rejected root=%s session=%s request=%s", rootID, key, item.ID)
+	}
 }
 
 func (h *WSHandler) handleSessionReady(clientID string, req WSRequest) {
@@ -1044,6 +1144,9 @@ func (h *WSHandler) handleSessionCancel(ctx context.Context, conn *websocket.Con
 
 	uc := &usecase.Service{Registry: h.AppContext}
 	turnRequestID := getString(req.Payload, "request_id")
+	if strings.TrimSpace(turnRequestID) == "" {
+		turnRequestID = streamHub.currentRequestID(key)
+	}
 	err := uc.CancelSessionTurn(ctx, usecase.CancelSessionTurnInput{
 		RootID:    rootID,
 		Key:       key,
@@ -1062,11 +1165,7 @@ func (h *WSHandler) handleSessionCancel(ctx context.Context, conn *websocket.Con
 		h.sendWSError(conn, clientID, req.ID, "session.cancel_failed", err.Error())
 		return
 	}
-	cancelledRequestID := turnRequestID
-	if strings.TrimSpace(cancelledRequestID) == "" {
-		cancelledRequestID = req.ID
-	}
-	streamHub.BroadcastSessionCancelled(rootID, key, req.ID, cancelledRequestID)
+	streamHub.BroadcastSessionCancelled(rootID, key, req.ID, turnRequestID)
 }
 
 func (h *WSHandler) acknowledgeStaleSessionCancel(conn *websocket.Conn, clientID, responseID, rootID, key, turnRequestID string, streamHub *StreamHub) {
@@ -1075,7 +1174,11 @@ func (h *WSHandler) acknowledgeStaleSessionCancel(conn *websocket.Conn, clientID
 			streamHub.BroadcastSessionQueueUpdated(rootID, key, queue)
 		}
 	}
-	h.sendWSCancelled(conn, clientID, responseID, rootID, key, turnRequestID)
+	if conn == nil {
+		return
+	}
+	resp := buildStaleSessionCancelledResponse(responseID, rootID, key, turnRequestID)
+	_ = h.writeWSJSON(clientID, conn, resp)
 }
 
 func (h *WSHandler) handleSessionQueueRemove(_ context.Context, conn *websocket.Conn, clientID string, req WSRequest) {
@@ -1162,14 +1265,6 @@ func (h *WSHandler) sendE2EEError(conn *websocket.Conn, id, code string) {
 		},
 	}
 	_ = h.writeWSJSON("", conn, resp)
-}
-
-func (h *WSHandler) sendWSCancelled(conn *websocket.Conn, clientID, id, rootID, sessionKey, requestID string) {
-	if conn == nil {
-		return
-	}
-	resp := buildSessionCancelledResponse(id, rootID, sessionKey, requestID, false)
-	_ = h.writeWSJSON(clientID, conn, resp)
 }
 
 func (h *WSHandler) sendWSAccepted(conn *websocket.Conn, clientID, requestID, rootID, sessionKey string) {

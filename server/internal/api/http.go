@@ -765,8 +765,11 @@ func (h *HTTPHandler) handleSessionGet(w http.ResponseWriter, r *http.Request) {
 	}
 	uc := h.service()
 	var pendingUser *session.Exchange
+	pending := false
 	if h.AppContext != nil {
-		pendingUser = h.AppContext.GetSessionStreamHub().GetPendingUserExchange(key)
+		streamHub := h.AppContext.GetSessionStreamHub()
+		pendingUser = streamHub.GetPendingUserExchange(key)
+		pending = streamHub.IsSessionReplying(key)
 	}
 	if pendingUser == nil {
 		if _, err := uc.SyncExternalSessionDelta(r.Context(), usecase.SyncExternalSessionDeltaInput{
@@ -794,7 +797,7 @@ func (h *HTTPHandler) handleSessionGet(w http.ResponseWriter, r *http.Request) {
 		Key:    key,
 		Seq:    afterSeq,
 	})
-	respondJSON(w, http.StatusOK, h.sessionResponse(out, pendingUser, contextWindow, exchangeAux))
+	respondJSON(w, http.StatusOK, h.sessionResponse(out, pendingUser, pending, contextWindow, exchangeAux))
 }
 
 func (h *HTTPHandler) handleSessionSync(w http.ResponseWriter, r *http.Request) {
@@ -836,7 +839,11 @@ func (h *HTTPHandler) handleSessionSync(w http.ResponseWriter, r *http.Request) 
 		Key:    key,
 		Seq:    afterSeq,
 	})
-	respondJSON(w, http.StatusOK, h.sessionResponse(out, nil, contextWindow, exchangeAux))
+	pending := false
+	if h.AppContext != nil {
+		pending = h.AppContext.GetSessionStreamHub().IsSessionReplying(key)
+	}
+	respondJSON(w, http.StatusOK, h.sessionResponse(out, nil, pending, contextWindow, exchangeAux))
 }
 
 func (h *HTTPHandler) handleSessionToolCallGet(w http.ResponseWriter, r *http.Request) {
@@ -955,7 +962,7 @@ func (h *HTTPHandler) handleSessionFork(w http.ResponseWriter, r *http.Request) 
 	}
 	respondJSON(w, http.StatusOK, map[string]any{
 		"session_key": out.Session.Key,
-		"session":     h.sessionResponse(out.Session, nil, agenttypes.ContextWindow{}, nil),
+		"session":     h.sessionResponse(out.Session, nil, false, agenttypes.ContextWindow{}, nil),
 	})
 }
 
@@ -1025,6 +1032,7 @@ func (h *HTTPHandler) handleSessionDelete(w http.ResponseWriter, r *http.Request
 func (h *HTTPHandler) sessionResponse(
 	s *session.Session,
 	pendingUser *session.Exchange,
+	pending bool,
 	contextWindow agenttypes.ContextWindow,
 	exchangeAux map[int][]session.ExchangeAux,
 ) map[string]any {
@@ -1056,6 +1064,7 @@ func (h *HTTPHandler) sessionResponse(
 		"effort":              session.InferEffortFromSession(s),
 		"fast_service":        session.InferFastServiceFromSession(s),
 		"plan_mode":           s.PlanMode,
+		"pending":             pending,
 		"shell":               h.commandShellForResponse(s, exchangeAux),
 		"name":                s.Name,
 		"exchanges":           exchanges,

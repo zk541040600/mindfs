@@ -13,10 +13,39 @@ import (
 	"testing"
 	"time"
 
+	agenttypes "mindfs/server/internal/agent/types"
 	"mindfs/server/internal/e2ee"
 	"mindfs/server/internal/fs"
 	"mindfs/server/internal/relay"
+	"mindfs/server/internal/session"
 )
+
+func TestSessionResponseIncludesAuthoritativePendingState(t *testing.T) {
+	handler := &HTTPHandler{}
+	sess := &session.Session{
+		Key:       "session-1",
+		Type:      session.TypeChat,
+		Name:      "Restarted session",
+		CreatedAt: time.Now().UTC(),
+		UpdatedAt: time.Now().UTC(),
+	}
+
+	for _, tt := range []struct {
+		name    string
+		pending bool
+	}{
+		{name: "active turn", pending: true},
+		{name: "fresh process", pending: false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			payload := handler.sessionResponse(sess, nil, tt.pending, agenttypes.ContextWindow{}, nil)
+			pending, ok := payload["pending"].(bool)
+			if !ok || pending != tt.pending {
+				t.Fatalf("pending = %#v, want %t", payload["pending"], tt.pending)
+			}
+		})
+	}
+}
 
 func TestPathForStaticAssetCleansURLPaths(t *testing.T) {
 	tests := []struct {

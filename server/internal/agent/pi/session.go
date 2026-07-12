@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"mindfs/server/internal/agent/diagnostic"
 	agenttypes "mindfs/server/internal/agent/types"
 )
 
@@ -88,7 +89,7 @@ func (r *Runtime) openSession(ctx context.Context, opts OpenOptions, attempts in
 	if cwd := strings.TrimSpace(opts.RootPath); cwd != "" {
 		cmd.Dir = cwd
 	}
-	cmd.Env = mergeEnv(opts.Env)
+	cmd.Env = mergeEnv(opts.Env, cmd.Dir)
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -121,9 +122,17 @@ func (r *Runtime) openSession(ctx context.Context, opts OpenOptions, attempts in
 		closed:             make(chan struct{}),
 	}
 	r.register(s)
-	go s.readLoop(stdout)
-	go s.stderrLoop(stderr)
-	go s.waitLoop()
+	var outputReaders sync.WaitGroup
+	outputReaders.Add(2)
+	go func() {
+		defer outputReaders.Done()
+		s.readLoop(stdout)
+	}()
+	go func() {
+		defer outputReaders.Done()
+		s.stderrLoop(stderr)
+	}()
+	go s.waitLoop(&outputReaders)
 
 	stateCtx, cancel := context.WithTimeout(ctx, startupStateTimeout)
 	stateErr := s.refreshState(stateCtx)
@@ -141,7 +150,7 @@ func (r *Runtime) openSession(ctx context.Context, opts OpenOptions, attempts in
 		log.Printf("[agent/pi-rpc] startup_state.warn session=%s err=%v", s.sessionKey, stateErr)
 	}
 	if model := normalizeModelID(strings.TrimSpace(opts.Model)); model != "" {
-		if err := s.SetModel(ctx, model); err != nil && s.isClosed() {
+		if err := s.SetModel(ctx, model); err != nil && s.Closed() {
 			_ = s.Close()
 			if attempts > 1 && ctx.Err() == nil {
 				time.Sleep(300 * time.Millisecond)
@@ -151,7 +160,7 @@ func (r *Runtime) openSession(ctx context.Context, opts OpenOptions, attempts in
 		}
 	}
 	if mode := strings.TrimSpace(opts.Mode); mode != "" {
-		if err := s.SetMode(ctx, mode); err != nil && s.isClosed() {
+		if err := s.SetMode(ctx, mode); err != nil && s.Closed() {
 			_ = s.Close()
 			if attempts > 1 && ctx.Err() == nil {
 				time.Sleep(300 * time.Millisecond)
@@ -160,7 +169,7 @@ func (r *Runtime) openSession(ctx context.Context, opts OpenOptions, attempts in
 			return nil, err
 		}
 	}
-	if s.isClosed() {
+	if s.Closed() {
 		if attempts > 1 && ctx.Err() == nil {
 			time.Sleep(300 * time.Millisecond)
 			return r.openSession(ctx, opts, attempts-1)
@@ -301,7 +310,7 @@ func hasNoSessionArg(args []string) bool {
 	return false
 }
 
-func mergeEnv(extra map[string]string) []string {
+func mergeEnv(extra map[string]string, cwd string) []string {
 	env := os.Environ()
 	for key, value := range extra {
 		key = strings.TrimSpace(key)
@@ -309,6 +318,9 @@ func mergeEnv(extra map[string]string) []string {
 			continue
 		}
 		env = append(env, key+"="+value)
+	}
+	if cwd = strings.TrimSpace(cwd); cwd != "" {
+		env = append(env, "PWD="+cwd)
 	}
 	return env
 }
@@ -422,11 +434,14 @@ func (s *session) readLoop(stdout io.Reader) {
 			s.handleLine(strings.TrimRight(line, "\r\n"))
 		}
 		if err != nil {
-			if !errors.Is(err, io.EOF) && !s.isClosed() {
+			if !errors.Is(err, io.EOF) && !s.Closed() {
 				log.Printf("[agent/pi-rpc] stdout.error session=%s err=%v", s.sessionKey, err)
+				s.failPending(err)
+				s.signalTurnDone(err)
+				if s.cmd != nil && s.cmd.Process != nil {
+					_ = s.cmd.Process.Kill()
+				}
 			}
-			s.failPending(err)
-			s.signalTurnDone(err)
 			return
 		}
 	}
@@ -436,17 +451,21 @@ func (s *session) stderrLoop(stderr io.Reader) {
 	scanner := bufio.NewScanner(stderr)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
+		line := sanitizeDiagnosticLine(scanner.Text())
 		if line != "" {
 			log.Printf("[agent/pi-rpc][stderr] agent=%s %s", s.agentName, line)
 		}
 	}
+	if err := scanner.Err(); err != nil && !s.Closed() {
+		log.Printf("[agent/pi-rpc] stderr.error session=%s agent=%s err=%v", s.sessionKey, s.agentName, err)
+	}
 }
 
-func (s *session) waitLoop() {
+func (s *session) waitLoop(outputReaders *sync.WaitGroup) {
 	defer s.unregisterRuntime()
+	outputReaders.Wait()
 	err := s.cmd.Wait()
-	if err != nil && !s.isClosed() && !s.isStarting() {
+	if err != nil && !s.Closed() && !s.isStarting() {
 		log.Printf("[agent/pi-rpc] process.exit session=%s err=%v", s.sessionKey, err)
 	}
 	s.closeOnce.Do(func() { close(s.closed) })
@@ -472,7 +491,8 @@ func (s *session) isStarting() bool {
 	return s.starting
 }
 
-func (s *session) isClosed() bool {
+// Closed reports whether the Pi RPC process lifecycle has ended.
+func (s *session) Closed() bool {
 	select {
 	case <-s.closed:
 		return true
@@ -1389,6 +1409,10 @@ func rawValueString(value any) string {
 		}
 		return string(raw)
 	}
+}
+
+func sanitizeDiagnosticLine(line string) string {
+	return preview(diagnostic.Redact(line))
 }
 
 func preview(text string) string {

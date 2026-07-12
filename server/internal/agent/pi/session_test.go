@@ -15,6 +15,40 @@ import (
 	agenttypes "mindfs/server/internal/agent/types"
 )
 
+func TestMergeEnvUsesRuntimeWorkingDirectory(t *testing.T) {
+	parentPWD := t.TempDir()
+	runtimePWD := t.TempDir()
+	t.Setenv("PWD", parentPWD)
+
+	values := make(map[string]string)
+	for _, entry := range mergeEnv(nil, runtimePWD) {
+		key, value, ok := strings.Cut(entry, "=")
+		if ok {
+			values[key] = value
+		}
+	}
+	if got := values["PWD"]; got != runtimePWD {
+		t.Fatalf("PWD = %q, want runtime root %q", got, runtimePWD)
+	}
+}
+
+func TestSanitizeDiagnosticLineRedactsSecretsAndBoundsOutput(t *testing.T) {
+	bearerSecret := strings.Repeat("a", 64)
+	apiSecret := strings.Repeat("b", 40)
+	raw := "Authorization: Bearer " + bearerSecret + " api_key=" + apiSecret + " " + strings.Repeat("x", 1000)
+
+	got := sanitizeDiagnosticLine(raw)
+	if strings.Contains(got, bearerSecret) || strings.Contains(got, apiSecret) {
+		t.Fatalf("diagnostic line leaked a secret: %q", got)
+	}
+	if !strings.Contains(got, "[REDACTED:token]") || !strings.Contains(got, "[REDACTED:secret]") {
+		t.Fatalf("diagnostic line missing redaction markers: %q", got)
+	}
+	if len(got) > 163 {
+		t.Fatalf("diagnostic line length = %d, want at most 163 bytes", len(got))
+	}
+}
+
 func TestPreviewTruncatesUTF8Safely(t *testing.T) {
 	got := preview(strings.Repeat("界", 60))
 	if !utf8.ValidString(got) {
@@ -605,7 +639,7 @@ func TestRuntimeCloseAllTerminatesTrackedSessions(t *testing.T) {
 		r.mu.Lock()
 		remaining := len(r.sessions)
 		r.mu.Unlock()
-		if remaining == 0 && s1.isClosed() && s2.isClosed() {
+		if remaining == 0 && s1.Closed() && s2.Closed() {
 			return
 		}
 		time.Sleep(50 * time.Millisecond)
@@ -613,5 +647,5 @@ func TestRuntimeCloseAllTerminatesTrackedSessions(t *testing.T) {
 	r.mu.Lock()
 	remaining := len(r.sessions)
 	r.mu.Unlock()
-	t.Fatalf("runtime still tracks %d sessions; closed=(%v,%v)", remaining, s1.isClosed(), s2.isClosed())
+	t.Fatalf("runtime still tracks %d sessions; closed=(%v,%v)", remaining, s1.Closed(), s2.Closed())
 }

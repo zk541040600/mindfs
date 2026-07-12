@@ -107,6 +107,7 @@ export type Session = {
   effort?: string;
   fast_service?: string;
   plan_mode?: boolean;
+  pending?: boolean;
   name: string;
   created_at: string;
   updated_at: string;
@@ -120,6 +121,7 @@ export type Session = {
   exchange_aux?: Record<string, ExchangeAux[]>;
   exchanges?: Array<{
     seq?: number;
+    request_id?: string;
     role?: string;
     agent?: string;
     model?: string;
@@ -348,7 +350,7 @@ class SessionService {
   private ws: WebSocket | null = null;
   private handlers = new Map<string, Set<SessionEventHandler>>();
   private pendingStreams = new Map<string, StreamEvent[]>();
-  private activeStreams = new Set<string>();
+  private activeStreams = new Map<string, string>();
   private pendingMessages = new Map<string, PendingMessage>();
   private listeners = new Set<(event: SessionServiceEvent) => void>();
   private reconnectTimer: number | null = null;
@@ -356,6 +358,7 @@ class SessionService {
   private probeTimeoutTimer: number | null = null;
   private activeProbeId: string | null = null;
   private connectingStartedAt = 0;
+  private lastSocketActivityAt = 0;
   private openingSocket = false;
   private reconnectDelayMs = 1000;
   private fastReconnectUntil = 0;
@@ -366,7 +369,8 @@ class SessionService {
   private readonly fastReconnectDelayMs = 1000;
   private readonly fastReconnectWindowMs = 10000;
   private readonly connectTimeoutMs = 5000;
-  private readonly probeTimeoutMs = 2000;
+  private readonly probeTimeoutMs = 5000;
+  private readonly probeIntervalMs = 15000;
   private readonly reconnectWatchdogMs = 3000;
   private contextCache = new Map<string, { selectionKey: string }>();
 
@@ -469,6 +473,7 @@ class SessionService {
       if (this.ws !== ws) return;
       this.clearConnectTimeout();
       this.clearProbe();
+      this.lastSocketActivityAt = Date.now();
       this.reconnectDelayMs = 1000;
       if (this.hasConnected) {
         this.emit({ type: "ws.reconnected" });
@@ -487,6 +492,7 @@ class SessionService {
     ws.onmessage = (event) => {
       if (this.ws !== ws) return;
       this.clearProbe();
+      this.lastSocketActivityAt = Date.now();
       void (async () => {
         try {
           const msg = await this.parseWSMessage(event.data);
@@ -503,6 +509,7 @@ class SessionService {
     ws.onclose = (event) => {
       if (this.ws !== ws) return;
       this.clearConnectTimeout();
+      this.lastSocketActivityAt = 0;
       this.ws = null;
       this.emit({
         type: "ws.closed",
@@ -592,12 +599,22 @@ class SessionService {
       this.reconnectNow();
       return;
     }
+    if (this.ws.readyState === WebSocket.CONNECTING) {
+      if (
+        this.connectingStartedAt > 0 &&
+        Date.now() - this.connectingStartedAt > this.connectTimeoutMs
+      ) {
+        this.reconnectNow();
+      }
+      return;
+    }
+    const pageVisible =
+      typeof document === "undefined" || document.visibilityState === "visible";
     if (
-      this.ws.readyState === WebSocket.CONNECTING &&
-      this.connectingStartedAt > 0 &&
-      Date.now() - this.connectingStartedAt > this.connectTimeoutMs
+      pageVisible &&
+      Date.now() - this.lastSocketActivityAt >= this.probeIntervalMs
     ) {
-      this.reconnectNow();
+      this.probeConnection();
     }
   }
 
@@ -709,6 +726,14 @@ class SessionService {
             ? msg.id
             : "";
       if (requestId) {
+        const pending = this.pendingMessages.get(requestId);
+        if (
+          pending?.message.type === "session.message" &&
+          sessionKey &&
+          !this.activeStreams.get(sessionKey)
+        ) {
+          this.activeStreams.set(sessionKey, requestId);
+        }
         this.pendingMessages.delete(requestId);
       }
     } else if (type === "session.done" && typeof msg.id === "string") {
@@ -730,6 +755,23 @@ class SessionService {
     msg: any,
   ) {
     const nextPayload = { ...payload };
+    const requestScopedEvent =
+      type === "session.stream" || type === "session.queue.updated";
+    if (sessionKey && requestScopedEvent && this.activeStreams.has(sessionKey)) {
+      const activeRequestId = this.activeStreams.get(sessionKey) || "";
+      const eventRequestId =
+        typeof nextPayload.request_id === "string" ? nextPayload.request_id : "";
+      if (activeRequestId && eventRequestId && activeRequestId !== eventRequestId) {
+        return;
+      }
+    }
+    if (type === "session.cancelled" && nextPayload.stale === true) return;
+    if (sessionKey && isSessionTerminalEvent(type) && this.activeStreams.has(sessionKey)) {
+      const activeRequestId = this.activeStreams.get(sessionKey) || "";
+      const terminalRequestId =
+        typeof nextPayload.request_id === "string" ? nextPayload.request_id : "";
+      if (activeRequestId && activeRequestId !== terminalRequestId) return;
+    }
     this.emit({ type, sessionKey, payload: nextPayload });
 
     if (!sessionKey) return;
@@ -801,6 +843,29 @@ class SessionService {
     return true;
   }
 
+  private async sendTrackedRequest(
+    requestId: string,
+    message: Record<string, unknown>,
+  ): Promise<boolean> {
+    this.pendingMessages.set(requestId, { id: requestId, message });
+    try {
+      const sent = await this.sendWSMessage(message);
+      if (!sent) {
+        this.pendingMessages.delete(requestId);
+        this.ensureConnection();
+      }
+      return sent;
+    } catch (err) {
+      this.pendingMessages.delete(requestId);
+      console.error("[Session] Failed to send tracked request:", {
+        requestId,
+        error: err,
+      });
+      this.ensureConnection();
+      return false;
+    }
+  }
+
   subscribeEvents(listener: (event: SessionServiceEvent) => void) {
     this.listeners.add(listener);
     return () => {
@@ -823,16 +888,48 @@ class SessionService {
       this.activeStreams.delete(sessionKey);
       return;
     }
+    if (type === "session.user_message") {
+      const requestId =
+        typeof payload.request_id === "string" ? payload.request_id : "";
+      if (requestId) {
+        this.activeStreams.set(sessionKey, requestId);
+      }
+      return;
+    }
     if (type !== "session.stream") return;
     const event = payload.event as StreamEvent | undefined;
     if (!event) return;
+    const requestId =
+      typeof payload.request_id === "string" ? payload.request_id : "";
     if (event.type === "error") {
       this.activeStreams.delete(sessionKey);
       return;
     }
     if (event.type !== "message_done") {
-      this.activeStreams.add(sessionKey);
+      if (requestId || !this.activeStreams.has(sessionKey)) {
+        this.activeStreams.set(sessionKey, requestId);
+      }
     }
+  }
+
+  getSessionStreamRequestId(sessionKey: string): string | null {
+    if (!this.activeStreams.has(sessionKey)) {
+      return null;
+    }
+    return this.activeStreams.get(sessionKey) || "";
+  }
+
+  reconcileSessionNotPending(
+    sessionKey: string,
+    expectedRequestId: string | null,
+  ): boolean {
+    const currentRequestId = this.getSessionStreamRequestId(sessionKey);
+    if (currentRequestId !== expectedRequestId) {
+      return false;
+    }
+    this.activeStreams.delete(sessionKey);
+    this.pendingStreams.delete(sessionKey);
+    return true;
   }
 
   isSessionStreaming(sessionKey: string) {
@@ -899,6 +996,7 @@ class SessionService {
         sessionKey: sessionKey || null,
         readyState: this.ws?.readyState ?? null,
       });
+      this.ensureConnection();
       return false;
     }
 
@@ -921,8 +1019,7 @@ class SessionService {
       },
     };
 
-    this.pendingMessages.set(requestId, { id: requestId, message: msg });
-    return this.sendWSMessage(msg);
+    return this.sendTrackedRequest(requestId, msg);
   }
 
   async setPlanMode(
@@ -979,8 +1076,7 @@ class SessionService {
         fast_service: fastService,
       },
     };
-    this.pendingMessages.set(requestId, { id: requestId, message: msg });
-    return this.sendWSMessage(msg);
+    return this.sendTrackedRequest(requestId, msg);
   }
 
   private resendPendingMessages() {

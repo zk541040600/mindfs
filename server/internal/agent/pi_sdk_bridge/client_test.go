@@ -58,6 +58,30 @@ JSON
 	}
 }
 
+func TestDefaultProbePathPrefersExecutableLayoutOverWorkingDirectory(t *testing.T) {
+	root := t.TempDir()
+	wd := filepath.Join(root, "working")
+	exeDir := filepath.Join(root, "bundle")
+	trustedProbe := filepath.Join(exeDir, "server", "internal", "agent", "pi_sdk_bridge", "probe.mjs")
+	untrustedProbe := filepath.Join(wd, "probe.mjs")
+	if err := os.MkdirAll(filepath.Dir(trustedProbe), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(wd, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, trustedProbe, "// bundled\n", 0o644)
+	writeFile(t, untrustedProbe, "// cwd\n", 0o644)
+
+	got, err := resolveDefaultProbePath(wd, filepath.Join(exeDir, "mindfs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != trustedProbe {
+		t.Fatalf("resolved probe = %q, want bundled %q", got, trustedProbe)
+	}
+}
+
 func TestProbePathCandidatesIncludeInstalledShareLayout(t *testing.T) {
 	prefix := t.TempDir()
 	exe := filepath.Join(prefix, "bin", "mindfs")

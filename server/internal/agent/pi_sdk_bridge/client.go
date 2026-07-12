@@ -223,13 +223,13 @@ func ResolveProbePath(probePath string) (string, error) {
 	if path := strings.TrimSpace(probePath); path != "" {
 		return requireReadableFile(path)
 	}
-	candidates := []string{}
-	if wd, err := os.Getwd(); err == nil {
-		candidates = append(candidates, probePathCandidates(strings.TrimSpace(wd), "")...)
-	}
-	if exe, err := os.Executable(); err == nil {
-		candidates = append(candidates, probePathCandidates("", strings.TrimSpace(exe))...)
-	}
+	wd, _ := os.Getwd()
+	exe, _ := os.Executable()
+	return resolveDefaultProbePath(strings.TrimSpace(wd), strings.TrimSpace(exe))
+}
+
+func resolveDefaultProbePath(wd, exe string) (string, error) {
+	candidates := append(probePathCandidates("", exe), probePathCandidates(wd, "")...)
 	for _, candidate := range candidates {
 		if path, err := requireReadableFile(candidate); err == nil {
 			return path, nil

@@ -31,6 +31,7 @@ import (
 const staticDirEnvKey = "MINDFS_STATIC_DIR"
 const externalProjectDiscoveryInterval = time.Minute
 const hostedAgentsRefreshInterval = 10 * time.Minute
+const sessionShutdownTimeout = 15 * time.Second
 
 type StartOptions struct {
 	NoRelayer       bool
@@ -175,9 +176,18 @@ func Start(ctx context.Context, addr string, opts StartOptions) error {
 
 	go func() {
 		<-ctx.Done()
+		wsHandler.BeginSessionShutdown()
 		agentProber.Stop()
+
+		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), sessionShutdownTimeout)
+		defer cancelShutdown()
 		agentPool.CloseAll()
-		server.Shutdown(context.Background())
+		if err := wsHandler.WaitSessionJobs(shutdownCtx); err != nil {
+			log.Printf("[shutdown] session_jobs.wait.error err=%v", err)
+		}
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			log.Printf("[shutdown] http.error err=%v", err)
+		}
 	}()
 
 	if services.E2EE != nil {

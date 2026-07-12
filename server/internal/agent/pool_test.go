@@ -167,6 +167,44 @@ func TestPoolRoutesPiSDKProtocol(t *testing.T) {
 	}
 }
 
+func TestPoolReopensClosedPiSDKSession(t *testing.T) {
+	cfg := Config{Agents: []Definition{{
+		Name:     "pi-sdk-test",
+		Command:  "pi",
+		Protocol: ProtocolPiSDK,
+	}}}
+	pool := NewPool(cfg)
+	defer pool.CloseAll()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	input := agenttypes.OpenSessionInput{
+		SessionKey:   "pool-pi-sdk-reopen",
+		AgentName:    "pi-sdk-test",
+		RootPath:     poolTestRepoRoot(t),
+		Probe:        true,
+		TestScenario: "prompt-stream",
+	}
+	first, err := pool.GetOrCreate(ctx, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	second, err := pool.GetOrCreate(ctx, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second == first {
+		t.Fatal("GetOrCreate returned the closed pi-sdk session")
+	}
+	if err := second.SendMessage(ctx, "reopened"); err != nil {
+		t.Fatalf("reopened session SendMessage failed: %v", err)
+	}
+}
+
 func TestPoolKillAgentProcessRoutesPiSDK(t *testing.T) {
 	cfg := Config{Agents: []Definition{{
 		Name:     "pi-sdk-test",

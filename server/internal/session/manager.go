@@ -114,17 +114,18 @@ var openSQLiteDB = func(path string) (*sql.DB, error) {
 var mindFSConfigDir = configpkg.MindFSConfigDir
 
 type Manager struct {
-	root             fs.RootInfo
-	mu               sync.Mutex
-	loopOnce         sync.Once
-	db               *sql.DB
-	sessions         map[string]*Session
-	pendingToolCalls map[string]map[string]agenttypes.ToolCall
-	now              func() time.Time
-	idleInterval     time.Duration
-	idleFor          time.Duration
-	closeFor         time.Duration
-	maxIdleSessions  int
+	root                      fs.RootInfo
+	mu                        sync.Mutex
+	loopOnce                  sync.Once
+	db                        *sql.DB
+	sessionMetadataReconciled bool
+	sessions                  map[string]*Session
+	pendingToolCalls          map[string]map[string]agenttypes.ToolCall
+	now                       func() time.Time
+	idleInterval              time.Duration
+	idleFor                   time.Duration
+	closeFor                  time.Duration
+	maxIdleSessions           int
 }
 
 type CreateInput struct {
@@ -454,6 +455,7 @@ func (m *Manager) Search(_ context.Context, opts SearchOptions) ([]SearchHit, er
 }
 
 type exchangeModelDisplayNameContextKey struct{}
+type exchangeRequestIDContextKey struct{}
 
 func WithExchangeModelDisplayName(ctx context.Context, displayName string) context.Context {
 	displayName = strings.TrimSpace(displayName)
@@ -471,15 +473,32 @@ func exchangeModelDisplayNameFromContext(ctx context.Context) string {
 	return strings.TrimSpace(value)
 }
 
+// WithExchangeRequestID associates a durable browser request with appended exchanges.
+func WithExchangeRequestID(ctx context.Context, requestID string) context.Context {
+	requestID = strings.TrimSpace(requestID)
+	if requestID == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, exchangeRequestIDContextKey{}, requestID)
+}
+
+func exchangeRequestIDFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	value, _ := ctx.Value(exchangeRequestIDContextKey{}).(string)
+	return strings.TrimSpace(value)
+}
+
 func (m *Manager) AddExchangeForAgent(ctx context.Context, session *Session, role, content, agent, mode, effort, fastService string) error {
-	return m.addExchangeForAgentAt(session, role, content, agent, exchangeModelDisplayNameFromContext(ctx), mode, effort, fastService, time.Time{})
+	return m.addExchangeForAgentAt(session, role, content, agent, exchangeModelDisplayNameFromContext(ctx), exchangeRequestIDFromContext(ctx), mode, effort, fastService, time.Time{})
 }
 
 func (m *Manager) AddExchangeForAgentAt(ctx context.Context, session *Session, role, content, agent, mode, effort, fastService string, timestamp time.Time) error {
-	return m.addExchangeForAgentAt(session, role, content, agent, exchangeModelDisplayNameFromContext(ctx), mode, effort, fastService, timestamp)
+	return m.addExchangeForAgentAt(session, role, content, agent, exchangeModelDisplayNameFromContext(ctx), exchangeRequestIDFromContext(ctx), mode, effort, fastService, timestamp)
 }
 
-func (m *Manager) addExchangeForAgentAt(session *Session, role, content, agent, modelDisplayName, mode, effort, fastService string, timestamp time.Time) error {
+func (m *Manager) addExchangeForAgentAt(session *Session, role, content, agent, modelDisplayName, requestID, mode, effort, fastService string, timestamp time.Time) error {
 	if session == nil || strings.TrimSpace(session.Key) == "" {
 		return errors.New("session required")
 	}
@@ -505,6 +524,7 @@ func (m *Manager) addExchangeForAgentAt(session *Session, role, content, agent, 
 	}
 	record := Exchange{
 		Seq:              nextSeq,
+		RequestID:        strings.TrimSpace(requestID),
 		Role:             role,
 		Agent:            resolvedAgent,
 		Model:            session.Model,
@@ -1081,6 +1101,7 @@ func (m *Manager) Shutdown() error {
 	}
 	db := m.db
 	m.db = nil
+	m.sessionMetadataReconciled = false
 	return db.Close()
 }
 
@@ -1574,6 +1595,9 @@ func validateSessionKey(key string) error {
 
 func (m *Manager) ensureSessionMetaDBUnsafe() (*sql.DB, error) {
 	if m.db != nil {
+		if err := m.reconcileSessionMetadataUnsafe(m.db); err != nil {
+			return nil, err
+		}
 		return m.db, nil
 	}
 	metaDir, err := m.root.EnsureMetaDir()
@@ -1589,14 +1613,12 @@ func (m *Manager) ensureSessionMetaDBUnsafe() (*sql.DB, error) {
 		if err != nil {
 			return nil, err
 		}
-		m.db = db
-		return m.db, nil
+		return m.useSessionMetaDBUnsafe(db)
 	}
 
 	db, err := openSessionMetaDB(legacyDBFile)
 	if err == nil {
-		m.db = db
-		return m.db, nil
+		return m.useSessionMetaDBUnsafe(db)
 	}
 	legacyErr := err
 
@@ -1613,8 +1635,84 @@ func (m *Manager) ensureSessionMetaDBUnsafe() (*sql.DB, error) {
 		return nil, fmt.Errorf("open legacy session db: %w; write session db link: %w", legacyErr, err)
 	}
 	log.Printf("[session/store] sqlite fallback root=%s legacy=%s fallback=%s err=%v", m.root.ID, legacyDBFile, fallbackDBFile, legacyErr)
+	return m.useSessionMetaDBUnsafe(db)
+}
+
+func (m *Manager) useSessionMetaDBUnsafe(db *sql.DB) (*sql.DB, error) {
 	m.db = db
-	return m.db, nil
+	if err := m.reconcileSessionMetadataUnsafe(db); err != nil {
+		m.db = nil
+		if closeErr := db.Close(); closeErr != nil {
+			return nil, errors.Join(err, closeErr)
+		}
+		return nil, err
+	}
+	return db, nil
+}
+
+func (m *Manager) reconcileSessionMetadataUnsafe(db *sql.DB) error {
+	if m.sessionMetadataReconciled {
+		return nil
+	}
+	rows, err := db.Query(`SELECT key, updated_at FROM sessions`)
+	if err != nil {
+		return fmt.Errorf("query session metadata for reconciliation: %w", err)
+	}
+	type sessionTimestamp struct {
+		key       string
+		updatedAt time.Time
+	}
+	items := make([]sessionTimestamp, 0)
+	for rows.Next() {
+		var key string
+		var updatedAtRaw string
+		if err := rows.Scan(&key, &updatedAtRaw); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan session metadata for reconciliation: %w", err)
+		}
+		updatedAt, err := time.Parse(time.RFC3339Nano, updatedAtRaw)
+		if err != nil {
+			rows.Close()
+			return fmt.Errorf("parse updated_at for session %s: %w", key, err)
+		}
+		items = append(items, sessionTimestamp{key: key, updatedAt: updatedAt})
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("iterate session metadata for reconciliation: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close session metadata reconciliation rows: %w", err)
+	}
+
+	repaired := 0
+	for _, item := range items {
+		exchanges, _, err := m.loadExchanges(item.key, 0)
+		if err != nil {
+			return fmt.Errorf("load exchanges for session %s metadata reconciliation: %w", item.key, err)
+		}
+		latest := item.updatedAt
+		for _, exchange := range exchanges {
+			if exchange.Timestamp.After(latest) {
+				latest = exchange.Timestamp
+			}
+		}
+		if !latest.After(item.updatedAt) {
+			continue
+		}
+		if _, err := db.Exec(`UPDATE sessions SET updated_at = ? WHERE key = ?`, latest.UTC().Format(time.RFC3339Nano), item.key); err != nil {
+			return fmt.Errorf("reconcile updated_at for session %s: %w", item.key, err)
+		}
+		if cached := m.sessions[item.key]; cached != nil {
+			cached.UpdatedAt = latest.UTC()
+		}
+		repaired++
+	}
+	m.sessionMetadataReconciled = true
+	if repaired > 0 {
+		log.Printf("[session/store] metadata.reconciled root=%s sessions=%d", m.root.ID, repaired)
+	}
+	return nil
 }
 
 func openSessionMetaDB(dbFile string) (db *sql.DB, err error) {

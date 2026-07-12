@@ -698,10 +698,17 @@ func (s *session) ListModels(ctx context.Context) (types.ModelList, error) {
 	if err != nil {
 		return types.ModelList{}, err
 	}
-	models := make([]types.ModelInfo, 0, len(resp.Data))
-	currentModelID := ""
 	defaults, _ := s.RuntimeDefaults(ctx)
-	for _, model := range resp.Data {
+	return buildCodexModelList(resp.Data, defaults.Model), nil
+}
+
+// buildCodexModelList keeps the configured model selectable when Codex omits it from model/list.
+func buildCodexModelList(catalog []codextypes.Model, configuredModel string) types.ModelList {
+	models := make([]types.ModelInfo, 0, len(catalog)+1)
+	currentModelID := ""
+	configuredModel = strings.TrimSpace(configuredModel)
+	configuredModelListed := false
+	for _, model := range catalog {
 		name := strings.TrimSpace(model.DisplayName)
 		if name == "" {
 			name = strings.TrimSpace(model.Model)
@@ -716,14 +723,24 @@ func (s *session) ListModels(ctx context.Context) (types.ModelList, error) {
 		if model.IsDefault && currentModelID == "" {
 			currentModelID = model.Model
 		}
+		if model.Model == configuredModel {
+			configuredModelListed = true
+		}
 	}
-	if strings.TrimSpace(defaults.Model) != "" {
-		currentModelID = strings.TrimSpace(defaults.Model)
+	if configuredModel != "" {
+		currentModelID = configuredModel
+		if !configuredModelListed {
+			models = append(models, types.ModelInfo{
+				ID:            configuredModel,
+				Name:          configuredModel,
+				SupportEffort: true,
+			})
+		}
 	}
 	return types.ModelList{
 		CurrentModelID: currentModelID,
 		Models:         models,
-	}, nil
+	}
 }
 
 func (s *session) RuntimeDefaults(ctx context.Context) (types.RuntimeDefaults, error) {

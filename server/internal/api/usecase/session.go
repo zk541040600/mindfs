@@ -895,12 +895,27 @@ func (s *Service) DeleteSession(ctx context.Context, in DeleteSessionInput) erro
 	if err != nil {
 		return err
 	}
+	pool := s.Registry.GetAgentPool()
+	var agentNames []string
+	if pool != nil {
+		for _, definition := range pool.Config().Agents {
+			if name := strings.TrimSpace(definition.Name); name != "" {
+				agentNames = append(agentNames, name)
+			}
+		}
+	}
 	for _, key := range keys {
 		cancelActiveSessionTurn(in.RootID, key)
 	}
 	for _, key := range keys {
 		if err := manager.Delete(ctx, key); err != nil {
 			return err
+		}
+		if pool != nil {
+			pool.Close(key)
+			for _, agentName := range agentNames {
+				pool.Close(agentPoolSessionKey(key, agentName))
+			}
 		}
 		if err := root.RemoveSessionFileMeta(key); err != nil {
 			return err
@@ -1094,6 +1109,8 @@ type CancelSessionTurnInput struct {
 }
 
 var ErrSessionCancelRequestMismatch = errors.New("session cancel request id mismatch")
+var ErrSessionRequestAlreadyCompleted = errors.New("session request already completed")
+var ErrSessionRequestInterrupted = errors.New("session request was persisted without completion")
 
 const (
 	switchContextTailLines   = 20
@@ -1501,6 +1518,15 @@ func isStaleAgentSessionError(err error) bool {
 		(strings.Contains(compact, "invalidparams") && strings.Contains(compact, "sessionid"))
 }
 
+func isRuntimeTransportClosedError(err error) bool {
+	compact := compactAgentError(err)
+	return strings.Contains(compact, "runtimesessionclosed") || strings.Contains(compact, "runtimeprocessexited")
+}
+
+func isRuntimeIdleTimeoutError(err error) bool {
+	return strings.Contains(compactAgentError(err), "pisdkpromptidletimeout")
+}
+
 func isNonRecoverableAgentError(err error) bool {
 	if err == nil {
 		return false
@@ -1883,6 +1909,19 @@ func (s *Service) ensureAgentSession(
 	if ctxSeqOverride == nil {
 		ctxSeqOverride = agentContextSeqOverrideAfterOpen(statelessRuntimeCtx, binding, openInput.AgentSessionID, sess.SessionID())
 	}
+
+	// 在长任务开始前落盘 runtime 身份，确保服务重启后仍能恢复同一上下文。
+	if manager != nil {
+		lastKnownCtxSeq := current.AgentCtxSeq[agentName]
+		if ctxSeqOverride != nil {
+			lastKnownCtxSeq = *ctxSeqOverride
+		}
+		if err := manager.UpdateAgentState(ctx, current, agentName, lastKnownCtxSeq, sess.SessionID()); err != nil {
+			pool.Close(poolSessionKey)
+			log.Printf("[session/model] binding.persist.error session=%s agent=%s pool_session=%s err=%v", current.Key, agentName, poolSessionKey, err)
+			return nil, nil, err
+		}
+	}
 	log.Printf("[session/model] open.done session=%s agent=%s model=%q mode=%q effort=%q fast_service=%q pool_session=%s", current.Key, agentName, nextModel, nextMode, nextEffort, nextFastService, poolSessionKey)
 	return sess, ctxSeqOverride, nil
 }
@@ -2077,7 +2116,55 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 		log.Printf("[session/model] validate.error root=%s session=%s agent=%s model=%q err=%v", in.RootID, in.Key, strings.TrimSpace(in.Agent), strings.TrimSpace(in.Model), err)
 		return err
 	}
-	isInitial := len(current.Exchanges) == 0
+
+	// 重启后按持久化 request_id 去重，绝不自动重放执行状态不明的 Agent turn。
+	requestID := strings.TrimSpace(in.RequestID)
+	requestPersisted := false
+	requestCompleted := false
+	if requestID != "" {
+		for _, exchange := range current.Exchanges {
+			if strings.TrimSpace(exchange.RequestID) != requestID {
+				continue
+			}
+			switch strings.ToLower(strings.TrimSpace(exchange.Role)) {
+			case "agent", "assistant":
+				requestCompleted = true
+			case "user":
+				requestPersisted = true
+			}
+		}
+	}
+	if requestCompleted {
+		return ErrSessionRequestAlreadyCompleted
+	}
+	if requestPersisted {
+		return ErrSessionRequestInterrupted
+	}
+
+	// 在启动长耗时 Agent turn 前保留历史快照，并先持久化已经接受的用户输入。
+	historyExchanges := append([]session.Exchange(nil), current.Exchanges...)
+	preTurnSession := *current
+	preTurnSession.Exchanges = historyExchanges
+	isInitial := len(historyExchanges) == 0
+	writeAheadModel := strings.TrimSpace(in.Model)
+	if writeAheadModel != "" {
+		if err := manager.UpdateModel(ctx, current, writeAheadModel); err != nil {
+			return err
+		}
+	} else {
+		writeAheadModel = strings.TrimSpace(current.Model)
+	}
+	writeAheadMode := resolveRuntimeMode(current, in.Mode)
+	writeAheadEffort := resolveRuntimeEffort(in.Agent, current, in.Effort)
+	writeAheadFastService := resolveRuntimeFastService(in.Agent, current, in.FastService)
+	writeAheadDisplayName := s.resolveExchangeModelDisplayName(in.Agent, writeAheadModel)
+	writeAheadCtx := session.WithExchangeModelDisplayName(ctx, writeAheadDisplayName)
+	writeAheadCtx = session.WithExchangeRequestID(writeAheadCtx, requestID)
+	if err := manager.AddExchangeForAgent(writeAheadCtx, current, "user", in.Content, in.Agent, writeAheadMode, writeAheadEffort, writeAheadFastService); err != nil {
+		log.Printf("[session] persist.user.error root=%s session=%s agent=%s err=%v", in.RootID, current.Key, in.Agent, err)
+		return err
+	}
+
 	agentPool := s.Registry.GetAgentPool()
 	if agentPool == nil {
 		return nil
@@ -2094,27 +2181,32 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 		rootAbs = filepath.Clean(runtimeRootPath)
 	}
 	planMode := current != nil && current.PlanMode
-	sess, agentCtxSeq, err := s.ensureAgentSession(turnCtx, agentPool, manager, current, in.Agent, in.Model, in.Mode, in.Effort, in.FastService, rootAbs)
+	sess, agentCtxSeq, err := s.ensureAgentSession(turnCtx, agentPool, manager, &preTurnSession, in.Agent, in.Model, in.Mode, in.Effort, in.FastService, rootAbs)
 	if err != nil {
 		return err
 	}
 	setActiveTurnSession(in.RootID, current.Key, sess)
 
-	prompt := s.BuildPrompt(BuildPromptInput{
-		Session:        current,
-		Manager:        manager,
-		Agent:          in.Agent,
-		Message:        in.Content,
-		ClientContext:  in.ClientCtx,
-		AgentCtxSeq:    agentCtxSeq,
-		RuntimeRootAbs: rootAbs,
-		IsInitial:      isInitial,
-	})
+	// Prompt 只读取本轮输入落盘前的历史，避免把当前消息同时放进历史和 message 参数。
+	buildTurnPrompt := func(ctxSeq *int) string {
+		promptSession := preTurnSession
+		return s.BuildPrompt(BuildPromptInput{
+			Session:        &promptSession,
+			Manager:        manager,
+			Agent:          in.Agent,
+			Message:        in.Content,
+			ClientContext:  in.ClientCtx,
+			AgentCtxSeq:    ctxSeq,
+			RuntimeRootAbs: rootAbs,
+			IsInitial:      isInitial,
+		})
+	}
+	prompt := buildTurnPrompt(agentCtxSeq)
 	var responseText string
 	sawAssistantChunk := false
 	var recoveryText string
 	var latestGoalState *agenttypes.GoalState
-	plannedAssistantSeq := len(current.Exchanges) + 2
+	plannedAssistantSeq := len(historyExchanges) + 2
 	auxBuffer := make([]session.ExchangeAux, 0, 8)
 	defer manager.ClearPendingExchangeAux(context.Background(), current.Key)
 	var thoughtBuffer strings.Builder
@@ -2330,7 +2422,7 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 	if sendErr != nil && !isCanceledTurnError(sendErr) && !sawAssistantChunk && isStaleAgentSessionError(sendErr) {
 		log.Printf("[session] turn.send.stale_runtime root=%s session=%s agent=%s err=%v action=reopen_runtime_session", in.RootID, current.Key, in.Agent, sendErr)
 		agentPool.Close(agentPoolSessionKey(current.Key, in.Agent))
-		reopenedSess, reopenedAgentCtxSeq, reopenedErr := s.ensureAgentSession(turnCtx, agentPool, manager, current, in.Agent, in.Model, in.Mode, in.Effort, in.FastService, rootAbs)
+		reopenedSess, reopenedAgentCtxSeq, reopenedErr := s.ensureAgentSession(turnCtx, agentPool, manager, &preTurnSession, in.Agent, in.Model, in.Mode, in.Effort, in.FastService, rootAbs)
 		if reopenedErr != nil {
 			log.Printf("[session] turn.send.stale_runtime_reopen.error root=%s session=%s agent=%s err=%v", in.RootID, current.Key, in.Agent, reopenedErr)
 		} else {
@@ -2338,15 +2430,7 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 			agentCtxSeq = reopenedAgentCtxSeq
 			usedFollowUp = false
 			setActiveTurnSession(in.RootID, current.Key, sess)
-			prompt = s.BuildPrompt(BuildPromptInput{
-				Session:       current,
-				Manager:       manager,
-				Agent:         in.Agent,
-				Message:       in.Content,
-				ClientContext: in.ClientCtx,
-				AgentCtxSeq:   agentCtxSeq,
-				IsInitial:     isInitial,
-			})
+			prompt = buildTurnPrompt(agentCtxSeq)
 			sendErr = sendWithAttachedUpdates(sess, prompt)
 		}
 	}
@@ -2355,7 +2439,12 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 			log.Printf("[session] turn.send.non_recoverable root=%s session=%s agent=%s action=fail_without_recovery err=%v", in.RootID, current.Key, in.Agent, sendErr)
 			cancelRuntimeAfterNonRecoverableError(sess, agentPool, in.Agent, sendErr)
 		} else if !sawAssistantChunk {
-			log.Printf("[session] turn.send.no_response root=%s session=%s agent=%s action=fail_without_recovery", in.RootID, current.Key, in.Agent)
+			action := "fail_without_recovery"
+			if isRuntimeIdleTimeoutError(sendErr) {
+				agentPool.Close(agentPoolSessionKey(current.Key, in.Agent))
+				action = "discard_stuck_runtime"
+			}
+			log.Printf("[session] turn.send.no_response root=%s session=%s agent=%s action=%s", in.RootID, current.Key, in.Agent, action)
 		} else {
 			if in.OnUpdate != nil {
 				in.OnUpdate(agenttypes.Event{
@@ -2367,7 +2456,7 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 				RootID:             in.RootID,
 				SessionKey:         current.Key,
 				Manager:            manager,
-				Current:            current,
+				Current:            &preTurnSession,
 				AgentName:          in.Agent,
 				Model:              in.Model,
 				Mode:               in.Mode,
@@ -2410,10 +2499,7 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 	resolvedMode := resolveRuntimeMode(current, in.Mode)
 	modelDisplayName := s.resolveExchangeModelDisplayName(in.Agent, resolvedModel)
 	exchangeCtx := session.WithExchangeModelDisplayName(ctx, modelDisplayName)
-	if err := manager.AddExchangeForAgent(exchangeCtx, current, "user", in.Content, in.Agent, resolvedMode, resolvedEffort, resolvedFastService); err != nil {
-		log.Printf("[session] persist.user.error root=%s session=%s agent=%s err=%v", in.RootID, current.Key, in.Agent, err)
-		return err
-	}
+	exchangeCtx = session.WithExchangeRequestID(exchangeCtx, requestID)
 	if strings.TrimSpace(responseText) != "" {
 		if err := manager.AddExchangeForAgent(exchangeCtx, current, "agent", responseText, in.Agent, resolvedMode, resolvedEffort, resolvedFastService); err != nil {
 			log.Printf("[session] persist.agent.error root=%s session=%s agent=%s err=%v", in.RootID, current.Key, in.Agent, err)
@@ -2442,6 +2528,11 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 
 	prober := s.Registry.GetProber()
 	if turnCanceled {
+		if runtimeProtocol(agentPool, in.Agent) == agent.ProtocolPiSDK {
+			poolSessionKey := agentPoolSessionKey(current.Key, in.Agent)
+			agentPool.Close(poolSessionKey)
+			log.Printf("[session] turn.cancel.discard_runtime root=%s session=%s agent=%s pool_session=%s", in.RootID, current.Key, in.Agent, poolSessionKey)
+		}
 		return context.Canceled
 	}
 	if sendErr != nil {
@@ -3438,13 +3529,15 @@ func (s *Service) recoverAgentTurn(ctx context.Context, in SendRecoveryInput) (a
 	}
 
 	var lastErr error
+	retryAfterReopen := false
 	for attempt := 1; attempt <= sessionRecoveryAttempts; attempt++ {
-		if attempt > 1 {
+		if attempt > 1 && !retryAfterReopen {
 			log.Printf("[session/recovery] wait root=%s session=%s agent=%s attempt=%d/%d delay=%s", in.RootID, in.SessionKey, in.AgentName, attempt, sessionRecoveryAttempts, sessionRecoveryDelay)
 			if err := waitForRecoveryDelay(ctx, sessionRecoveryDelay); err != nil {
 				return nil, err
 			}
 		}
+		retryAfterReopen = false
 
 		sess := in.CurrentSession
 		recoveryMessage := in.Prompt
@@ -3468,7 +3561,7 @@ func (s *Service) recoverAgentTurn(ctx context.Context, in SendRecoveryInput) (a
 				log.Printf("[session/recovery] active_turn root=%s session=%s agent=%s attempt=%d/%d action=%s decision=stop_recovery err=%v", in.RootID, in.SessionKey, in.AgentName, attempt, sessionRecoveryAttempts, recoveryAction, err)
 				return nil, err
 			}
-			if isStaleAgentSessionError(err) {
+			if isStaleAgentSessionError(err) || (in.SawAssistantChunk && isRuntimeTransportClosedError(err)) {
 				pool := s.Registry.GetAgentPool()
 				if pool == nil {
 					continue
@@ -3481,6 +3574,7 @@ func (s *Service) recoverAgentTurn(ctx context.Context, in SendRecoveryInput) (a
 					continue
 				}
 				in.CurrentSession = reopened
+				retryAfterReopen = true
 				log.Printf("[session/recovery] reopen.done root=%s session=%s agent=%s attempt=%d/%d", in.RootID, in.SessionKey, in.AgentName, attempt, sessionRecoveryAttempts)
 			}
 			continue

@@ -446,6 +446,44 @@ func TestDeleteSessionDeletesSubSessionTree(t *testing.T) {
 	}
 }
 
+func TestDeleteSessionClosesUnpersistedPiSDKRuntime(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	root := rootfs.NewRootInfo("mindfs", "mindfs", t.TempDir())
+	manager := session.NewManager(root)
+	created, err := manager.Create(ctx, session.CreateInput{Type: session.TypeChat, Agent: "pi", Name: "delete runtime"})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	pool := agent.NewPool(agent.Config{Agents: []agent.Definition{{
+		Name:     "pi",
+		Command:  "pi",
+		Protocol: agent.ProtocolPiSDK,
+	}}})
+	defer pool.CloseAll()
+	registry := &chatAgentTestRegistry{
+		commandTestRegistry: &commandTestRegistry{root: root, manager: manager},
+		pool:                pool,
+	}
+	poolKey := agentPoolSessionKey(created.Key, "pi")
+	if _, err := pool.GetOrCreate(ctx, agenttypes.OpenSessionInput{
+		SessionKey:   poolKey,
+		AgentName:    "pi",
+		RootPath:     root.RootPath,
+		TestScenario: "prompt-stream",
+	}); err != nil {
+		t.Fatalf("open Pi SDK runtime: %v", err)
+	}
+
+	service := Service{Registry: registry}
+	if err := service.DeleteSession(ctx, DeleteSessionInput{RootID: root.ID, Key: created.Key}); err != nil {
+		t.Fatalf("DeleteSession: %v", err)
+	}
+	if _, ok := pool.Get(poolKey); ok {
+		t.Fatal("deleted session left its Pi SDK runtime in the pool")
+	}
+}
+
 func TestSubSessionSyntheticDonePersistsPartialResponse(t *testing.T) {
 	ctx := context.Background()
 	rootDir := t.TempDir()
@@ -1989,6 +2027,21 @@ func TestSendMessagePropagatesPiCancellationAfterPersistingUser(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 
+	persistedWhileRunning, err := manager.Get(ctx, created.Key, 0)
+	if err != nil {
+		t.Fatalf("get running session: %v", err)
+	}
+	if len(persistedWhileRunning.Exchanges) != 1 || persistedWhileRunning.Exchanges[0].Role != "user" || persistedWhileRunning.Exchanges[0].Content != "keep this user input" {
+		t.Fatalf("running exchanges = %#v, want write-ahead user input before turn settlement", persistedWhileRunning.Exchanges)
+	}
+	promptPayload, err := os.ReadFile(promptMarker)
+	if err != nil {
+		t.Fatalf("read captured prompt: %v", err)
+	}
+	if count := strings.Count(string(promptPayload), "keep this user input"); count != 1 {
+		t.Fatalf("current user input appears %d times in prompt, want exactly once", count)
+	}
+
 	if err := service.CancelSessionTurn(ctx, CancelSessionTurnInput{
 		RootID:    root.ID,
 		Key:       created.Key,
@@ -2010,8 +2063,151 @@ func TestSendMessagePropagatesPiCancellationAfterPersistingUser(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get cancelled session: %v", err)
 	}
-	if len(loaded.Exchanges) != 1 || loaded.Exchanges[0].Role != "user" || loaded.Exchanges[0].Content != "keep this user input" {
-		t.Fatalf("cancelled exchanges = %#v, want persisted user input only", loaded.Exchanges)
+	if len(loaded.Exchanges) != 1 || loaded.Exchanges[0].Role != "user" || loaded.Exchanges[0].Content != "keep this user input" || loaded.Exchanges[0].RequestID != "request-cancelled" {
+		t.Fatalf("cancelled exchanges = %#v, want request-scoped persisted user input only", loaded.Exchanges)
+	}
+	if err := service.SendMessage(ctx, SendMessageInput{
+		RootID:    root.ID,
+		Key:       created.Key,
+		RequestID: "request-cancelled",
+		Agent:     "pi",
+		Content:   "keep this user input",
+	}); !errors.Is(err, ErrSessionRequestInterrupted) {
+		t.Fatalf("duplicate interrupted request error = %v, want ErrSessionRequestInterrupted", err)
+	}
+	loaded, err = manager.Get(ctx, created.Key, 0)
+	if err != nil {
+		t.Fatalf("get duplicate interrupted session: %v", err)
+	}
+	if len(loaded.Exchanges) != 1 {
+		t.Fatalf("duplicate interrupted request appended exchanges: %#v", loaded.Exchanges)
+	}
+
+	retryCtx, retryCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer retryCancel()
+	if err := service.SendMessage(retryCtx, SendMessageInput{
+		RootID:    root.ID,
+		Key:       created.Key,
+		RequestID: "request-recovered",
+		Agent:     "pi",
+		Content:   "respond after cancellation",
+	}); err != nil {
+		t.Fatalf("SendMessage after cancellation returned error: %v", err)
+	}
+
+	loaded, err = manager.Get(ctx, created.Key, 0)
+	if err != nil {
+		t.Fatalf("get recovered session: %v", err)
+	}
+	if len(loaded.Exchanges) != 3 || loaded.Exchanges[1].Role != "user" || loaded.Exchanges[1].RequestID != "request-recovered" || loaded.Exchanges[2].Role != "agent" || loaded.Exchanges[2].RequestID != "request-recovered" || loaded.Exchanges[2].Content != "recovered after cancel" {
+		t.Fatalf("recovered exchanges = %#v, want request-scoped cancelled user followed by a clean completed turn", loaded.Exchanges)
+	}
+	if err := service.SendMessage(ctx, SendMessageInput{
+		RootID:    root.ID,
+		Key:       created.Key,
+		RequestID: "request-recovered",
+		Agent:     "pi",
+		Content:   "respond after cancellation",
+	}); !errors.Is(err, ErrSessionRequestAlreadyCompleted) {
+		t.Fatalf("duplicate completed request error = %v, want ErrSessionRequestAlreadyCompleted", err)
+	}
+	loaded, err = manager.Get(ctx, created.Key, 0)
+	if err != nil {
+		t.Fatalf("get duplicate completed session: %v", err)
+	}
+	if len(loaded.Exchanges) != 3 {
+		t.Fatalf("duplicate completed request appended exchanges: %#v", loaded.Exchanges)
+	}
+}
+
+func TestSendMessageRecoversAfterPiSDKExitWithPartialResponse(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	rootDir := t.TempDir()
+	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
+	manager := session.NewManager(root)
+	created, err := manager.Create(ctx, session.CreateInput{Type: session.TypeChat, Agent: "pi", Name: "recovery test"})
+	if err != nil {
+		t.Fatalf("create chat session: %v", err)
+	}
+
+	generationMarker := filepath.Join(t.TempDir(), "first-runtime-exited")
+	pool := agent.NewPool(agent.Config{Agents: []agent.Definition{{
+		Name:     "pi",
+		Command:  writeFakeRecoveringPiSDKForUsecase(t),
+		Protocol: agent.ProtocolPiSDK,
+		Env:      map[string]string{"MINDFS_TEST_GENERATION_MARKER": generationMarker},
+	}}})
+	defer pool.CloseAll()
+	service := Service{Registry: &chatAgentTestRegistry{
+		commandTestRegistry: &commandTestRegistry{root: root, manager: manager},
+		pool:                pool,
+	}}
+
+	var chunks strings.Builder
+	err = service.SendMessage(ctx, SendMessageInput{
+		RootID:  root.ID,
+		Key:     created.Key,
+		Agent:   "pi",
+		Content: "recover this turn",
+		OnUpdate: func(update agenttypes.Event) {
+			if update.Type != agenttypes.EventTypeMessageChunk {
+				return
+			}
+			chunk, ok := update.Data.(agenttypes.MessageChunk)
+			if ok {
+				chunks.WriteString(chunk.Content)
+			}
+		},
+	})
+	if err != nil {
+		t.Fatalf("SendMessage returned error after bridge recovery: %v", err)
+	}
+	if got := chunks.String(); got != "partial recovered" {
+		t.Fatalf("streamed response = %q, want %q", got, "partial recovered")
+	}
+
+	loaded, err := manager.Get(ctx, created.Key, 0)
+	if err != nil {
+		t.Fatalf("get recovered session: %v", err)
+	}
+	if len(loaded.Exchanges) != 2 || loaded.Exchanges[1].Role != "agent" || loaded.Exchanges[1].Content != "partial recovered" {
+		t.Fatalf("recovered exchanges = %#v", loaded.Exchanges)
+	}
+}
+
+func TestSendMessageDiscardsPiSDKRuntimeAfterIdleTimeout(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	root := rootfs.NewRootInfo("mindfs", "mindfs", t.TempDir())
+	manager := session.NewManager(root)
+	created, err := manager.Create(ctx, session.CreateInput{Type: session.TypeChat, Agent: "pi", Name: "idle timeout test"})
+	if err != nil {
+		t.Fatalf("create chat session: %v", err)
+	}
+
+	pool := agent.NewPool(agent.Config{Agents: []agent.Definition{{
+		Name:     "pi",
+		Command:  writeFakeIdleTimeoutPiSDKForUsecase(t),
+		Protocol: agent.ProtocolPiSDK,
+	}}})
+	defer pool.CloseAll()
+	service := Service{Registry: &chatAgentTestRegistry{
+		commandTestRegistry: &commandTestRegistry{root: root, manager: manager},
+		pool:                pool,
+	}}
+
+	err = service.SendMessage(ctx, SendMessageInput{
+		RootID:  root.ID,
+		Key:     created.Key,
+		Agent:   "pi",
+		Content: "timeout this turn",
+	})
+	if err == nil || !strings.Contains(err.Error(), "Pi SDK prompt idle timeout") {
+		t.Fatalf("SendMessage idle timeout error = %v", err)
+	}
+	if _, ok := pool.Get(agentPoolSessionKey(created.Key, "pi")); ok {
+		t.Fatal("idle-timed-out Pi SDK runtime remained cached")
 	}
 }
 
@@ -2486,6 +2682,26 @@ func TestStaleAgentSessionErrorDetection(t *testing.T) {
 	}
 }
 
+func TestRuntimeTransportClosedErrorDetection(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "pi sdk closed", err: errors.New("pi sdk runtime session closed"), want: true},
+		{name: "pi sdk exited", err: errors.New("pi sdk runtime process exited: exit status 17"), want: true},
+		{name: "ordinary session error", err: errors.New("session not found"), want: false},
+		{name: "nil", err: nil, want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isRuntimeTransportClosedError(tc.err); got != tc.want {
+				t.Fatalf("isRuntimeTransportClosedError(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestAgentAlreadyProcessingErrorDetection(t *testing.T) {
 	cases := []struct {
 		name string
@@ -2543,6 +2759,81 @@ func TestBuildPromptReadsHistoryWhenAgentContextReset(t *testing.T) {
 	}
 	if !strings.HasSuffix(prompt, "continue") {
 		t.Fatalf("prompt = %q, want original message suffix", prompt)
+	}
+}
+
+func TestEnsureAgentSessionPersistsRuntimeBindingBeforeFirstTurn(t *testing.T) {
+	ctx := context.Background()
+	rootDir := t.TempDir()
+	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
+	manager := session.NewManager(root)
+	created, err := manager.Create(ctx, session.CreateInput{Type: session.TypeChat, Agent: "pi", Name: "chat"})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if err := manager.AddExchangeForAgent(ctx, created, "user", "first", "pi", "", "", ""); err != nil {
+		t.Fatalf("add user: %v", err)
+	}
+	if err := manager.AddExchangeForAgent(ctx, created, "agent", "second", "pi", "", "", ""); err != nil {
+		t.Fatalf("add agent: %v", err)
+	}
+
+	command := writeFakePiSDKNoTextForUsecase(t)
+	pool := agent.NewPool(agent.Config{Agents: []agent.Definition{{
+		Name:     "pi",
+		Protocol: agent.ProtocolPiSDK,
+		Command:  command,
+	}}})
+	defer pool.CloseAll()
+	opened, _, err := (&Service{}).ensureAgentSession(ctx, pool, manager, created, "pi", "", "", "", "", rootDir)
+	if err != nil {
+		t.Fatalf("ensureAgentSession: %v", err)
+	}
+	binding, err := manager.FindAgentBinding(ctx, created.Key, "pi")
+	if err != nil {
+		t.Fatalf("find binding before first turn: %v", err)
+	}
+	if binding == nil {
+		t.Fatal("runtime binding was not persisted before the first turn")
+	}
+	if binding.AgentSessionID != opened.SessionID() {
+		t.Fatalf("binding session id = %q, want %q", binding.AgentSessionID, opened.SessionID())
+	}
+	if binding.AgentCtxSeq != 0 {
+		t.Fatalf("binding context seq = %d, want 0 for a newly opened runtime", binding.AgentCtxSeq)
+	}
+	pool.CloseAll()
+
+	resumedManager := session.NewManager(root)
+	resumedSession, err := resumedManager.Get(ctx, created.Key, 0)
+	if err != nil {
+		t.Fatalf("reload session after restart: %v", err)
+	}
+	resumedPool := agent.NewPool(agent.Config{Agents: []agent.Definition{{
+		Name:     "pi",
+		Protocol: agent.ProtocolPiSDK,
+		Command:  command,
+	}}})
+	defer resumedPool.CloseAll()
+	resumed, resumedCtxSeq, err := (&Service{}).ensureAgentSession(ctx, resumedPool, resumedManager, resumedSession, "pi", "", "", "", "", rootDir)
+	if err != nil {
+		t.Fatalf("resume persisted runtime: %v", err)
+	}
+	if resumed.SessionID() != binding.AgentSessionID {
+		t.Fatalf("resumed session id = %q, want %q", resumed.SessionID(), binding.AgentSessionID)
+	}
+	if resumedCtxSeq == nil || *resumedCtxSeq != binding.AgentCtxSeq {
+		t.Fatalf("resumed context seq = %v, want %d", resumedCtxSeq, binding.AgentCtxSeq)
+	}
+	prompt := (&Service{}).BuildPrompt(BuildPromptInput{
+		Session:     resumedSession,
+		Manager:     resumedManager,
+		Agent:       "pi",
+		Message:     "continue",
+		AgentCtxSeq: resumedCtxSeq,
+	})
+	if !strings.Contains(prompt, "read the last 2 lines") {
+		t.Fatalf("prompt = %q, want persisted history recovery hint", prompt)
 	}
 }
 
@@ -2790,6 +3081,9 @@ import json
 import os
 import sys
 
+marker = os.environ.get("MINDFS_TEST_PROMPT_MARKER", "")
+first_runtime = not marker or not os.path.exists(marker)
+
 def send(obj):
     print(json.dumps(obj, ensure_ascii=False), flush=True)
 
@@ -2802,16 +3096,98 @@ for line in sys.stdin:
     elif typ == "get_state":
         send({"id": req_id, "type": "response", "command": typ, "success": True, "data": {"sessionId": "blocking-pi-sdk-session", "isStreaming": False, "pendingMessageCount": 0}})
     elif typ == "prompt":
-        marker = os.environ.get("MINDFS_TEST_PROMPT_MARKER", "")
-        if marker:
-            open(marker, "w", encoding="utf-8").close()
+        if first_runtime:
+            if marker:
+                with open(marker, "w", encoding="utf-8") as prompt_file:
+                    prompt_file.write(req.get("message", ""))
+            send({"id": req_id, "type": "response", "command": typ, "success": True, "data": {"runtime": "sdk"}})
+            send({"type": "agent_start"})
+            continue
         send({"id": req_id, "type": "response", "command": typ, "success": True, "data": {"runtime": "sdk"}})
         send({"type": "agent_start"})
+        send({"type": "message_start", "message": {"role": "assistant", "content": []}})
+        send({"type": "message_update", "message": {"role": "assistant", "content": [{"type": "text", "text": "recovered after cancel"}]}, "assistantMessageEvent": {"type": "text_delta", "delta": "recovered after cancel"}})
+        send({"type": "message_end", "message": {"role": "assistant", "stopReason": "end_turn", "content": [{"type": "text", "text": "recovered after cancel"}]}})
+        send({"type": "runtime_settled", "reason": "recovered_after_cancel"})
     else:
         send({"id": req_id, "type": "response", "command": typ, "success": True, "data": {}})
 `
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
 		t.Fatalf("write fake blocking pi sdk: %v", err)
+	}
+	return path
+}
+
+func writeFakeRecoveringPiSDKForUsecase(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "fake-node")
+	script := `#!/usr/bin/env python3
+import json
+import os
+import sys
+
+marker = os.environ.get("MINDFS_TEST_GENERATION_MARKER", "")
+first_runtime = bool(marker) and not os.path.exists(marker)
+
+def send(obj):
+    print(json.dumps(obj, ensure_ascii=False), flush=True)
+
+for line in sys.stdin:
+    req = json.loads(line)
+    req_id = req.get("id")
+    typ = req.get("type")
+    if typ == "start_sdk_runtime":
+        send({"id": req_id, "type": "response", "command": typ, "success": True, "data": {"sessionId": "recovering-pi-sdk-session"}})
+    elif typ == "get_state":
+        send({"id": req_id, "type": "response", "command": typ, "success": True, "data": {"sessionId": "recovering-pi-sdk-session", "isStreaming": False, "pendingMessageCount": 0}})
+    elif typ == "prompt":
+        send({"id": req_id, "type": "response", "command": typ, "success": True, "data": {"runtime": "sdk"}})
+        send({"type": "agent_start"})
+        send({"type": "message_start", "message": {"role": "assistant", "content": []}})
+        if first_runtime:
+            open(marker, "w", encoding="utf-8").close()
+            send({"type": "message_update", "message": {"role": "assistant", "content": [{"type": "text", "text": "partial "}]}, "assistantMessageEvent": {"type": "text_delta", "delta": "partial "}})
+            sys.exit(0)
+        send({"type": "message_update", "message": {"role": "assistant", "content": [{"type": "text", "text": "recovered"}]}, "assistantMessageEvent": {"type": "text_delta", "delta": "recovered"}})
+        send({"type": "message_end", "message": {"role": "assistant", "stopReason": "end_turn", "content": [{"type": "text", "text": "recovered"}]}})
+        send({"type": "runtime_settled", "reason": "recovered"})
+    else:
+        send({"id": req_id, "type": "response", "command": typ, "success": True, "data": {}})
+`
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write recovering pi sdk: %v", err)
+	}
+	return path
+}
+
+func writeFakeIdleTimeoutPiSDKForUsecase(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "fake-node")
+	script := `#!/usr/bin/env python3
+import json
+import sys
+
+def send(obj):
+    print(json.dumps(obj, ensure_ascii=False), flush=True)
+
+for line in sys.stdin:
+    req = json.loads(line)
+    req_id = req.get("id")
+    typ = req.get("type")
+    if typ == "start_sdk_runtime":
+        send({"id": req_id, "type": "response", "command": typ, "success": True, "data": {"sessionId": "idle-timeout-pi-sdk-session"}})
+    elif typ == "get_state":
+        send({"id": req_id, "type": "response", "command": typ, "success": True, "data": {"sessionId": "idle-timeout-pi-sdk-session", "isStreaming": False, "pendingMessageCount": 0}})
+    elif typ == "prompt":
+        send({"id": req_id, "type": "response", "command": typ, "success": True, "data": {"runtime": "sdk"}})
+        send({"type": "agent_start"})
+        send({"type": "recovery", "message": "Pi SDK prompt idle timeout after 120000ms"})
+        send({"type": "runtime_settled", "reason": "sdk_prompt_idle_timeout"})
+    else:
+        send({"id": req_id, "type": "response", "command": typ, "success": True, "data": {}})
+`
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write idle-timeout pi sdk: %v", err)
 	}
 	return path
 }

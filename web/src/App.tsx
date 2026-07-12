@@ -500,6 +500,7 @@ function toSessionItem(
 }
 type Exchange = {
   role: string;
+  request_id?: string;
   agent?: string;
   model?: string;
   model_display_name?: string;
@@ -3370,6 +3371,8 @@ export function App({ onGoHome }: AppProps) {
         return null;
       }
       const cacheKey = rootSessionKey(resolvedRoot, resolvedKey);
+      const streamRequestBeforeSync =
+        sessionService.getSessionStreamRequestId(resolvedKey);
       const inflight = loadingSessionRef.current[cacheKey];
       const request =
         inflight ||
@@ -3388,16 +3391,25 @@ export function App({ onGoHome }: AppProps) {
         typeof (fullSession as any)?.pending === "boolean"
           ? !!(fullSession as any).pending
           : undefined;
+      if (serverPending === false && !inflight) {
+        sessionService.reconcileSessionNotPending(
+          resolvedKey,
+          streamRequestBeforeSync,
+        );
+      }
       const liveSession = sessionCacheRef.current[cacheKey];
       const hasLiveStream = sessionService.isSessionStreaming(resolvedKey);
       if (serverPending === false && !hasLiveStream) {
         clearLocalPendingForSession(resolvedRoot, resolvedKey);
       }
-      const pending = hasLiveStream
-        ? true
-        : serverPending === undefined
-          ? resolvePendingForSession(resolvedRoot, resolvedKey, false)
-          : resolveFreshSessionPending(resolvedRoot, resolvedKey, serverPending);
+      let pending: boolean;
+      if (hasLiveStream) {
+        pending = true;
+      } else if (serverPending === undefined) {
+        pending = resolvePendingForSession(resolvedRoot, resolvedKey, false);
+      } else {
+        pending = resolveFreshSessionPending(resolvedRoot, resolvedKey, serverPending);
+      }
       const restoredSession = {
         ...(fullSession as any),
         key: resolvedKey,
@@ -9034,7 +9046,7 @@ export function App({ onGoHome }: AppProps) {
       sessionKey: string,
       requestId?: string,
       terminalType: "done" | "cancelled" = "done",
-    ) => {
+    ): boolean => {
       const cacheKey = rootSessionKey(rootID, sessionKey);
       const pending = pendingBySessionRef.current[cacheKey];
       const runningTurn = runningTurnBySessionRef.current[cacheKey];
@@ -9045,7 +9057,7 @@ export function App({ onGoHome }: AppProps) {
           requestId,
           pendingRequestId: pending.requestId,
         });
-        return;
+        return false;
       }
       if (
         requestId &&
@@ -9058,7 +9070,7 @@ export function App({ onGoHome }: AppProps) {
           requestId,
           runningRequestId: runningTurn.requestId,
         });
-        return;
+        return false;
       }
       if (terminalType === "cancelled") {
         holdCancelRequestTombstone(cacheKey);
@@ -9074,9 +9086,10 @@ export function App({ onGoHome }: AppProps) {
         !!(hiddenQueued && hiddenQueued.size > 0);
       if (hasQueuedContinuation && !wasCanceled) {
         markSessionPending(rootID, sessionKey);
-        return;
+        return true;
       }
       clearLocalPendingForSession(rootID, sessionKey);
+      return true;
     };
 
     const handleSessionStream = (payload: any) => {
@@ -9090,6 +9103,23 @@ export function App({ onGoHome }: AppProps) {
       const ck = rootSessionKey(activeRoot, streamKey);
       const event = payload.event;
       if (!event?.type) return;
+      const streamRequestId =
+        typeof payload?.request_id === "string" ? payload.request_id : "";
+      const runningRequestId =
+        runningTurnBySessionRef.current[ck]?.requestId || "";
+      if (
+        streamRequestId &&
+        runningRequestId &&
+        streamRequestId !== runningRequestId
+      ) {
+        console.info("[session/stream] ignore_stale_request", {
+          rootId: activeRoot,
+          sessionKey: streamKey,
+          requestId: streamRequestId,
+          runningRequestId,
+        });
+        return;
+      }
       const isTerminalStreamEvent =
         event.type === "message_done" || event.type === "error";
       if (cancelRequestedBySessionRef.current[ck] && !isTerminalStreamEvent) {
@@ -9382,6 +9412,9 @@ export function App({ onGoHome }: AppProps) {
             typeof event.data?.request_id === "string"
               ? event.data.request_id
               : "";
+          if (!handleSessionStreamDone(activeRoot, streamKey, errorRequestId)) {
+            break;
+          }
           reportError(
             "session.resume_failed",
             event.data?.message || "会话处理失败，请稍后重试",
@@ -9393,7 +9426,6 @@ export function App({ onGoHome }: AppProps) {
               },
             },
           );
-          handleSessionStreamDone(activeRoot, streamKey, errorRequestId);
           break;
         }
       }
@@ -9974,6 +10006,9 @@ export function App({ onGoHome }: AppProps) {
             console.warn("[session/ws] error_without_session", { requestId, payloadSessionKey: payloadSessionKey || null });
             break;
           }
+          if (!handleSessionStreamDone(rootID, failedKey, requestId)) {
+            break;
+          }
           console.warn("[session/ws] error", { requestId: requestId || null, rootId: rootID, sessionKey: failedKey });
           if (requestId && pending) {
             delete pendingRequestRef.current[requestId];
@@ -9998,7 +10033,6 @@ export function App({ onGoHome }: AppProps) {
               exchanges,
             } as Session);
           }
-          handleSessionStreamDone(rootID, failedKey, requestId);
           reportError(
             "session.resume_failed",
             typeof payload?.error_message === "string"
@@ -10036,8 +10070,10 @@ export function App({ onGoHome }: AppProps) {
               });
               break;
             }
+            if (!handleSessionStreamDone(rootID, sessionKey, requestId, "cancelled")) {
+              break;
+            }
             setMultiProjectSessionPending(rootID, sessionKey, false);
-            handleSessionStreamDone(rootID, sessionKey, requestId, "cancelled");
           }
           break;
         }
@@ -10066,11 +10102,13 @@ export function App({ onGoHome }: AppProps) {
               });
               break;
             }
+            if (!handleSessionStreamDone(rootID, sessionKey, requestId)) {
+              break;
+            }
             if (payload?.replay !== true) {
               playCompletionSound();
             }
             setMultiProjectSessionPending(rootID, sessionKey, false);
-            handleSessionStreamDone(rootID, sessionKey, requestId);
             const newest = sessionsRef.current[0]?.updated_at || "";
             void loadSessionsForRoot(
               rootID,

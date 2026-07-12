@@ -699,13 +699,19 @@ func (s *AppContext) BroadcastSessionUserMessage(rootID, sessionKey, sessionType
 }
 
 func (s *AppContext) BroadcastSessionUpdate(rootID, sessionKey string, update agenttypes.Event) {
+	s.broadcastSessionUpdateForRequest(rootID, sessionKey, "", update)
+}
+
+func (s *AppContext) broadcastSessionUpdateForRequest(rootID, sessionKey, requestID string, update agenttypes.Event) {
 	event := updateToEvent(update)
 	if event == nil {
 		return
 	}
+	if !s.GetSessionStreamHub().broadcastSessionStreamForRequest(rootID, sessionKey, requestID, event) {
+		return
+	}
 	s.updateTaskAuxFlagsFromEvent(rootID, sessionKey, event)
 	s.notifyAskUserIfNeeded(rootID, sessionKey, event)
-	s.GetSessionStreamHub().BroadcastSessionStream(rootID, sessionKey, event)
 }
 
 func (s *AppContext) BroadcastSessionError(rootID, sessionKey, message string) {
@@ -714,10 +720,19 @@ func (s *AppContext) BroadcastSessionError(rootID, sessionKey, message string) {
 
 func (s *AppContext) BroadcastSessionErrorForRequest(rootID, sessionKey, requestID, message string) {
 	errorMessage := normalizeAgentErrorMessage(errors.New(message))
-	s.UpdateTaskSessionErrorForSession(rootID, sessionKey, errorMessage)
 	hub := s.GetSessionStreamHub()
-	hub.ClearSessionPending(sessionKey)
-	hub.BroadcastSessionError(rootID, sessionKey, requestID, "session.message_failed", errorMessage)
+	if !hub.recordSessionTerminal(sessionKey, CompletedSessionState{
+		RequestID:    requestID,
+		ErrorCode:    "session.message_failed",
+		ErrorMessage: errorMessage,
+	}) {
+		return
+	}
+	if !hub.clearSessionPendingForRequest(sessionKey, requestID) {
+		return
+	}
+	s.UpdateTaskSessionErrorForSession(rootID, sessionKey, errorMessage)
+	hub.sendSessionError(rootID, sessionKey, requestID, "session.message_failed", errorMessage)
 }
 
 func (s *AppContext) ClearTaskAuxFlagsForSession(rootID, sessionKey string) {
@@ -745,9 +760,14 @@ func (s *AppContext) UpdateTaskSessionErrorForSession(rootID, sessionKey, messag
 func (s *AppContext) BroadcastSessionDone(rootID, sessionKey, requestID string) {
 	hub := s.GetSessionStreamHub()
 	pending := hub.PendingSessionSnapshot(sessionKey)
+	if !hub.recordSessionTerminal(sessionKey, CompletedSessionState{RequestID: requestID}) {
+		return
+	}
+	if !hub.clearSessionPendingForRequest(sessionKey, requestID) {
+		return
+	}
 	s.notifySessionDone(rootID, sessionKey, requestID, pending)
-	hub.ClearSessionPending(sessionKey)
-	hub.BroadcastSessionDone(rootID, sessionKey, requestID)
+	hub.sendSessionDone(rootID, sessionKey, requestID)
 }
 
 func (s *AppContext) BroadcastScheduledTaskDone(rootID, taskID, taskName, sessionKey, summary string) {

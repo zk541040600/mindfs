@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -554,5 +555,75 @@ func TestManagerCreateRejectsInvalidKeyBeforePersistingMeta(t *testing.T) {
 	}
 	if len(sessions) != 0 {
 		t.Fatalf("persisted %d sessions after invalid create, want 0", len(sessions))
+	}
+}
+
+func TestManagerReconcilesExchangeAppendedBeforeMetadataUpdate(t *testing.T) {
+	root := rootfs.NewRootInfo("mindfs", "mindfs", t.TempDir())
+	createdAt := time.Date(2026, 7, 12, 4, 0, 0, 0, time.UTC)
+	manager := NewManager(root, WithClock(func() time.Time { return createdAt }))
+	created, err := manager.Create(context.Background(), CreateInput{
+		Key:  "interrupted-session",
+		Type: TypeChat,
+		Name: "Interrupted",
+	})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if err := manager.Shutdown(); err != nil {
+		t.Fatalf("shutdown manager: %v", err)
+	}
+
+	exchangeAt := createdAt.Add(time.Hour)
+	payload, err := json.Marshal(Exchange{
+		Seq:       1,
+		Role:      "user",
+		Content:   "persisted before metadata update",
+		Timestamp: exchangeAt,
+	})
+	if err != nil {
+		t.Fatalf("marshal exchange: %v", err)
+	}
+	exchangeFile := filepath.Join(root.MetaDir(), "sessions", created.Key+".jsonl")
+	file, err := os.OpenFile(exchangeFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("open exchange file: %v", err)
+	}
+	if _, err := file.Write(append(payload, '\n')); err != nil {
+		file.Close()
+		t.Fatalf("append exchange: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("close exchange file: %v", err)
+	}
+
+	restarted := NewManager(root)
+	changedAfter := createdAt.Add(30 * time.Minute)
+	sessions, err := restarted.List(context.Background(), ListOptions{AfterTime: changedAfter})
+	if err != nil {
+		t.Fatalf("list sessions after restart: %v", err)
+	}
+	if len(sessions) != 1 {
+		t.Fatalf("sessions after interrupted append = %d, want 1", len(sessions))
+	}
+	if !sessions[0].UpdatedAt.Equal(exchangeAt) {
+		t.Fatalf("UpdatedAt = %s, want %s", sessions[0].UpdatedAt, exchangeAt)
+	}
+	if len(sessions[0].Exchanges) != 1 {
+		t.Fatalf("exchange count = %d, want 1", len(sessions[0].Exchanges))
+	}
+
+	dbFile := filepath.Join(root.MetaDir(), filepath.FromSlash(sessionDBPath))
+	db, err := sql.Open("sqlite", dbFile)
+	if err != nil {
+		t.Fatalf("open session db: %v", err)
+	}
+	defer db.Close()
+	var updatedAt string
+	if err := db.QueryRow(`SELECT updated_at FROM sessions WHERE key = ?`, created.Key).Scan(&updatedAt); err != nil {
+		t.Fatalf("query reconciled metadata: %v", err)
+	}
+	if updatedAt != exchangeAt.Format(time.RFC3339Nano) {
+		t.Fatalf("persisted updated_at = %q, want %q", updatedAt, exchangeAt.Format(time.RFC3339Nano))
 	}
 }

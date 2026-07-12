@@ -168,3 +168,36 @@ func TestHandleUnknownPlanAndContextCompactionItems(t *testing.T) {
 		t.Fatalf("compact notice = %#v", updates[1].Data)
 	}
 }
+
+func TestBuildCodexModelListIncludesConfiguredModelMissingFromCatalog(t *testing.T) {
+	got := buildCodexModelList([]codextypes.Model{{
+		Model:       "gpt-5.5",
+		DisplayName: "GPT-5.5",
+		IsDefault:   true,
+	}}, "gpt-5.6-sol")
+
+	if got.CurrentModelID != "gpt-5.6-sol" {
+		t.Fatalf("current model = %q, want gpt-5.6-sol", got.CurrentModelID)
+	}
+	if len(got.Models) != 2 {
+		t.Fatalf("models = %#v, want catalog model plus configured model", got.Models)
+	}
+	configured := got.Models[1]
+	if configured.ID != "gpt-5.6-sol" || configured.Name != "gpt-5.6-sol" || !configured.SupportEffort {
+		t.Fatalf("configured model = %#v", configured)
+	}
+}
+
+func TestBuildCodexModelListDoesNotDuplicateConfiguredCatalogModel(t *testing.T) {
+	got := buildCodexModelList([]codextypes.Model{{
+		Model:       "gpt-5.6-sol",
+		DisplayName: "GPT-5.6 Sol",
+	}}, "gpt-5.6-sol")
+
+	if len(got.Models) != 1 {
+		t.Fatalf("models = %#v, want configured catalog model once", got.Models)
+	}
+	if got.Models[0].Name != "GPT-5.6 Sol" {
+		t.Fatalf("model name = %q, want catalog display name", got.Models[0].Name)
+	}
+}

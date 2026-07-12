@@ -67,8 +67,13 @@ func (p *Pool) GetOrCreate(ctx context.Context, in agenttypes.OpenSessionInput) 
 		return nil, errors.New("agent pool closed")
 	}
 	if entry, ok := p.sessions[in.SessionKey]; ok {
-		p.mu.Unlock()
-		return entry.session, nil
+		closed, reportsClosed := entry.session.(interface{ Closed() bool })
+		if !reportsClosed || !closed.Closed() {
+			p.mu.Unlock()
+			return entry.session, nil
+		}
+		delete(p.sessions, in.SessionKey)
+		log.Printf("[agent/pool] get_or_create.evict_closed session=%s agent=%s protocol=%s", in.SessionKey, entry.agentName, entry.protocol)
 	}
 	def, ok := p.cfg.GetAgent(in.AgentName)
 	if !ok {

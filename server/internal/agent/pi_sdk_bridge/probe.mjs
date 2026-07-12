@@ -2559,7 +2559,15 @@ async function createJsonlSDKRuntime(options) {
       if (elapsed < SDK_PROMPT_IDLE_FALLBACK_MS) {
         return;
       }
-      if (session.isRetrying === true || session.isCompacting === true || state.pendingToolCalls.size > 0 || pendingUI.size > 0) {
+      // A provider may spend longer than the fallback window before emitting the
+      // next SDK event. Keep genuinely active streams alive; the caller can still
+      // cancel them explicitly through the runtime abort path.
+      const hasActiveWork = session.isStreaming === true
+        || session.isRetrying === true
+        || session.isCompacting === true
+        || state.pendingToolCalls.size > 0
+        || pendingUI.size > 0;
+      if (hasActiveWork) {
         return;
       }
       if (elapsed < SDK_PROMPT_HARD_IDLE_TIMEOUT_MS) {
