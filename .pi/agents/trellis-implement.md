@@ -3,6 +3,8 @@ name: trellis-implement
 description: |
   Code implementation expert. Understands Trellis specs and requirements, then implements features. No git commit allowed.
 tools: read, write, edit, bash, find, grep
+model: cch-anthropic/deepseek-v4-pro
+thinking: medium
 ---
 
 ## Required: Load Trellis Context First

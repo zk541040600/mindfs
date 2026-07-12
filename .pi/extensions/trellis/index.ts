@@ -665,7 +665,17 @@ function resolveRunCfg(
 }
 
 function buildPiArgs(cfg: PiRunConfig): string[] {
-  const args = ["--mode", "json", "-p", "--no-session"];
+  const args = [
+    "--mode",
+    "json",
+    "-p",
+    "--no-session",
+    "--no-extensions",
+    "--no-skills",
+    "--no-prompt-templates",
+    "--no-themes",
+    "--no-context-files",
+  ];
   if (cfg.model)
     args.push(
       "--model",
