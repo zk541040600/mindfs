@@ -40,3 +40,38 @@ Fixed restart-safe session persistence, request-idempotent WebSocket delivery, b
 ### Next Steps
 
 - None - task complete
+
+
+## Session 2: Optimize MindFS web performance
+
+**Date**: 2026-07-12
+**Task**: Optimize MindFS web performance
+**Branch**: `main`
+
+### Summary
+
+Reduced entry JS by 16.89%, added build-time Brotli/gzip with q-aware Go serving, moved optional UI features to lazy chunks, coalesced stream UI notifications, passed the full Go/Web/native-shell matrix, proved automatic rollback on a faulty smoke assertion, and completed a verified production deployment.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `19f2268` | (see git log) |
+| `9e7f70c` | (see git log) |
+| `e77c977` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
