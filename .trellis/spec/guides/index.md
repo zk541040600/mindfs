@@ -23,6 +23,7 @@ These guides help you **ask the right questions before coding**.
 |-------|---------|-------------|
 | [Code Reuse Thinking Guide](./code-reuse-thinking-guide.md) | Identify patterns and reduce duplication | When you notice repeated patterns |
 | [Cross-Layer Thinking Guide](./cross-layer-thinking-guide.md) | Think through data flow across layers | Features spanning multiple layers |
+| [Web Performance Guide](./web-performance-guide.md) | Preserve bundle, transport, cache, and streaming UI performance | Web build, static serving, lazy loading, or stream rendering changes |
 
 ---
 
@@ -50,6 +51,16 @@ These guides help you **ask the right questions before coding**.
 - [ ] Multiple branches update the same derived state from `kind` / `action`
 
 → Read [Code Reuse Thinking Guide](./code-reuse-thinking-guide.md)
+
+### When to Think About Web Performance
+
+- [ ] A dependency is added to the main frontend entry
+- [ ] A component moves behind `React.lazy` or a dynamic import
+- [ ] Vite reports a large chunk or a bundle budget changes
+- [ ] Static asset, service-worker, relay, or native-shell behavior changes
+- [ ] Streaming events trigger React state or scroll work
+
+→ Read [Web Performance Guide](./web-performance-guide.md)
 
 ### When Verifying AI Cross-Review Results
 
