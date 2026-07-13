@@ -119,11 +119,7 @@ class BootstrapService {
       this.setState({ phase: "ready", error: "" });
       return this.snapshot();
     } catch (err) {
-      if (err instanceof Error && err.message === "e2ee_proof_invalid") {
-        e2eeService.clearSecret();
-      } else {
-        e2eeService.clearSession();
-      }
+      e2eeService.clearSession();
       const code = err instanceof Error ? err.message : "e2ee_open_failed";
       this.setState({ phase: "needs_pairing", error: code });
       throw err;
@@ -143,11 +139,7 @@ class BootstrapService {
             await this.refreshRelayStatus();
             this.setState({ phase: "ready", error: "" });
           } catch (err) {
-            if (err instanceof Error && err.message === "e2ee_proof_invalid") {
-              e2eeService.clearSecret();
-            } else {
-              e2eeService.clearSession();
-            }
+            e2eeService.clearSession();
             this.setState({ phase: "needs_pairing", error: "" });
           }
         } else {

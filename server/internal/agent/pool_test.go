@@ -176,8 +176,6 @@ func TestPoolReopensClosedPiSDKSession(t *testing.T) {
 	pool := NewPool(cfg)
 	defer pool.CloseAll()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
 	input := agenttypes.OpenSessionInput{
 		SessionKey:   "pool-pi-sdk-reopen",
 		AgentName:    "pi-sdk-test",
@@ -185,7 +183,9 @@ func TestPoolReopensClosedPiSDKSession(t *testing.T) {
 		Probe:        true,
 		TestScenario: "prompt-stream",
 	}
-	first, err := pool.GetOrCreate(ctx, input)
+	firstCtx, cancelFirst := context.WithTimeout(context.Background(), 10*time.Second)
+	first, err := pool.GetOrCreate(firstCtx, input)
+	cancelFirst()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -193,14 +193,16 @@ func TestPoolReopensClosedPiSDKSession(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	second, err := pool.GetOrCreate(ctx, input)
+	secondCtx, cancelSecond := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelSecond()
+	second, err := pool.GetOrCreate(secondCtx, input)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if second == first {
 		t.Fatal("GetOrCreate returned the closed pi-sdk session")
 	}
-	if err := second.SendMessage(ctx, "reopened"); err != nil {
+	if err := second.SendMessage(secondCtx, "reopened"); err != nil {
 		t.Fatalf("reopened session SendMessage failed: %v", err)
 	}
 }
@@ -276,17 +278,41 @@ func TestPoolConfigReturnsLoadedConfig(t *testing.T) {
 	}
 }
 
-func TestPoolUpdateConfigAppliesRuntimeEnvWithoutFreezingHostedFields(t *testing.T) {
+func TestPoolUpdateConfigPreservesLocalExecutableFieldsOnHostedRefresh(t *testing.T) {
 	local := Config{
 		Agents: []Definition{
-			{Name: "codex", Command: "local-codex", Brief: "local brief", Env: map[string]string{"LOCAL": "1"}},
+			{
+				Name:            "codex",
+				Command:         "local-codex",
+				Brief:           "local brief",
+				Protocol:        ProtocolCodexSDK,
+				Args:            []string{"--local"},
+				Env:             map[string]string{"LOCAL": "1"},
+				CwdTemplate:     "{root}/local",
+				InstallCommands: LifecycleCommands{"local install"},
+			},
+			{Name: "pi", Command: "local-pi"},
 		},
+		Shells:       []Shell{{Command: "local-shell"}},
+		RelayBaseURL: "https://relay.local.example.com",
 	}
 	hostedV1 := Config{
 		Agents: []Definition{
-			{Name: "codex", Command: "hosted-codex", Brief: "hosted brief v1"},
+			{
+				Name:            "codex",
+				Command:         "hosted-codex",
+				Brief:           "hosted brief v1",
+				Protocol:        ProtocolACP,
+				Args:            []string{"--hosted"},
+				Env:             map[string]string{"HOSTED": "1"},
+				CwdTemplate:     "/hosted",
+				InstallCommands: LifecycleCommands{"hosted install"},
+			},
+			{Name: "pi", Command: "hosted-pi", Brief: "hosted pi brief"},
 			{Name: "hosted-only", Command: "hosted-only", Brief: "hosted only v1"},
 		},
+		Shells:       []Shell{{Command: "hosted-shell"}},
+		RelayBaseURL: "https://relay.hosted.example.com",
 	}
 	pool := NewPool(MergeHostedConfig(hostedV1, local))
 	if err := pool.SetAgentEnv("codex", map[string]string{"RUNTIME": "1"}); err != nil {
@@ -295,9 +321,12 @@ func TestPoolUpdateConfigAppliesRuntimeEnvWithoutFreezingHostedFields(t *testing
 
 	hostedV2 := Config{
 		Agents: []Definition{
-			{Name: "codex", Command: "hosted-codex-v2", Brief: "hosted brief v2"},
+			{Name: "codex", Command: "hosted-codex-v2", Brief: "hosted brief v2", Args: []string{"--hosted-v2"}},
+			{Name: "pi", Command: "hosted-pi-v2", Brief: "hosted pi brief v2"},
 			{Name: "hosted-only", Command: "hosted-only-v2", Brief: "hosted only v2"},
 		},
+		Shells:       []Shell{{Command: "hosted-shell-v2"}},
+		RelayBaseURL: "https://relay.hosted-v2.example.com",
 	}
 	effective := pool.UpdateConfig(MergeHostedConfig(hostedV2, local))
 
@@ -305,18 +334,24 @@ func TestPoolUpdateConfigAppliesRuntimeEnvWithoutFreezingHostedFields(t *testing
 	if !ok {
 		t.Fatalf("expected codex")
 	}
-	if codex.Command != "local-codex" || codex.Brief != "local brief" {
-		t.Fatalf("local override not preserved: %+v", codex)
+	if codex.Command != "local-codex" || codex.Brief != "local brief" || codex.Protocol != ProtocolCodexSDK || !reflect.DeepEqual(codex.Args, []string{"--local"}) || codex.CwdTemplate != "{root}/local" || !reflect.DeepEqual(codex.InstallCommands, LifecycleCommands{"local install"}) {
+		t.Fatalf("local executable definition not preserved: %+v", codex)
 	}
 	if !reflect.DeepEqual(codex.Env, map[string]string{"RUNTIME": "1"}) {
 		t.Fatalf("runtime env not preserved: %#v", codex.Env)
 	}
-	hostedOnly, ok := effective.GetAgent("hosted-only")
-	if !ok {
-		t.Fatalf("expected hosted-only")
+	if _, ok := effective.GetAgent("hosted-only"); ok {
+		t.Fatal("hosted-only agent must not become executable without a local definition")
 	}
-	if hostedOnly.Command != "hosted-only-v2" || hostedOnly.Brief != "hosted only v2" {
-		t.Fatalf("hosted update was frozen: %+v", hostedOnly)
+	pi, ok := effective.GetAgent("pi")
+	if !ok {
+		t.Fatal("expected local pi definition")
+	}
+	if pi.Command != "local-pi" || pi.Brief != "hosted pi brief v2" {
+		t.Fatalf("hosted metadata fallback or local command boundary failed: %+v", pi)
+	}
+	if !reflect.DeepEqual(effective.Shells, local.Shells) || effective.RelayBaseURL != local.RelayBaseURL {
+		t.Fatalf("hosted config changed local execution configuration: %+v", effective)
 	}
 }
 

@@ -2,6 +2,7 @@ import { appURL } from "./base";
 import { getStoredString, removeStoredString, setStoredString } from "./storage";
 
 const SECRET_STORAGE_PREFIX = "mindfs.e2ee.secret.";
+const E2EE_PROTOCOL_VERSION = 2;
 export const E2EE_HEADER = "X-MindFS-E2EE";
 export const CLIENT_ID_HEADER = "X-MindFS-Client-ID";
 export const PROOF_HEADER = "X-MindFS-Proof";
@@ -22,6 +23,7 @@ type OpenResponse = {
   node_eph_pk?: string;
   server_nonce?: string;
   server_proof?: string;
+  proto_version?: number;
 };
 
 type CipherEnvelope = {
@@ -32,11 +34,26 @@ type CipherEnvelope = {
 type SessionContext = {
   transportKey: CryptoKey;
   transportKeyBytes: Uint8Array;
+  protocolVersion: number;
+  nextClientWSSequence: number;
+  lastServerWSSequence: number;
+};
+
+type E2EEWSFrame<T> = {
+  sequence: number;
+  message: T;
 };
 
 type ProtectedRequest = {
   init: RequestInit;
   session: SessionContext;
+  headers: Headers;
+};
+
+type ProtectedResponseBinding = {
+  session: SessionContext;
+  proof: string;
+  expiresAt: number;
 };
 
 export type NativeE2EESession = {
@@ -54,6 +71,9 @@ class E2EEService {
   private session: SessionContext | null = null;
   private listeners = new Set<E2EEListener>();
   private openingPromise: Promise<SessionContext> | null = null;
+  private lastProofTimestampMs = 0;
+  private pendingResponseBindings = new Map<string, ProtectedResponseBinding>();
+  private responseBindings = new WeakMap<Response, ProtectedResponseBinding>();
 
   subscribe(listener: E2EEListener) {
     this.listeners.add(listener);
@@ -137,13 +157,6 @@ class E2EEService {
     }
   }
 
-  clearSecret() {
-    if (this.nodeId) {
-      removeStoredString(this.secretStorageKey());
-    }
-    this.clearSession();
-  }
-
   async ensureSession(): Promise<SessionContext | null> {
     if (!this.required) {
       return null;
@@ -175,14 +188,6 @@ class E2EEService {
     return encryptJSON(session.transportKey, value);
   }
 
-  async decryptEnvelope<T>(envelope: CipherEnvelope): Promise<T> {
-    const session = await this.ensureSession();
-    if (!session) {
-      throw new Error("e2ee_required");
-    }
-    return decryptJSON<T>(session.transportKey, envelope);
-  }
-
   async encryptEnvelopeBytes(bytes: Uint8Array): Promise<CipherEnvelope> {
     const session = await this.ensureSession();
     if (!session) {
@@ -199,25 +204,33 @@ class E2EEService {
     return decryptBytes(session.transportKey, envelope);
   }
 
-  async encodeProtectedJSON(value: unknown): Promise<string> {
-    const envelope = await this.encryptEnvelope(value);
-    if (!envelope) {
+  async encodeWSMessage(value: unknown): Promise<string> {
+    const session = await this.ensureSession();
+    if (!session) {
       throw new Error("e2ee_required");
     }
-    return JSON.stringify(envelope);
-  }
-
-  async decodeProtectedJSON<T>(raw: string): Promise<T> {
-    const envelope = JSON.parse(raw) as CipherEnvelope;
-    return this.decryptEnvelope<T>(envelope);
-  }
-
-  async encodeWSMessage(value: unknown): Promise<string> {
-    return this.encodeProtectedJSON(value);
+    const frame: E2EEWSFrame<unknown> = {
+      sequence: ++session.nextClientWSSequence,
+      message: value,
+    };
+    return JSON.stringify(await encryptJSON(session.transportKey, frame));
   }
 
   async decodeWSMessage<T>(raw: string): Promise<T> {
-    return this.decodeProtectedJSON<T>(raw);
+    const session = await this.ensureSession();
+    if (!session) {
+      throw new Error("e2ee_required");
+    }
+    const envelope = JSON.parse(raw) as CipherEnvelope;
+    const frame = await decryptJSON<unknown>(session.transportKey, envelope);
+    if (!isE2EEWSFrame(frame)) {
+      throw new Error("e2ee_frame_invalid");
+    }
+    if (frame.sequence <= session.lastServerWSSequence) {
+      throw new Error("e2ee_frame_replayed");
+    }
+    session.lastServerWSSequence = frame.sequence;
+    return frame.message as T;
   }
 
   async wsProofParams(method: string, path: string): Promise<URLSearchParams> {
@@ -225,7 +238,7 @@ class E2EEService {
     if (!session) {
       throw new Error("e2ee_required");
     }
-    const ts = new Date().toISOString();
+    const ts = this.nextProofTimestamp();
     const proofPath = canonicalProofPath(path);
     const proof = await buildRequestProof(session.transportKeyBytes, method, proofPath, ts, this.clientId);
     return new URLSearchParams({
@@ -246,25 +259,52 @@ class E2EEService {
     if (!session) {
       throw new Error("e2ee_required");
     }
-    const ts = new Date().toISOString();
+    const ts = this.nextProofTimestamp();
     const proofPath = canonicalProofPath(path);
     const proof = await buildRequestProof(session.transportKeyBytes, method, proofPath, ts, this.clientId);
     const next = new Headers(headers);
     next.set(CLIENT_ID_HEADER, this.clientId);
     next.set(TS_HEADER, ts);
     next.set(PROOF_HEADER, proof);
+    this.rememberResponseBinding(session, proof);
     return next;
   }
 
   private async requestProofHeaders(session: SessionContext, method: string, input: RequestInfo | URL, headers?: HeadersInit): Promise<Headers> {
-    const ts = new Date().toISOString();
+    const ts = this.nextProofTimestamp();
     const requestURL = input instanceof Request ? input.url : String(input);
     const proofPath = canonicalProofPath(requestURL);
     const proof = await buildRequestProof(session.transportKeyBytes, method, proofPath, ts, this.clientId);
     const next = this.sessionProtectedHeaders(headers);
     next.set(TS_HEADER, ts);
     next.set(PROOF_HEADER, proof);
+    this.rememberResponseBinding(session, proof);
     return next;
+  }
+
+  private nextProofTimestamp(): string {
+    const next = Math.max(Date.now(), this.lastProofTimestampMs + 1);
+    this.lastProofTimestampMs = next;
+    return new Date(next).toISOString();
+  }
+
+  private rememberResponseBinding(session: SessionContext, proof: string) {
+    const now = Date.now();
+    for (const [value, binding] of this.pendingResponseBindings) {
+      if (binding.expiresAt <= now) {
+        this.pendingResponseBindings.delete(value);
+      }
+    }
+    this.pendingResponseBindings.set(proof, { session, proof, expiresAt: now + 5 * 60 * 1000 });
+  }
+
+  private takeResponseBinding(response: Response): ProtectedResponseBinding {
+    const binding = this.responseBindings.get(response);
+    this.responseBindings.delete(response);
+    if (!binding) {
+      throw new Error("e2ee_response_unbound");
+    }
+    return binding;
   }
 
   isProtectedJSONResponse(response: Response): boolean {
@@ -275,7 +315,34 @@ class E2EEService {
     if (!this.isProtectedJSONResponse(response)) {
       return response.json() as Promise<T>;
     }
-    return this.decodeProtectedJSON<T>(await response.text());
+    const binding = this.takeResponseBinding(response);
+    const envelope = JSON.parse(await response.text()) as CipherEnvelope;
+    if (binding.session.protocolVersion < E2EE_PROTOCOL_VERSION) {
+      return decryptJSON<T>(binding.session.transportKey, envelope);
+    }
+    return decryptJSON<T>(binding.session.transportKey, envelope, new TextEncoder().encode(binding.proof));
+  }
+
+  bindProtectedResponse(response: Response, headers?: HeadersInit): Response {
+    const proof = String(new Headers(headers).get(PROOF_HEADER) || "").trim();
+    if (!proof) {
+      return response;
+    }
+    const binding = this.pendingResponseBindings.get(proof);
+    this.pendingResponseBindings.delete(proof);
+    if (binding && this.isProtectedJSONResponse(response)) {
+      this.responseBindings.set(response, binding);
+    }
+    return response;
+  }
+
+  async decryptBoundResponseBytes(response: Response, envelope: CipherEnvelope, context = ""): Promise<Uint8Array> {
+    const binding = this.takeResponseBinding(response);
+    if (binding.session.protocolVersion < E2EE_PROTOCOL_VERSION) {
+      return decryptBytes(binding.session.transportKey, envelope);
+    }
+    const aad = context ? `${binding.proof}\x1f${context}` : binding.proof;
+    return decryptBytes(binding.session.transportKey, envelope, new TextEncoder().encode(aad));
   }
 
   async protectedFetch(input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
@@ -284,11 +351,13 @@ class E2EEService {
     }
     let request = await this.buildProtectedRequest(input, init);
     let response = await fetch(input, request.init);
+    this.bindProtectedResponse(response, request.headers);
     if (response.status === 401) {
       const payload = (await response.clone().json().catch(() => ({}))) as { error?: string };
       if (await this.recoverProtectedSession(String(payload.error || ""), request.session)) {
         request = await this.buildProtectedRequest(input, init);
         response = await fetch(input, request.init);
+        this.bindProtectedResponse(response, request.headers);
       }
     }
     return response;
@@ -308,7 +377,7 @@ class E2EEService {
       next.body = JSON.stringify(envelope);
       headers.set("Content-Type", "application/json");
     }
-    return { init: next, session };
+    return { init: next, session, headers };
   }
 
   private async recoverProtectedSession(code: string, failedSession: SessionContext): Promise<boolean> {
@@ -327,34 +396,25 @@ class E2EEService {
     ) {
       return true;
     }
-    if (
-      normalized === "e2ee_session_missing" ||
-      normalized === "e2ee_session_expired"
-    ) {
-      this.session = null;
-      if (!this.hasSecret()) {
-        this.emit();
-      }
+    if (normalized === "e2ee_session_missing" || normalized === "e2ee_session_expired") {
+      this.clearSession({ silent: this.hasSecret() });
       await this.ensureSession();
       return true;
     }
     if (normalized === "e2ee_proof_invalid") {
-      this.clearSecret();
-      return true;
+      this.clearSession({ silent: this.hasSecret() });
+      return false;
     }
     return false;
   }
 
   async protectedJSON<T>(input: RequestInfo | URL, init: RequestInit = {}): Promise<T> {
     const response = await this.protectedFetch(input, init);
+    const payload = await this.parseProtectedJSONResponse<{ error?: string; message?: string } & T>(response);
     if (!response.ok) {
-      const payload: { error?: string; message?: string } =
-        await this.parseProtectedJSONResponse<{ error?: string; message?: string }>(
-          response.clone(),
-        ).catch(() => ({}));
       throw new Error(String(payload.message || payload.error || `request failed: ${response.status}`));
     }
-    return this.parseProtectedJSONResponse<T>(response);
+    return payload as T;
   }
 
   isRequired(): boolean {
@@ -387,8 +447,8 @@ class E2EEService {
       return true;
     }
     if (normalized === "e2ee_proof_invalid") {
-      this.clearSecret();
-      return true;
+      this.clearSession({ silent: this.hasSecret() });
+      return false;
     }
     return false;
   }
@@ -427,7 +487,7 @@ class E2EEService {
         client_eph_pk: clientEphPK,
         client_nonce: clientNonce,
         proof,
-        proto_version: 1,
+        proto_version: E2EE_PROTOCOL_VERSION,
       }),
     });
     const payload = (await response.json().catch(() => ({}))) as OpenResponse & {
@@ -437,6 +497,10 @@ class E2EEService {
       const code = String(payload?.error || `e2ee_open_failed_${response.status}`);
       this.handleServerError(code);
       throw new Error(code);
+    }
+    const protocolVersion = Number(payload.proto_version);
+    if (protocolVersion !== E2EE_PROTOCOL_VERSION) {
+      throw new Error("e2ee_protocol_unsupported");
     }
     const nodeEphPK = String(payload.node_eph_pk || "").trim();
     const serverNonce = String(payload.server_nonce || "").trim();
@@ -451,6 +515,7 @@ class E2EEService {
       nodeEphPK,
       clientNonce,
       serverNonce,
+      protocolVersion,
     );
     if (expectedServerProof !== serverProof) {
       throw new Error("e2ee_proof_invalid");
@@ -472,10 +537,11 @@ class E2EEService {
         256,
       ),
     );
+    const sessionInfoParts = [this.nodeId, clientEphPK, nodeEphPK, clientNonce, serverNonce, "v2"];
     const sessionMaster = await hkdfBytes(
       sharedSecret,
       await sha256Bytes(secret),
-      await sha256Bytes([this.nodeId, clientEphPK, nodeEphPK, clientNonce, serverNonce].join("\x1f")),
+      await sha256Bytes(sessionInfoParts.join("\x1f")),
       32,
     );
     const transportKeyBytes = await hkdfBytes(sessionMaster, null, new TextEncoder().encode("transport"), 32);
@@ -483,6 +549,9 @@ class E2EEService {
     return {
       transportKey,
       transportKeyBytes,
+      protocolVersion,
+      nextClientWSSequence: 0,
+      lastServerWSSequence: 0,
     };
   }
 
@@ -505,12 +574,21 @@ class E2EEService {
   }
 }
 
+function isE2EEWSFrame(value: unknown): value is E2EEWSFrame<unknown> {
+  if (!value || typeof value !== "object" || !("sequence" in value) || !("message" in value)) {
+    return false;
+  }
+  const sequence = (value as E2EEWSFrame<unknown>).sequence;
+  return Number.isSafeInteger(sequence) && sequence > 0;
+}
+
 async function buildOpenProof(secret: string, nodeId: string, clientEphPK: string, clientNonce: string): Promise<string> {
   return buildHmacProof(secret, "mindfs-e2ee-open", [nodeId, clientEphPK, clientNonce]);
 }
 
-async function buildAcceptProof(secret: string, nodeId: string, clientEphPK: string, nodeEphPK: string, clientNonce: string, serverNonce: string): Promise<string> {
-  return buildHmacProof(secret, "mindfs-e2ee-accept", [nodeId, clientEphPK, nodeEphPK, clientNonce, serverNonce]);
+async function buildAcceptProof(secret: string, nodeId: string, clientEphPK: string, nodeEphPK: string, clientNonce: string, serverNonce: string, protocolVersion: number): Promise<string> {
+  const label = protocolVersion === E2EE_PROTOCOL_VERSION ? "mindfs-e2ee-accept-v2" : "mindfs-e2ee-accept";
+  return buildHmacProof(secret, label, [nodeId, clientEphPK, nodeEphPK, clientNonce, serverNonce]);
 }
 
 async function buildHmacProof(secret: string, label: string, parts: string[]): Promise<string> {
@@ -530,8 +608,8 @@ async function encryptJSON(key: CryptoKey, value: unknown): Promise<CipherEnvelo
   return encryptBytes(key, new TextEncoder().encode(JSON.stringify(value)));
 }
 
-async function decryptJSON<T>(key: CryptoKey, envelope: CipherEnvelope): Promise<T> {
-  const plaintext = await decryptBytes(key, envelope);
+async function decryptJSON<T>(key: CryptoKey, envelope: CipherEnvelope, aad?: Uint8Array): Promise<T> {
+  const plaintext = await decryptBytes(key, envelope, aad);
   return JSON.parse(new TextDecoder().decode(plaintext)) as T;
 }
 
@@ -548,9 +626,11 @@ async function encryptBytes(key: CryptoKey, bytes: Uint8Array): Promise<CipherEn
   };
 }
 
-async function decryptBytes(key: CryptoKey, envelope: CipherEnvelope): Promise<Uint8Array> {
+async function decryptBytes(key: CryptoKey, envelope: CipherEnvelope, aad?: Uint8Array): Promise<Uint8Array> {
   const plaintext = await crypto.subtle.decrypt(
-    { name: "AES-GCM", iv: toArrayBuffer(decodeBase64(envelope.nonce)) },
+    aad
+      ? { name: "AES-GCM", iv: toArrayBuffer(decodeBase64(envelope.nonce)), additionalData: toArrayBuffer(aad) }
+      : { name: "AES-GCM", iv: toArrayBuffer(decodeBase64(envelope.nonce)) },
     key,
     toArrayBuffer(decodeBase64(envelope.ciphertext)),
   );

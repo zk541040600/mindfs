@@ -121,6 +121,9 @@ func (h *HTTPHandler) requireRequestProof(r *http.Request) (*e2ee.Session, error
 	if !e2ee.VerifyProof(expected, proof) {
 		return nil, errInvalidRequest("e2ee_proof_invalid")
 	}
+	if !manager.ConsumeRequestProof(clientID, proof, timestamp.Add(requestProofMaxSkew)) {
+		return nil, errInvalidRequest("e2ee_proof_replayed")
+	}
 	if err := manager.TouchSessionForClient(clientID); err != nil {
 		return nil, errInvalidRequest(err.Error())
 	}
@@ -137,8 +140,25 @@ func requestProofPath(r *http.Request) string {
 	return r.URL.Path + "?" + r.URL.RawQuery
 }
 
-func writeProtectedJSON(w http.ResponseWriter, status int, key []byte, value any) error {
-	envelope, err := e2ee.EncryptJSON(key, value)
+func rawResponseAAD(requestProof, contentType string) []byte {
+	return []byte(strings.TrimSpace(requestProof) + "\x1f" + strings.TrimSpace(contentType))
+}
+
+func writeProtectedJSON(w http.ResponseWriter, status int, sess *e2ee.Session, requestProof string, value any) error {
+	if sess == nil {
+		return errors.New("e2ee session required")
+	}
+	var envelope *e2ee.CipherEnvelope
+	var err error
+	if sess.ProtocolVersion >= e2ee.ProtocolVersionV2 {
+		requestProof = strings.TrimSpace(requestProof)
+		if requestProof == "" {
+			return errors.New("e2ee request proof required")
+		}
+		envelope, err = e2ee.EncryptJSONWithAAD(sess.Key, value, []byte(requestProof))
+	} else {
+		envelope, err = e2ee.EncryptJSON(sess.Key, value)
+	}
 	if err != nil {
 		return err
 	}
@@ -211,7 +231,7 @@ func (h *HTTPHandler) protectedEndpoint(next http.HandlerFunc) http.HandlerFunc 
 			respondError(w, http.StatusServiceUnavailable, err)
 			return
 		}
-		if err := writeProtectedJSON(w, recorder.status, sess.Key, payload); err != nil {
+		if err := writeProtectedJSON(w, recorder.status, sess, r.Header.Get(e2eeProofHeaderName), payload); err != nil {
 			respondError(w, http.StatusServiceUnavailable, err)
 			return
 		}
@@ -1700,7 +1720,13 @@ func (h *HTTPHandler) handleFile(w http.ResponseWriter, r *http.Request) {
 				respondError(w, http.StatusRequestEntityTooLarge, errInvalidRequest("file too large for e2ee raw download"))
 				return
 			}
-			envelope, err := e2ee.EncryptBytes(proofSession.Key, payload)
+			requestProof := strings.TrimSpace(r.Header.Get(e2eeProofHeaderName))
+			var envelope *e2ee.CipherEnvelope
+			if proofSession.ProtocolVersion >= e2ee.ProtocolVersionV2 {
+				envelope, err = e2ee.EncryptBytesWithAAD(proofSession.Key, payload, rawResponseAAD(requestProof, contentType))
+			} else {
+				envelope, err = e2ee.EncryptBytes(proofSession.Key, payload)
+			}
 			if err != nil {
 				respondError(w, http.StatusServiceUnavailable, err)
 				return
@@ -1752,7 +1778,7 @@ func (h *HTTPHandler) handleFile(w http.ResponseWriter, r *http.Request) {
 		"file": out.File,
 	}
 	if proofSession != nil {
-		if err := writeProtectedJSON(w, http.StatusOK, proofSession.Key, payload); err != nil {
+		if err := writeProtectedJSON(w, http.StatusOK, proofSession, r.Header.Get(e2eeProofHeaderName), payload); err != nil {
 			respondError(w, http.StatusServiceUnavailable, err)
 		}
 		return
@@ -2213,7 +2239,7 @@ func (h *HTTPHandler) handleUpload(w http.ResponseWriter, r *http.Request) {
 		"files": out.Files,
 	}
 	if proofSession != nil {
-		if err := writeProtectedJSON(w, http.StatusOK, proofSession.Key, payload); err != nil {
+		if err := writeProtectedJSON(w, http.StatusOK, proofSession, r.Header.Get(e2eeProofHeaderName), payload); err != nil {
 			respondError(w, http.StatusServiceUnavailable, err)
 		}
 		return
@@ -2469,7 +2495,7 @@ func (h *HTTPHandler) handleRelayStatus(w http.ResponseWriter, r *http.Request) 
 		respondJSON(w, http.StatusOK, publicRelayStatus(status))
 		return
 	}
-	if err := writeProtectedJSON(w, http.StatusOK, sess.Key, status); err != nil {
+	if err := writeProtectedJSON(w, http.StatusOK, sess, r.Header.Get(e2eeProofHeaderName), status); err != nil {
 		respondError(w, http.StatusServiceUnavailable, err)
 		return
 	}
@@ -2559,11 +2585,12 @@ func (h *HTTPHandler) handleE2EEOpen(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		ClientID    string `json:"client_id"`
-		NodeID      string `json:"node_id"`
-		ClientEphPK string `json:"client_eph_pk"`
-		ClientNonce string `json:"client_nonce"`
-		Proof       string `json:"proof"`
+		ClientID     string `json:"client_id"`
+		NodeID       string `json:"node_id"`
+		ClientEphPK  string `json:"client_eph_pk"`
+		ClientNonce  string `json:"client_nonce"`
+		Proof        string `json:"proof"`
+		ProtoVersion int    `json:"proto_version"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
 		respondError(w, http.StatusBadRequest, errInvalidRequest("invalid e2ee open payload"))
@@ -2574,8 +2601,15 @@ func (h *HTTPHandler) handleE2EEOpen(w http.ResponseWriter, r *http.Request) {
 	req.ClientEphPK = strings.TrimSpace(req.ClientEphPK)
 	req.ClientNonce = strings.TrimSpace(req.ClientNonce)
 	req.Proof = strings.TrimSpace(req.Proof)
+	if req.ProtoVersion == 0 {
+		req.ProtoVersion = e2ee.ProtocolVersionV1
+	}
 	if req.ClientID == "" || req.NodeID == "" || req.ClientEphPK == "" || req.ClientNonce == "" || req.Proof == "" {
 		respondError(w, http.StatusBadRequest, errInvalidRequest("client_id, node_id, client_eph_pk, client_nonce and proof are required"))
+		return
+	}
+	if !e2ee.IsSupportedProtocolVersion(req.ProtoVersion) {
+		respondError(w, http.StatusBadRequest, errInvalidRequest("e2ee_protocol_unsupported"))
 		return
 	}
 	if req.NodeID != manager.NodeID() {
@@ -2603,9 +2637,13 @@ func (h *HTTPHandler) handleE2EEOpen(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	serverNonce := base64.StdEncoding.EncodeToString(serverNonceBytes)
-	derived, err := e2ee.DeriveKey(manager.PairingSecret(), req.NodeID, req.ClientEphPK, nodeEphPK, req.ClientNonce, serverNonce, nodePriv, clientPub)
+	derived, err := e2ee.DeriveKeyForProtocol(manager.PairingSecret(), req.NodeID, req.ClientEphPK, nodeEphPK, req.ClientNonce, serverNonce, nodePriv, clientPub, req.ProtoVersion)
 	if err != nil {
 		respondError(w, http.StatusServiceUnavailable, err)
+		return
+	}
+	if !manager.ConsumeOpenNonce(req.ClientID, req.ClientNonce) {
+		respondError(w, http.StatusConflict, errInvalidRequest("e2ee_open_replayed"))
 		return
 	}
 	if _, err := manager.OpenSessionForClient(req.ClientID, derived); err != nil {
@@ -2613,10 +2651,11 @@ func (h *HTTPHandler) handleE2EEOpen(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	respondJSON(w, http.StatusOK, map[string]any{
-		"ok":           true,
-		"node_eph_pk":  nodeEphPK,
-		"server_nonce": serverNonce,
-		"server_proof": e2ee.BuildAcceptProof(manager.PairingSecret(), req.NodeID, req.ClientEphPK, nodeEphPK, req.ClientNonce, serverNonce),
+		"ok":            true,
+		"node_eph_pk":   nodeEphPK,
+		"server_nonce":  serverNonce,
+		"server_proof":  e2ee.BuildAcceptProofForProtocol(manager.PairingSecret(), req.NodeID, req.ClientEphPK, nodeEphPK, req.ClientNonce, serverNonce, req.ProtoVersion),
+		"proto_version": req.ProtoVersion,
 	})
 }
 

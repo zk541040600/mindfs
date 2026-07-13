@@ -17,7 +17,9 @@ import (
 )
 
 const (
-	InfoTransport = "transport"
+	InfoTransport     = "transport"
+	ProtocolVersionV1 = 1
+	ProtocolVersionV2 = 2
 )
 
 type CipherEnvelope struct {
@@ -26,7 +28,13 @@ type CipherEnvelope struct {
 }
 
 type DerivedKey struct {
-	Transport []byte
+	Transport       []byte
+	ProtocolVersion int
+}
+
+// IsSupportedProtocolVersion reports whether the server can safely negotiate the requested E2EE transport protocol.
+func IsSupportedProtocolVersion(version int) bool {
+	return version == ProtocolVersionV1 || version == ProtocolVersionV2
 }
 
 func GenerateECDHKeypair() (*ecdh.PrivateKey, string, error) {
@@ -50,7 +58,16 @@ func BuildOpenProof(pairingSecret, nodeID, clientEphPK, clientNonce string) stri
 }
 
 func BuildAcceptProof(pairingSecret, nodeID, clientEphPK, nodeEphPK, clientNonce, serverNonce string) string {
-	return buildProof(pairingSecret, "mindfs-e2ee-accept", nodeID, clientEphPK, nodeEphPK, clientNonce, serverNonce)
+	return BuildAcceptProofForProtocol(pairingSecret, nodeID, clientEphPK, nodeEphPK, clientNonce, serverNonce, ProtocolVersionV1)
+}
+
+// BuildAcceptProofForProtocol proves that the server accepted the same E2EE transport protocol as the client.
+func BuildAcceptProofForProtocol(pairingSecret, nodeID, clientEphPK, nodeEphPK, clientNonce, serverNonce string, protocolVersion int) string {
+	label := "mindfs-e2ee-accept"
+	if protocolVersion == ProtocolVersionV2 {
+		label += "-v2"
+	}
+	return buildProof(pairingSecret, label, nodeID, clientEphPK, nodeEphPK, clientNonce, serverNonce)
 }
 
 func buildProof(pairingSecret, label string, parts ...string) string {
@@ -72,11 +89,23 @@ func BuildRequestProof(key []byte, method, path, ts, clientID string) string {
 }
 
 func DeriveKey(pairingSecret, nodeID, clientEphPK, nodeEphPK, clientNonce, serverNonce string, localPriv *ecdh.PrivateKey, remotePub *ecdh.PublicKey) (DerivedKey, error) {
+	return DeriveKeyForProtocol(pairingSecret, nodeID, clientEphPK, nodeEphPK, clientNonce, serverNonce, localPriv, remotePub, ProtocolVersionV1)
+}
+
+// DeriveKeyForProtocol derives a transport key that is bound to the negotiated E2EE protocol version.
+func DeriveKeyForProtocol(pairingSecret, nodeID, clientEphPK, nodeEphPK, clientNonce, serverNonce string, localPriv *ecdh.PrivateKey, remotePub *ecdh.PublicKey, protocolVersion int) (DerivedKey, error) {
+	if !IsSupportedProtocolVersion(protocolVersion) {
+		return DerivedKey{}, errors.New("unsupported e2ee protocol version")
+	}
 	sharedSecret, err := localPriv.ECDH(remotePub)
 	if err != nil {
 		return DerivedKey{}, err
 	}
-	infoHash := sha256.Sum256([]byte(joinParts("", nodeID, clientEphPK, nodeEphPK, clientNonce, serverNonce)))
+	infoParts := []string{nodeID, clientEphPK, nodeEphPK, clientNonce, serverNonce}
+	if protocolVersion == ProtocolVersionV2 {
+		infoParts = append(infoParts, "v2")
+	}
+	infoHash := sha256.Sum256([]byte(joinParts("", infoParts...)))
 	salt := sha256.Sum256([]byte(pairingSecret))
 	sessionMaster, err := hkdfBytes(sharedSecret, salt[:], infoHash[:], 32)
 	if err != nil {
@@ -86,18 +115,28 @@ func DeriveKey(pairingSecret, nodeID, clientEphPK, nodeEphPK, clientNonce, serve
 	if err != nil {
 		return DerivedKey{}, err
 	}
-	return DerivedKey{Transport: transportKey}, nil
+	return DerivedKey{Transport: transportKey, ProtocolVersion: protocolVersion}, nil
 }
 
 func EncryptJSON(key []byte, value any) (*CipherEnvelope, error) {
+	return EncryptJSONWithAAD(key, value, nil)
+}
+
+// EncryptJSONWithAAD encrypts JSON while authenticating caller-supplied transport context.
+func EncryptJSONWithAAD(key []byte, value any, aad []byte) (*CipherEnvelope, error) {
 	payload, err := json.Marshal(value)
 	if err != nil {
 		return nil, err
 	}
-	return EncryptBytes(key, payload)
+	return EncryptBytesWithAAD(key, payload, aad)
 }
 
 func EncryptBytes(key, plaintext []byte) (*CipherEnvelope, error) {
+	return EncryptBytesWithAAD(key, plaintext, nil)
+}
+
+// EncryptBytesWithAAD encrypts bytes while authenticating caller-supplied transport context.
+func EncryptBytesWithAAD(key, plaintext, aad []byte) (*CipherEnvelope, error) {
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, err
@@ -110,7 +149,7 @@ func EncryptBytes(key, plaintext []byte) (*CipherEnvelope, error) {
 	if _, err := rand.Read(nonce); err != nil {
 		return nil, err
 	}
-	ciphertext := aead.Seal(nil, nonce, plaintext, nil)
+	ciphertext := aead.Seal(nil, nonce, plaintext, aad)
 	return &CipherEnvelope{
 		Nonce:      base64.StdEncoding.EncodeToString(nonce),
 		Ciphertext: base64.StdEncoding.EncodeToString(ciphertext),
@@ -118,7 +157,12 @@ func EncryptBytes(key, plaintext []byte) (*CipherEnvelope, error) {
 }
 
 func DecryptJSON(key []byte, envelope *CipherEnvelope, out any) error {
-	plaintext, err := DecryptBytes(key, envelope)
+	return DecryptJSONWithAAD(key, envelope, nil, out)
+}
+
+// DecryptJSONWithAAD decrypts JSON only when the supplied transport context matches the authenticated ciphertext.
+func DecryptJSONWithAAD(key []byte, envelope *CipherEnvelope, aad []byte, out any) error {
+	plaintext, err := DecryptBytesWithAAD(key, envelope, aad)
 	if err != nil {
 		return err
 	}
@@ -126,6 +170,11 @@ func DecryptJSON(key []byte, envelope *CipherEnvelope, out any) error {
 }
 
 func DecryptBytes(key []byte, envelope *CipherEnvelope) ([]byte, error) {
+	return DecryptBytesWithAAD(key, envelope, nil)
+}
+
+// DecryptBytesWithAAD decrypts bytes only when the supplied transport context matches the authenticated ciphertext.
+func DecryptBytesWithAAD(key []byte, envelope *CipherEnvelope, aad []byte) ([]byte, error) {
 	if envelope == nil {
 		return nil, errors.New("cipher envelope required")
 	}
@@ -148,7 +197,7 @@ func DecryptBytes(key []byte, envelope *CipherEnvelope) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return aead.Open(nil, nonce, ciphertext, nil)
+	return aead.Open(nil, nonce, ciphertext, aad)
 }
 
 func hkdfBytes(secret, salt, info []byte, length int) ([]byte, error) {

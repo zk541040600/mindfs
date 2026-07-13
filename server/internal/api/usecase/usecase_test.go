@@ -1037,6 +1037,31 @@ func TestSaveUploadedFilesUsesExplicitDir(t *testing.T) {
 	assertFileContent(t, filepath.Join(rootDir, "design", "spec.pdf"), "pdf-bytes")
 }
 
+func TestSaveUploadedFilesRejectsDirectorySymlinkOutsideRoot(t *testing.T) {
+	rootDir := t.TempDir()
+	outsideDir := t.TempDir()
+	if err := os.Symlink(outsideDir, filepath.Join(rootDir, "outside")); err != nil {
+		t.Skipf("Symlink unavailable: %v", err)
+	}
+	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
+	service := Service{Registry: uploadTestRegistry{root: root}}
+
+	_, err := service.SaveUploadedFiles(context.Background(), SaveUploadedFilesInput{
+		RootID: "mindfs",
+		Dir:    "outside",
+		Files: []UploadFile{{
+			Name:   "escape.txt",
+			Reader: bytes.NewBufferString("escape"),
+		}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "path outside root") {
+		t.Fatalf("SaveUploadedFiles error = %v, want path outside root", err)
+	}
+	if _, err := os.Stat(filepath.Join(outsideDir, "escape.txt")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("outside upload stat error = %v, want not exist", err)
+	}
+}
+
 func TestFileCandidateProviderSearch(t *testing.T) {
 	rootDir := t.TempDir()
 	mustWriteFile(t, filepath.Join(rootDir, "design", "18-view-plugin.md"), "a")

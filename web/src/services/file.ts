@@ -563,6 +563,9 @@ export async function fetchFile(params: FetchFileParams): Promise<FilePayload | 
       requestURL,
       { ...request.init, headers },
     );
+    if (headers) {
+      e2eeService.bindProtectedResponse(response, headers);
+    }
 
     if (response.status === 304) {
       if (cachedFile) {
@@ -574,15 +577,19 @@ export async function fetchFile(params: FetchFileParams): Promise<FilePayload | 
         return record!.file;
       }
       const retryURL = buildFileURL(params.rootId, params.path, readMode, cursor);
+      const retryHeaders = e2eeService.isRequired()
+        ? await e2eeService.fileProofHeaders("GET", retryURL)
+        : headers;
       const retry = await fetchResponse(
         retryURL,
         {
           ...request.init,
-          headers: e2eeService.isRequired()
-            ? await e2eeService.fileProofHeaders("GET", retryURL)
-            : headers,
+          headers: retryHeaders,
         },
       );
+      if (retryHeaders) {
+        e2eeService.bindProtectedResponse(retry, retryHeaders);
+      }
       if (!retry.ok) {
         throw new Error(`open file failed after 304 retry: status=${retry.status}`);
       }
@@ -635,6 +642,9 @@ export async function fetchProofProtectedBlob(params: {
       ? await e2eeService.fileProofHeaders("GET", rawURL)
       : undefined;
     const response = await fetchResponse(rawURL, { ...request.init, headers });
+    if (headers) {
+      e2eeService.bindProtectedResponse(response, headers);
+    }
     if (!response.ok) {
       if (response.status === 401 && e2eeService.isRequired()) {
         const payload = (await response.json().catch(() => ({}))) as { error?: string };
@@ -646,8 +656,9 @@ export async function fetchProofProtectedBlob(params: {
     }
     if (e2eeService.isRequired()) {
       const envelope = (await response.json()) as ProtectedBlobEnvelope;
-      const plaintext = await e2eeService.decryptEnvelopeBytes(envelope);
-      return new Blob([bytesToBlobPart(plaintext)], { type: envelope.content_type || "application/octet-stream" });
+      const contentType = envelope.content_type || "application/octet-stream";
+      const plaintext = await e2eeService.decryptBoundResponseBytes(response, envelope, contentType);
+      return new Blob([bytesToBlobPart(plaintext)], { type: contentType });
     }
     return response.blob();
   } finally {

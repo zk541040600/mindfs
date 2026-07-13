@@ -69,21 +69,83 @@ func (r RootInfo) rootDir() (string, error) {
 	return filepath.Clean(r.RootPath), nil
 }
 
-func (r RootInfo) resolveRelativePath(relPath string) (string, error) {
+func pathWithin(base, target string) bool {
+	rel, err := filepath.Rel(base, target)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel)
+}
+
+func resolvePathWithinRoot(root, relPath string) (string, error) {
 	if relPath == "" {
 		relPath = "."
 	}
 	if filepath.IsAbs(relPath) {
 		return "", errors.New("absolute path not allowed")
 	}
+	clean := filepath.Clean(filepath.Join(root, relPath))
+	if !pathWithin(root, clean) {
+		return "", errors.New("path outside root")
+	}
+	return clean, nil
+}
+
+// validateResolvedPath prevents a path that is lexically under the root from escaping through an existing symlink.
+func (r RootInfo) validateResolvedPath(path string) error {
+	root, err := r.rootDir()
+	if err != nil {
+		return err
+	}
+	path = filepath.Clean(path)
+	if !pathWithin(root, path) {
+		return errors.New("path outside root")
+	}
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return errors.New("path outside root")
+	}
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return apperr.Wrap("resolve", root, err)
+	}
+	current := filepath.Clean(resolvedRoot)
+	for _, part := range strings.Split(rel, string(filepath.Separator)) {
+		if part == "" || part == "." {
+			continue
+		}
+		candidate := filepath.Join(current, part)
+		info, err := os.Lstat(candidate)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return apperr.Wrap("stat", candidate, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			resolvedCandidate, err := filepath.EvalSymlinks(candidate)
+			if err != nil {
+				return apperr.Wrap("resolve", candidate, err)
+			}
+			current = filepath.Clean(resolvedCandidate)
+		} else {
+			current = candidate
+		}
+		if !pathWithin(resolvedRoot, current) {
+			return errors.New("path outside root")
+		}
+	}
+	return nil
+}
+
+func (r RootInfo) resolveRelativePath(relPath string) (string, error) {
 	root, err := r.rootDir()
 	if err != nil {
 		return "", err
 	}
-	clean := filepath.Clean(filepath.Join(root, relPath))
-	rel, err := filepath.Rel(root, clean)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return "", errors.New("path outside root")
+	clean, err := resolvePathWithinRoot(root, relPath)
+	if err != nil {
+		return "", err
+	}
+	if err := r.validateResolvedPath(clean); err != nil {
+		return "", err
 	}
 	return clean, nil
 }
@@ -94,8 +156,11 @@ func (r RootInfo) relativeFromAbsolute(absPath string) (string, error) {
 		return "", err
 	}
 	clean := filepath.Clean(absPath)
+	if !pathWithin(root, clean) {
+		return "", errors.New("path outside root")
+	}
 	rel, err := filepath.Rel(root, clean)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+	if err != nil {
 		return "", errors.New("path outside root")
 	}
 	return filepath.ToSlash(rel), nil
@@ -136,7 +201,7 @@ func (r RootInfo) NormalizePath(path string) (string, error) {
 	if rootTrimmed != "" && (pathSlash == rootTrimmed || strings.HasPrefix(pathSlash, rootTrimmed+"/")) {
 		return r.relativeFromAbsolute(string(filepath.Separator) + filepath.FromSlash(pathSlash))
 	}
-	resolved, err := r.resolveRelativePath(cleanPath)
+	resolved, err := resolvePathWithinRoot(root, cleanPath)
 	if err != nil {
 		return "", err
 	}
@@ -167,9 +232,9 @@ func (r RootInfo) StatRoot() (os.FileInfo, error) {
 }
 
 func (r RootInfo) EnsureMetaDir() (string, error) {
-	metaDir := r.MetaDir()
-	if metaDir == "" {
-		return "", errors.New("root required")
+	metaDir, err := r.resolveRelativePath(metaDirName)
+	if err != nil {
+		return "", err
 	}
 	if err := os.MkdirAll(metaDir, 0o755); err != nil {
 		return "", apperr.Wrap("mkdir", metaDir, err)
@@ -181,7 +246,14 @@ func (r RootInfo) resolveMetaPath(path string) (string, error) {
 	if path == "" {
 		path = "."
 	}
-	rootRel := filepath.ToSlash(filepath.Join(metaDirName, filepath.Clean(path)))
+	if filepath.IsAbs(path) {
+		return "", errors.New("absolute meta path not allowed")
+	}
+	cleanPath := filepath.Clean(path)
+	if !pathWithin(".", cleanPath) {
+		return "", errors.New("meta path outside metadata directory")
+	}
+	rootRel := filepath.ToSlash(filepath.Join(metaDirName, cleanPath))
 	return r.resolveRelativePath(rootRel)
 }
 
@@ -297,7 +369,11 @@ func (r RootInfo) ListEntries(dirRelPath string) ([]Entry, error) {
 		isDir := entry.IsDir()
 		isSymlink := info.Mode()&os.ModeSymlink != 0
 		if isSymlink {
-			if targetInfo, err := os.Stat(absPath); err == nil {
+			if err := r.validateResolvedPath(absPath); err == nil {
+				targetInfo, err := os.Stat(absPath)
+				if err != nil {
+					continue
+				}
 				info = targetInfo
 				isDir = targetInfo.IsDir()
 			}

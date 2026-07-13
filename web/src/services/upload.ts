@@ -70,6 +70,9 @@ export async function uploadFiles(params: {
     headers,
     body,
   });
+  if (headers) {
+    e2eeService.bindProtectedResponse(response, headers);
+  }
   if (!response.ok) {
     if (response.status === 401 && e2eeService.isRequired()) {
       const payload = (await response.json().catch(() => ({}))) as { error?: string };

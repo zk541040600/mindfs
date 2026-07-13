@@ -152,6 +152,18 @@ func TestRootInfoNormalizePathStripsFragment(t *testing.T) {
 	}
 }
 
+func TestRootInfoNormalizePathAllowsMissingRelativePath(t *testing.T) {
+	root := NewRootInfo("mindfs", "mindfs", filepath.Join(t.TempDir(), "missing"))
+
+	got, err := root.NormalizePath("design/test.md")
+	if err != nil {
+		t.Fatalf("NormalizePath returned error: %v", err)
+	}
+	if got != "design/test.md" {
+		t.Fatalf("NormalizePath = %q, want design/test.md", got)
+	}
+}
+
 func TestRootInfoListEntriesIncludesSizeAndMTime(t *testing.T) {
 	rootDir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(rootDir, "a.txt"), []byte("hello"), 0o644); err != nil {
@@ -227,6 +239,80 @@ func TestRootInfoListEntriesTreatsDirectorySymlinkAsDirectory(t *testing.T) {
 	}
 	if len(children) != 1 || children[0].Name != "child.txt" {
 		t.Fatalf("linked children = %#v, want child.txt", children)
+	}
+	read, err := root.ReadFile("linked/child.txt", 64, 0, "full")
+	if err != nil {
+		t.Fatalf("ReadFile through in-root symlink: %v", err)
+	}
+	if read.Content != "hello" {
+		t.Fatalf("ReadFile content = %q, want hello", read.Content)
+	}
+}
+
+func TestRootInfoRejectsSymlinkOutsideRoot(t *testing.T) {
+	rootDir := t.TempDir()
+	outsideDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outsideDir, "secret.txt"), []byte("secret"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if err := os.Symlink(outsideDir, filepath.Join(rootDir, "outside")); err != nil {
+		t.Skipf("Symlink unavailable: %v", err)
+	}
+
+	root := NewRootInfo("mindfs", "mindfs", rootDir)
+	entries, err := root.ListEntries(".")
+	if err != nil {
+		t.Fatalf("ListEntries root: %v", err)
+	}
+	for _, entry := range entries {
+		if entry.Name != "outside" {
+			continue
+		}
+		if !entry.IsSymlink || entry.IsDir {
+			t.Fatalf("outside entry = %#v, want non-directory symlink", entry)
+		}
+		break
+	}
+	if _, err := root.ListEntries("outside"); err == nil || !strings.Contains(err.Error(), "path outside root") {
+		t.Fatalf("ListEntries error = %v, want path outside root", err)
+	}
+	if _, err := root.ReadFile("outside/secret.txt", 64, 0, "full"); err == nil || !strings.Contains(err.Error(), "path outside root") {
+		t.Fatalf("ReadFile error = %v, want path outside root", err)
+	}
+	if _, _, _, err := root.OpenFile("outside/secret.txt"); err == nil || !strings.Contains(err.Error(), "path outside root") {
+		t.Fatalf("OpenFile error = %v, want path outside root", err)
+	}
+	if _, _, err := root.StatFile("outside/secret.txt"); err == nil || !strings.Contains(err.Error(), "path outside root") {
+		t.Fatalf("StatFile error = %v, want path outside root", err)
+	}
+}
+
+func TestRootInfoMetaPathCannotEscapeMetadataDirectory(t *testing.T) {
+	rootDir := t.TempDir()
+	root := NewRootInfo("mindfs", "mindfs", rootDir)
+	if err := root.WriteMetaFile("../outside.txt", []byte("escape")); err == nil || !strings.Contains(err.Error(), "meta path outside metadata directory") {
+		t.Fatalf("WriteMetaFile error = %v, want metadata path rejection", err)
+	}
+	if _, err := os.Stat(filepath.Join(rootDir, "outside.txt")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("outside metadata write stat error = %v, want not exist", err)
+	}
+}
+
+func TestRootInfoRejectsMetadataDirectorySymlinkOutsideRoot(t *testing.T) {
+	rootDir := t.TempDir()
+	outsideDir := t.TempDir()
+	if err := os.Symlink(outsideDir, filepath.Join(rootDir, metaDirName)); err != nil {
+		t.Skipf("Symlink unavailable: %v", err)
+	}
+	root := NewRootInfo("mindfs", "mindfs", rootDir)
+	if _, err := root.EnsureMetaDir(); err == nil || !strings.Contains(err.Error(), "path outside root") {
+		t.Fatalf("EnsureMetaDir error = %v, want path outside root", err)
+	}
+	if err := root.WriteMetaFile("state.json", []byte("escape")); err == nil || !strings.Contains(err.Error(), "path outside root") {
+		t.Fatalf("WriteMetaFile error = %v, want path outside root", err)
+	}
+	if _, err := os.Stat(filepath.Join(outsideDir, "state.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("outside metadata write stat error = %v, want not exist", err)
 	}
 }
 

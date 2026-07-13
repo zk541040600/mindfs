@@ -81,6 +81,8 @@ func EnsureConfigAtPath(path string, enabled bool) (EnsureResult, error) {
 		if err := saveConfig(trimmedPath, cfg); err != nil {
 			return EnsureResult{}, err
 		}
+	} else if err := os.Chmod(trimmedPath, 0o600); err != nil {
+		return EnsureResult{}, err
 	}
 	return EnsureResult{Config: cfg, Generated: generated}, nil
 }

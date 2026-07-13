@@ -364,6 +364,8 @@ class SessionService {
   private fastReconnectUntil = 0;
   private rootId: string | null = null;
   private hasConnected = false;
+  private wsReceiveQueue: Promise<void> = Promise.resolve();
+  private wsSendQueue: Promise<void> = Promise.resolve();
   private readonly clientId = this.generateClientId();
   private readonly maxReconnectDelayMs = 30000;
   private readonly fastReconnectDelayMs = 1000;
@@ -493,17 +495,7 @@ class SessionService {
       if (this.ws !== ws) return;
       this.clearProbe();
       this.lastSocketActivityAt = Date.now();
-      void (async () => {
-        try {
-          const msg = await this.parseWSMessage(event.data);
-          if (!msg) {
-            return;
-          }
-          this.handleMessage(msg);
-        } catch (err) {
-          console.error("[Session] Failed to parse message:", err);
-        }
-      })();
+      this.enqueueWSMessage(ws, event.data);
     };
 
     ws.onclose = (event) => {
@@ -534,6 +526,9 @@ class SessionService {
     this.clearConnectTimeout();
     this.clearProbe();
     this.closeSocket();
+    this.rootId = null;
+    this.lastSocketActivityAt = 0;
+    this.hasConnected = false;
     this.contextCache.clear();
   }
 
@@ -713,7 +708,11 @@ class SessionService {
     }
     if (type === "e2ee.error") {
       const code = typeof payload.code === "string" ? payload.code : "";
-      e2eeService.handleServerError(code);
+      if (payload.untrusted === true) {
+        e2eeService.clearSession();
+      } else {
+        e2eeService.handleServerError(code);
+      }
       this.emit({ type, payload });
       return;
     }
@@ -822,16 +821,41 @@ class SessionService {
       return null;
     }
     const parsed = JSON.parse(raw);
-    if (!e2eeService.isRequired() || parsed?.type === "e2ee.error") {
+    if (!e2eeService.isRequired()) {
       return parsed;
+    }
+    if (parsed?.type === "e2ee.error") {
+      return { type: "e2ee.error", payload: { code: "e2ee_transport_error", untrusted: true } };
     }
     return e2eeService.decodeWSMessage<any>(raw);
   }
 
-  private async sendWSMessage(
+  private enqueueWSMessage(ws: WebSocket, raw: unknown) {
+    const next = this.wsReceiveQueue.then(async () => {
+      if (this.ws !== ws) return;
+      const msg = await this.parseWSMessage(raw);
+      if (this.ws !== ws || !msg) return;
+      this.handleMessage(msg);
+    });
+    this.wsReceiveQueue = next.catch((err) => {
+      console.error("[Session] Failed to parse message:", err);
+    });
+  }
+
+  private sendWSMessage(
     message: Record<string, unknown>,
   ): Promise<boolean> {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+    const next = this.wsSendQueue.then(() => this.sendWSMessageNow(message));
+    this.wsSendQueue = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    return next;
+  }
+
+  private async sendWSMessageNow(message: Record<string, unknown>): Promise<boolean> {
+    const ws = this.ws;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
       return false;
     }
     let serialized = JSON.stringify(message);
@@ -839,7 +863,10 @@ class SessionService {
       await e2eeService.ensureSession();
       serialized = await e2eeService.encodeWSMessage(message);
     }
-    this.ws.send(serialized);
+    if (this.ws !== ws || ws.readyState !== WebSocket.OPEN) {
+      return false;
+    }
+    ws.send(serialized);
     return true;
   }
 

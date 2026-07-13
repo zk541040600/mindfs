@@ -224,6 +224,61 @@ func TestLongShellEvalKeepsShellState(t *testing.T) {
 	}
 }
 
+func TestLongShellKeepsStateWhenDefaultShellBecomesExplicit(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh not available")
+	}
+	dir := t.TempDir()
+	subdir := filepath.Join(dir, "subdir")
+	if err := os.Mkdir(subdir, 0o755); err != nil {
+		t.Fatalf("mkdir subdir: %v", err)
+	}
+	sessionKey := "default-shell-" + strings.ReplaceAll(t.Name(), "/", "-")
+	defer CloseSession("root", sessionKey)
+	shells := []ShellSpec{{Command: "sh"}}
+
+	first, err := StartInSession(context.Background(), Options{
+		Command: "cd subdir",
+		Cwd:     dir,
+		Shells:  shells,
+		RootID:  "root",
+		Session: sessionKey,
+	})
+	if err != nil {
+		t.Fatalf("first StartInSession returned error: %v", err)
+	}
+	if result := waitForTestCommand(t, first); result.ExitCode != 0 {
+		t.Fatalf("first exit code = %d, want 0", result.ExitCode)
+	}
+
+	second, err := StartInSession(context.Background(), Options{
+		Command: "pwd",
+		Cwd:     dir,
+		Shells:  shells,
+		Shell:   "sh",
+		RootID:  "root",
+		Session: sessionKey,
+	})
+	if err != nil {
+		t.Fatalf("second StartInSession returned error: %v", err)
+	}
+	output := readTestOutput(second.Output())
+	if result := waitForTestCommand(t, second); result.ExitCode != 0 {
+		t.Fatalf("second exit code = %d, want 0", result.ExitCode)
+	}
+	gotPath, err := filepath.EvalSymlinks(strings.TrimSpace(output))
+	if err != nil {
+		t.Fatalf("eval pwd path: %v", err)
+	}
+	wantPath, err := filepath.EvalSymlinks(subdir)
+	if err != nil {
+		t.Fatalf("eval subdir path: %v", err)
+	}
+	if gotPath != wantPath {
+		t.Fatalf("pwd = %q, want %q", gotPath, wantPath)
+	}
+}
+
 func waitForTestCommand(t *testing.T, proc Process) Result {
 	t.Helper()
 	done := make(chan Result, 1)

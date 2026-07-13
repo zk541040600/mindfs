@@ -98,6 +98,92 @@ func TestSessionForClientNoTouchDoesNotRefreshLastSeen(t *testing.T) {
 	}
 }
 
+func TestReplayValuesAreConsumedOnce(t *testing.T) {
+	manager := newTestManager()
+	expiresAt := time.Now().UTC().Add(time.Minute)
+
+	if !manager.ConsumeRequestProof("client", "proof", expiresAt) {
+		t.Fatal("first request proof was not consumed")
+	}
+	if manager.ConsumeRequestProof("client", "proof", expiresAt) {
+		t.Fatal("replayed request proof was accepted")
+	}
+	if manager.ConsumeRequestProof("client", "expired", time.Now().UTC().Add(-time.Minute)) {
+		t.Fatal("expired request proof was consumed")
+	}
+	if !manager.ConsumeOpenNonce("client", "nonce") {
+		t.Fatal("first open nonce was not consumed")
+	}
+	if manager.ConsumeOpenNonce("client", "nonce") {
+		t.Fatal("replayed open nonce was accepted")
+	}
+}
+
+func TestTouchSessionExtendsOpenNonceReplayProtection(t *testing.T) {
+	manager := newTestManager()
+	if !manager.ConsumeOpenNonce("client", "nonce") {
+		t.Fatal("open nonce was not consumed")
+	}
+	if _, err := manager.OpenSessionForClient("client", DerivedKey{Transport: []byte("0123456789abcdef0123456789abcdef")}); err != nil {
+		t.Fatalf("OpenSessionForClient: %v", err)
+	}
+	key := "client\x00nonce"
+	manager.mu.RLock()
+	before := manager.usedOpenNonces[key]
+	manager.mu.RUnlock()
+
+	if err := manager.TouchSessionForClient("client"); err != nil {
+		t.Fatalf("TouchSessionForClient: %v", err)
+	}
+	manager.mu.RLock()
+	after := manager.usedOpenNonces[key]
+	manager.mu.RUnlock()
+	if !after.After(before) {
+		t.Fatalf("open nonce expiry = %s, want after %s", after, before)
+	}
+}
+
+func TestWSSequencesRejectReplayAndAdvanceServerFrames(t *testing.T) {
+	manager := newTestManager()
+	sess, err := manager.OpenSessionForClient("client", DerivedKey{
+		Transport:       []byte("0123456789abcdef0123456789abcdef"),
+		ProtocolVersion: ProtocolVersionV2,
+	})
+	if err != nil {
+		t.Fatalf("OpenSessionForClient: %v", err)
+	}
+
+	if err := manager.ConsumeClientWSSequence("client", sess.ID, 1); err != nil {
+		t.Fatalf("ConsumeClientWSSequence first: %v", err)
+	}
+	afterFirst, err := manager.SessionForClientNoTouch("client")
+	if err != nil {
+		t.Fatalf("SessionForClientNoTouch after first frame: %v", err)
+	}
+	if err := manager.ConsumeClientWSSequence("client", sess.ID, 1); err == nil || err.Error() != "e2ee_frame_replayed" {
+		t.Fatalf("replayed frame error = %v, want e2ee_frame_replayed", err)
+	}
+	afterReplay, err := manager.SessionForClientNoTouch("client")
+	if err != nil {
+		t.Fatalf("SessionForClientNoTouch after replay: %v", err)
+	}
+	if !afterReplay.LastSeenAt.Equal(afterFirst.LastSeenAt) {
+		t.Fatalf("LastSeenAt changed after replay: first=%s replay=%s", afterFirst.LastSeenAt, afterReplay.LastSeenAt)
+	}
+
+	firstServerSequence, err := manager.NextServerWSSequence("client", sess.ID)
+	if err != nil {
+		t.Fatalf("NextServerWSSequence first: %v", err)
+	}
+	secondServerSequence, err := manager.NextServerWSSequence("client", sess.ID)
+	if err != nil {
+		t.Fatalf("NextServerWSSequence second: %v", err)
+	}
+	if firstServerSequence != 1 || secondServerSequence != 2 {
+		t.Fatalf("server sequences = %d, %d; want 1, 2", firstServerSequence, secondServerSequence)
+	}
+}
+
 func newTestManager() *Manager {
 	return NewManager(Config{
 		Enabled:       true,

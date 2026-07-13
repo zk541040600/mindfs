@@ -745,6 +745,25 @@ test("actively probes a stale open websocket while the page is visible", async (
   );
 });
 
+test("does not reconnect after an explicit websocket disconnect", async ({ page }) => {
+  await openPendingApp(page, { current: false }, undefined, { current: false });
+
+  const state = await page.evaluate(async () => {
+    const { sessionService } = await import("/src/services/session.ts");
+    const service = sessionService as any;
+    service.disconnect();
+    await new Promise((resolve) => {
+      window.setTimeout(resolve, service.reconnectWatchdogMs + 200);
+    });
+    return {
+      rootId: service.rootId,
+      hasSocket: service.ws !== null,
+    };
+  });
+
+  expect(state).toEqual({ rootId: null, hasSocket: false });
+});
+
 test("clears stale pending when restarted server reports no active turn", async ({ page }) => {
   const replying = { current: true };
   const serverPending = { current: true };

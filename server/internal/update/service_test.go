@@ -60,6 +60,24 @@ func TestInstallPackageCopiesBridgeAssets(t *testing.T) {
 	}
 }
 
+func TestWindowsReplacementScriptDefinesBridgeShareDirectory(t *testing.T) {
+	script := windowsReplacementScript(
+		42,
+		`C:/Program Files/MindFS/bin/mindfs.exe`,
+		[]string{"--port", "7331"},
+		`C:/Temp/mindfs_v1.2.3_windows_amd64`,
+		`C:/Program Files/MindFS/bin/mindfs.exe`,
+		`C:/Program Files/MindFS/share/mindfs/agents.json`,
+		`C:/Program Files/MindFS/share/mindfs/web`,
+	)
+	if !strings.Contains(script, "$shareDir = Split-Path -Parent $dstAgents") {
+		t.Fatalf("restart script does not define bridge destination root: %s", script)
+	}
+	if !strings.Contains(script, "$dstBridge = Join-Path $shareDir 'server\\internal\\agent\\pi_sdk_bridge'") {
+		t.Fatalf("restart script does not derive bridge destination from share root: %s", script)
+	}
+}
+
 func TestParseReleaseNotesVersion(t *testing.T) {
 	t.Parallel()
 

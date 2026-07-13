@@ -677,6 +677,152 @@ func TestRequireRequestProofDoesNotRefreshSessionOnInvalidProof(t *testing.T) {
 	}
 }
 
+func TestRequireRequestProofRejectsReplayWithoutRefreshingSession(t *testing.T) {
+	manager := e2ee.NewManager(e2ee.Config{Enabled: true, NodeID: "node-id", PairingSecret: "secret"})
+	key := []byte("0123456789abcdef0123456789abcdef")
+	clientID := "client-1"
+	if _, err := manager.OpenSessionForClient(clientID, e2ee.DerivedKey{Transport: key}); err != nil {
+		t.Fatalf("OpenSessionForClient returned error: %v", err)
+	}
+	handler := &HTTPHandler{AppContext: &AppContext{E2EE: manager}}
+	request := func() *http.Request {
+		req := httptest.NewRequest(http.MethodGet, "/api/file?root=r&path=a.txt", nil)
+		ts := time.Now().UTC().Format(time.RFC3339Nano)
+		req.Header.Set(clientIDHeaderName, clientID)
+		req.Header.Set(e2eeTSHeaderName, ts)
+		req.Header.Set(e2eeProofHeaderName, e2ee.BuildRequestProof(key, http.MethodGet, requestProofPath(req), ts, clientID))
+		return req
+	}
+	req := request()
+	if _, err := handler.requireRequestProof(req); err != nil {
+		t.Fatalf("first requireRequestProof returned error: %v", err)
+	}
+	afterFirst, err := manager.SessionForClientNoTouch(clientID)
+	if err != nil {
+		t.Fatalf("SessionForClientNoTouch after first proof: %v", err)
+	}
+	if _, err := handler.requireRequestProof(req); err == nil || !strings.Contains(err.Error(), "e2ee_proof_replayed") {
+		t.Fatalf("replayed requireRequestProof error = %v, want e2ee_proof_replayed", err)
+	}
+	afterReplay, err := manager.SessionForClientNoTouch(clientID)
+	if err != nil {
+		t.Fatalf("SessionForClientNoTouch after replay: %v", err)
+	}
+	if !afterReplay.LastSeenAt.Equal(afterFirst.LastSeenAt) {
+		t.Fatalf("LastSeenAt changed after replay: first=%s replay=%s", afterFirst.LastSeenAt, afterReplay.LastSeenAt)
+	}
+}
+
+func TestHandleE2EEOpenRejectsReplayedClientNonce(t *testing.T) {
+	manager := e2ee.NewManager(e2ee.Config{Enabled: true, NodeID: "node", PairingSecret: "secret"})
+	handler := &HTTPHandler{AppContext: &AppContext{E2EE: manager}}
+	_, clientEphPK, err := e2ee.GenerateECDHKeypair()
+	if err != nil {
+		t.Fatalf("GenerateECDHKeypair returned error: %v", err)
+	}
+	clientID := "client-open"
+	open := func(nonce string) *httptest.ResponseRecorder {
+		payload := map[string]string{
+			"client_id":     clientID,
+			"node_id":       "node",
+			"client_eph_pk": clientEphPK,
+			"client_nonce":  nonce,
+			"proof":         e2ee.BuildOpenProof("secret", "node", clientEphPK, nonce),
+		}
+		body, marshalErr := json.Marshal(payload)
+		if marshalErr != nil {
+			t.Fatalf("Marshal payload: %v", marshalErr)
+		}
+		resp := httptest.NewRecorder()
+		handler.handleE2EEOpen(resp, httptest.NewRequest(http.MethodPost, "/api/e2ee/open", bytes.NewReader(body)))
+		return resp
+	}
+
+	first := open("nonce-1")
+	if first.Code != http.StatusOK {
+		t.Fatalf("first open status = %d body=%s", first.Code, first.Body.String())
+	}
+	firstSession, err := manager.SessionForClientNoTouch(clientID)
+	if err != nil {
+		t.Fatalf("SessionForClientNoTouch after first open: %v", err)
+	}
+	replayed := open("nonce-1")
+	if replayed.Code != http.StatusConflict || !strings.Contains(replayed.Body.String(), "e2ee_open_replayed") {
+		t.Fatalf("replayed open status = %d body=%s", replayed.Code, replayed.Body.String())
+	}
+	afterReplay, err := manager.SessionForClientNoTouch(clientID)
+	if err != nil {
+		t.Fatalf("SessionForClientNoTouch after replay: %v", err)
+	}
+	if afterReplay.ID != firstSession.ID {
+		t.Fatalf("replayed open replaced session: got %s want %s", afterReplay.ID, firstSession.ID)
+	}
+	second := open("nonce-2")
+	if second.Code != http.StatusOK {
+		t.Fatalf("new nonce open status = %d body=%s", second.Code, second.Body.String())
+	}
+}
+
+func TestHandleE2EEOpenNegotiatesProtocolVersion(t *testing.T) {
+	manager := e2ee.NewManager(e2ee.Config{Enabled: true, NodeID: "node", PairingSecret: "secret"})
+	handler := &HTTPHandler{AppContext: &AppContext{E2EE: manager}}
+	_, clientEphPK, err := e2ee.GenerateECDHKeypair()
+	if err != nil {
+		t.Fatalf("GenerateECDHKeypair: %v", err)
+	}
+	payload := map[string]any{
+		"client_id":     "client-v2",
+		"node_id":       "node",
+		"client_eph_pk": clientEphPK,
+		"client_nonce":  "nonce-v2",
+		"proof":         e2ee.BuildOpenProof("secret", "node", clientEphPK, "nonce-v2"),
+		"proto_version": e2ee.ProtocolVersionV2,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("Marshal payload: %v", err)
+	}
+	resp := httptest.NewRecorder()
+	handler.handleE2EEOpen(resp, httptest.NewRequest(http.MethodPost, "/api/e2ee/open", bytes.NewReader(body)))
+	if resp.Code != http.StatusOK {
+		t.Fatalf("open status = %d body=%s", resp.Code, resp.Body.String())
+	}
+	var response struct {
+		ProtoVersion int    `json:"proto_version"`
+		NodeEphPK    string `json:"node_eph_pk"`
+		ServerNonce  string `json:"server_nonce"`
+		ServerProof  string `json:"server_proof"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &response); err != nil {
+		t.Fatalf("Unmarshal response: %v", err)
+	}
+	if response.ProtoVersion != e2ee.ProtocolVersionV2 {
+		t.Fatalf("response protocol = %d, want %d", response.ProtoVersion, e2ee.ProtocolVersionV2)
+	}
+	expectedProof := e2ee.BuildAcceptProofForProtocol("secret", "node", clientEphPK, response.NodeEphPK, "nonce-v2", response.ServerNonce, e2ee.ProtocolVersionV2)
+	if !e2ee.VerifyProof(expectedProof, response.ServerProof) {
+		t.Fatal("v2 response proof did not bind the negotiated protocol")
+	}
+	sess, err := manager.SessionForClientNoTouch("client-v2")
+	if err != nil {
+		t.Fatalf("SessionForClientNoTouch: %v", err)
+	}
+	if sess.ProtocolVersion != e2ee.ProtocolVersionV2 {
+		t.Fatalf("session protocol = %d, want %d", sess.ProtocolVersion, e2ee.ProtocolVersionV2)
+	}
+}
+
+func TestHandleE2EEOpenRejectsUnsupportedProtocolVersion(t *testing.T) {
+	manager := e2ee.NewManager(e2ee.Config{Enabled: true, NodeID: "node", PairingSecret: "secret"})
+	handler := &HTTPHandler{AppContext: &AppContext{E2EE: manager}}
+	body := bytes.NewBufferString(`{"client_id":"client","node_id":"node","client_eph_pk":"key","client_nonce":"nonce","proof":"proof","proto_version":99}`)
+	resp := httptest.NewRecorder()
+	handler.handleE2EEOpen(resp, httptest.NewRequest(http.MethodPost, "/api/e2ee/open", body))
+	if resp.Code != http.StatusBadRequest || !strings.Contains(resp.Body.String(), "e2ee_protocol_unsupported") {
+		t.Fatalf("unsupported protocol status = %d body=%s", resp.Code, resp.Body.String())
+	}
+}
+
 func TestRelayStatusWithE2EEDoesNotFallbackNodeIDWhenEnabled(t *testing.T) {
 	handler := &HTTPHandler{AppContext: &AppContext{
 		E2EE: e2ee.NewManager(e2ee.Config{Enabled: true, NodeID: "e2ee-node", PairingSecret: "secret"}),
@@ -707,7 +853,7 @@ func TestHandleFileRawEncryptsResponseWhenE2EERequired(t *testing.T) {
 	key := []byte("0123456789abcdef0123456789abcdef")
 	clientID := "client-raw"
 	manager := e2ee.NewManager(e2ee.Config{Enabled: true, NodeID: "node", PairingSecret: "secret"})
-	if _, err := manager.OpenSessionForClient(clientID, e2ee.DerivedKey{Transport: key}); err != nil {
+	if _, err := manager.OpenSessionForClient(clientID, e2ee.DerivedKey{Transport: key, ProtocolVersion: e2ee.ProtocolVersionV2}); err != nil {
 		t.Fatalf("OpenSessionForClient: %v", err)
 	}
 	handler := &HTTPHandler{AppContext: &AppContext{Dirs: registry, E2EE: manager}}
@@ -716,7 +862,8 @@ func TestHandleFileRawEncryptsResponseWhenE2EERequired(t *testing.T) {
 	ts := time.Now().UTC().Format(time.RFC3339)
 	req.Header.Set(clientIDHeaderName, clientID)
 	req.Header.Set(e2eeTSHeaderName, ts)
-	req.Header.Set(e2eeProofHeaderName, e2ee.BuildRequestProof(key, http.MethodGet, requestProofPath(req), ts, clientID))
+	proof := e2ee.BuildRequestProof(key, http.MethodGet, requestProofPath(req), ts, clientID)
+	req.Header.Set(e2eeProofHeaderName, proof)
 	resp := httptest.NewRecorder()
 
 	handler.handleFile(resp, req)
@@ -737,15 +884,88 @@ func TestHandleFileRawEncryptsResponseWhenE2EERequired(t *testing.T) {
 	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
 		t.Fatalf("decode encrypted payload: %v", err)
 	}
-	plain, err := e2ee.DecryptBytes(key, &payload.CipherEnvelope)
+	plain, err := e2ee.DecryptBytesWithAAD(key, &payload.CipherEnvelope, rawResponseAAD(proof, payload.ContentType))
 	if err != nil {
-		t.Fatalf("DecryptBytes: %v", err)
+		t.Fatalf("DecryptBytesWithAAD: %v", err)
 	}
 	if string(plain) != "raw secret" {
 		t.Fatalf("plaintext = %q, want raw secret", string(plain))
 	}
 	if !strings.HasPrefix(payload.ContentType, "text/plain") {
 		t.Fatalf("content_type = %q, want text/plain", payload.ContentType)
+	}
+	if _, err := e2ee.DecryptBytesWithAAD(key, &payload.CipherEnvelope, rawResponseAAD("different-proof", payload.ContentType)); err == nil {
+		t.Fatal("raw response decrypted under a different request proof")
+	}
+	if _, err := e2ee.DecryptBytes(key, &payload.CipherEnvelope); err == nil {
+		t.Fatal("raw response decrypted without authenticated context")
+	}
+}
+
+func TestProtectedEndpointBindsV2ResponseToRequestProof(t *testing.T) {
+	key := []byte("0123456789abcdef0123456789abcdef")
+	clientID := "client-v2-response"
+	manager := e2ee.NewManager(e2ee.Config{Enabled: true, NodeID: "node", PairingSecret: "secret"})
+	if _, err := manager.OpenSessionForClient(clientID, e2ee.DerivedKey{Transport: key, ProtocolVersion: e2ee.ProtocolVersionV2}); err != nil {
+		t.Fatalf("OpenSessionForClient: %v", err)
+	}
+	handler := &HTTPHandler{AppContext: &AppContext{E2EE: manager}}
+	protected := handler.protectedEndpoint(func(w http.ResponseWriter, _ *http.Request) {
+		respondJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	})
+	req := httptest.NewRequest(http.MethodGet, "/api/tree?root=root-1", nil)
+	req.Header.Set(e2eeHeaderName, "1")
+	ts := time.Now().UTC().Format(time.RFC3339)
+	proof := e2ee.BuildRequestProof(key, req.Method, requestProofPath(req), ts, clientID)
+	req.Header.Set(clientIDHeaderName, clientID)
+	req.Header.Set(e2eeTSHeaderName, ts)
+	req.Header.Set(e2eeProofHeaderName, proof)
+	resp := httptest.NewRecorder()
+
+	protected(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", resp.Code, resp.Body.String())
+	}
+	if got := resp.Header().Get(e2eeHeaderName); got != "1" {
+		t.Fatalf("%s = %q, want 1", e2eeHeaderName, got)
+	}
+	var envelope e2ee.CipherEnvelope
+	if err := json.Unmarshal(resp.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("decode protected response: %v", err)
+	}
+	var payload map[string]string
+	if err := e2ee.DecryptJSONWithAAD(key, &envelope, []byte(proof), &payload); err != nil {
+		t.Fatalf("DecryptJSONWithAAD: %v", err)
+	}
+	if payload["status"] != "ok" {
+		t.Fatalf("payload = %#v, want status=ok", payload)
+	}
+	if err := e2ee.DecryptJSONWithAAD(key, &envelope, []byte("different-proof"), &payload); err == nil {
+		t.Fatal("protected response decrypted under a different request proof")
+	}
+	if err := e2ee.DecryptJSON(key, &envelope, &payload); err == nil {
+		t.Fatal("protected response decrypted without authenticated context")
+	}
+}
+
+func TestWriteProtectedJSONPreservesV1Compatibility(t *testing.T) {
+	key := []byte("0123456789abcdef0123456789abcdef")
+	resp := httptest.NewRecorder()
+	err := writeProtectedJSON(resp, http.StatusOK, &e2ee.Session{Key: key, ProtocolVersion: e2ee.ProtocolVersionV1}, "ignored-proof", map[string]string{"status": "ok"})
+	if err != nil {
+		t.Fatalf("writeProtectedJSON: %v", err)
+	}
+	var envelope e2ee.CipherEnvelope
+	if err := json.Unmarshal(resp.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("decode protected response: %v", err)
+	}
+	var payload map[string]string
+	if err := e2ee.DecryptJSON(key, &envelope, &payload); err != nil {
+		t.Fatalf("DecryptJSON: %v", err)
+	}
+	if payload["status"] != "ok" {
+		t.Fatalf("payload = %#v, want status=ok", payload)
 	}
 }
 

@@ -193,7 +193,19 @@ func DecodeConfig(payload []byte) (Config, error) {
 }
 
 func MergeHostedConfig(hosted Config, local Config) Config {
-	return mergeConfigs(hosted, local)
+	merged := Config{
+		Agents:       append([]Definition(nil), local.Agents...),
+		Shells:       append([]Shell(nil), local.Shells...),
+		RelayBaseURL: local.RelayBaseURL,
+	}
+	for i := range merged.Agents {
+		hostedAgent, ok := hosted.GetAgent(merged.Agents[i].Name)
+		if !ok || strings.TrimSpace(merged.Agents[i].Brief) != "" {
+			continue
+		}
+		merged.Agents[i].Brief = strings.TrimSpace(hostedAgent.Brief)
+	}
+	return merged
 }
 
 func loadInstalledDefaultConfig() (Config, string, error) {

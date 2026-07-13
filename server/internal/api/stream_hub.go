@@ -1075,16 +1075,35 @@ func (h *StreamHub) WriteJSON(clientID string, conn *websocket.Conn, value any) 
 	lock.Lock()
 	defer lock.Unlock()
 	if h.e2eeManager != nil && h.e2eeManager.Enabled() {
-		if resp, ok := value.(WSResponse); ok && resp.Type == "e2ee.error" {
-			return conn.WriteJSON(resp)
-		}
-		sess, err := h.e2eeManager.SessionForClient(clientID)
+		sess, err := h.e2eeManager.SessionForClientNoTouch(clientID)
 		if err != nil {
+			if resp, ok := value.(WSResponse); ok && resp.Type == "e2ee.error" {
+				return conn.WriteJSON(resp)
+			}
 			return nil
+		}
+		if sess.ProtocolVersion < e2ee.ProtocolVersionV2 {
+			if resp, ok := value.(WSResponse); ok && resp.Type == "e2ee.error" {
+				return conn.WriteJSON(resp)
+			}
+			sess, err = h.e2eeManager.SessionForClient(clientID)
+			if err != nil {
+				return nil
+			}
 		}
 		payload, err := json.Marshal(value)
 		if err != nil {
 			return err
+		}
+		if sess.ProtocolVersion >= e2ee.ProtocolVersionV2 {
+			sequence, err := h.e2eeManager.NextServerWSSequence(clientID, sess.ID)
+			if err != nil {
+				return err
+			}
+			payload, err = json.Marshal(E2EEWSFrame{Sequence: sequence, Message: payload})
+			if err != nil {
+				return err
+			}
 		}
 		envelope, err := e2ee.EncryptBytes(sess.Key, payload)
 		if err != nil {

@@ -311,21 +311,32 @@ func (h *WSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if e2eeManager := h.AppContext.GetE2EEManager(); e2eeManager != nil && e2eeManager.Enabled() {
 			sess, err := e2eeManager.SessionForClientNoTouch(clientID)
 			if err != nil {
-				h.sendE2EEError(conn, "", err.Error())
+				h.sendE2EEError(clientID, conn, "", err.Error())
 				continue
 			}
 			var envelope e2ee.CipherEnvelope
 			if err := json.Unmarshal(message, &envelope); err != nil {
-				h.sendE2EEError(conn, "", "e2ee_session_missing")
+				h.sendE2EEError(clientID, conn, "", "e2ee_frame_invalid")
 				continue
 			}
 			message, err = e2ee.DecryptBytes(sess.Key, &envelope)
 			if err != nil {
-				h.sendE2EEError(conn, "", "e2ee_proof_invalid")
+				h.sendE2EEError(clientID, conn, "", "e2ee_frame_invalid")
 				continue
 			}
-			if err := e2eeManager.TouchSessionForClient(clientID); err != nil {
-				h.sendE2EEError(conn, "", err.Error())
+			if sess.ProtocolVersion >= e2ee.ProtocolVersionV2 {
+				var frame E2EEWSFrame
+				if err := json.Unmarshal(message, &frame); err != nil || len(frame.Message) == 0 {
+					h.sendE2EEError(clientID, conn, "", "e2ee_frame_invalid")
+					continue
+				}
+				if err := e2eeManager.ConsumeClientWSSequence(clientID, sess.ID, frame.Sequence); err != nil {
+					h.sendE2EEError(clientID, conn, "", err.Error())
+					continue
+				}
+				message = frame.Message
+			} else if err := e2eeManager.TouchSessionForClient(clientID); err != nil {
+				h.sendE2EEError(clientID, conn, "", err.Error())
 				continue
 			}
 		}
@@ -366,6 +377,9 @@ func (h *WSHandler) requireWSProof(r *http.Request, clientID string) error {
 	expected := e2ee.BuildRequestProof(sess.Key, r.Method, wsProofPath(r), ts, clientID)
 	if !e2ee.VerifyProof(expected, proof) {
 		return errInvalidRequest("e2ee_proof_invalid")
+	}
+	if !manager.ConsumeRequestProof(clientID, proof, timestamp.Add(requestProofMaxSkew)) {
+		return errInvalidRequest("e2ee_proof_replayed")
 	}
 	if err := manager.TouchSessionForClient(clientID); err != nil {
 		return errInvalidRequest(err.Error())
@@ -1256,7 +1270,7 @@ func (h *WSHandler) sendWSError(conn *websocket.Conn, clientID, id, code, messag
 	_ = h.writeWSJSON(clientID, conn, resp)
 }
 
-func (h *WSHandler) sendE2EEError(conn *websocket.Conn, id, code string) {
+func (h *WSHandler) sendE2EEError(clientID string, conn *websocket.Conn, id, code string) {
 	resp := WSResponse{
 		ID:   id,
 		Type: "e2ee.error",
@@ -1264,7 +1278,7 @@ func (h *WSHandler) sendE2EEError(conn *websocket.Conn, id, code string) {
 			"code": code,
 		},
 	}
-	_ = h.writeWSJSON("", conn, resp)
+	_ = h.writeWSJSON(clientID, conn, resp)
 }
 
 func (h *WSHandler) sendWSAccepted(conn *websocket.Conn, clientID, requestID, rootID, sessionKey string) {

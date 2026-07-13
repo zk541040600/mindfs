@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -788,6 +789,109 @@ func TestRequireWSProofRejectsMissingProofWhenE2EEEnabled(t *testing.T) {
 
 	if err := handler.requireWSProof(req, clientID); err == nil {
 		t.Fatal("expected missing proof to be rejected")
+	}
+}
+
+func TestRequireWSProofRejectsReplay(t *testing.T) {
+	key := []byte("0123456789abcdef0123456789abcdef")
+	clientID := "web-test"
+	manager := e2ee.NewManager(e2ee.Config{Enabled: true, NodeID: "node", PairingSecret: "secret"})
+	if _, err := manager.OpenSessionForClient(clientID, e2ee.DerivedKey{Transport: key}); err != nil {
+		t.Fatalf("OpenSessionForClient: %v", err)
+	}
+	handler := &WSHandler{AppContext: &AppContext{E2EE: manager}}
+	ts := time.Now().UTC().Format(time.RFC3339Nano)
+	proofPath := "/ws?client_id=" + url.QueryEscape(clientID)
+	proof := e2ee.BuildRequestProof(key, http.MethodGet, proofPath, ts, clientID)
+	req := httptest.NewRequest(http.MethodGet, proofPath+"&"+wsTSQuery+"="+url.QueryEscape(ts)+"&"+wsProofQuery+"="+url.QueryEscape(proof), nil)
+	if err := handler.requireWSProof(req, clientID); err != nil {
+		t.Fatalf("first requireWSProof returned error: %v", err)
+	}
+	if err := handler.requireWSProof(req, clientID); err == nil || !strings.Contains(err.Error(), "e2ee_proof_replayed") {
+		t.Fatalf("replayed requireWSProof error = %v, want e2ee_proof_replayed", err)
+	}
+}
+
+func TestWSRejectsReplayedV2Frame(t *testing.T) {
+	key := []byte("0123456789abcdef0123456789abcdef")
+	clientID := "web-v2"
+	manager := e2ee.NewManager(e2ee.Config{Enabled: true, NodeID: "node", PairingSecret: "secret"})
+	if _, err := manager.OpenSessionForClient(clientID, e2ee.DerivedKey{Transport: key, ProtocolVersion: e2ee.ProtocolVersionV2}); err != nil {
+		t.Fatalf("OpenSessionForClient: %v", err)
+	}
+	server := httptest.NewServer(&WSHandler{AppContext: &AppContext{E2EE: manager}})
+	defer server.Close()
+
+	ts := time.Now().UTC().Format(time.RFC3339Nano)
+	proofPath := "/ws?client_id=" + url.QueryEscape(clientID)
+	proof := e2ee.BuildRequestProof(key, http.MethodGet, proofPath, ts, clientID)
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + proofPath + "&" + wsTSQuery + "=" + url.QueryEscape(ts) + "&" + wsProofQuery + "=" + url.QueryEscape(proof)
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer conn.Close()
+
+	request, err := json.Marshal(WSRequest{ID: "ping-1", Type: "ping", Payload: map[string]any{}})
+	if err != nil {
+		t.Fatalf("Marshal request: %v", err)
+	}
+	frame, err := json.Marshal(E2EEWSFrame{Sequence: 1, Message: request})
+	if err != nil {
+		t.Fatalf("Marshal frame: %v", err)
+	}
+	envelope, err := e2ee.EncryptBytes(key, frame)
+	if err != nil {
+		t.Fatalf("EncryptBytes: %v", err)
+	}
+	wire, err := json.Marshal(envelope)
+	if err != nil {
+		t.Fatalf("Marshal envelope: %v", err)
+	}
+	if err := conn.WriteMessage(websocket.TextMessage, wire); err != nil {
+		t.Fatalf("WriteMessage first frame: %v", err)
+	}
+
+	readResponse := func(wantSequence uint64) WSResponse {
+		t.Helper()
+		if err := conn.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+			t.Fatalf("SetReadDeadline: %v", err)
+		}
+		_, raw, readErr := conn.ReadMessage()
+		if readErr != nil {
+			t.Fatalf("ReadMessage: %v", readErr)
+		}
+		var responseEnvelope e2ee.CipherEnvelope
+		if err := json.Unmarshal(raw, &responseEnvelope); err != nil {
+			t.Fatalf("Unmarshal response envelope: %v", err)
+		}
+		plaintext, err := e2ee.DecryptBytes(key, &responseEnvelope)
+		if err != nil {
+			t.Fatalf("DecryptBytes response: %v", err)
+		}
+		var responseFrame E2EEWSFrame
+		if err := json.Unmarshal(plaintext, &responseFrame); err != nil {
+			t.Fatalf("Unmarshal response frame: %v", err)
+		}
+		if responseFrame.Sequence != wantSequence {
+			t.Fatalf("response sequence = %d, want %d", responseFrame.Sequence, wantSequence)
+		}
+		var response WSResponse
+		if err := json.Unmarshal(responseFrame.Message, &response); err != nil {
+			t.Fatalf("Unmarshal response: %v", err)
+		}
+		return response
+	}
+
+	if response := readResponse(1); response.Type != "pong" {
+		t.Fatalf("first response = %#v, want pong", response)
+	}
+	if err := conn.WriteMessage(websocket.TextMessage, wire); err != nil {
+		t.Fatalf("WriteMessage replay: %v", err)
+	}
+	response := readResponse(2)
+	if response.Type != "e2ee.error" || response.Payload["code"] != "e2ee_frame_replayed" {
+		t.Fatalf("replay response = %#v, want encrypted e2ee_frame_replayed", response)
 	}
 }
 

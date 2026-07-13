@@ -56,7 +56,15 @@ func StartInSession(ctx context.Context, opts Options) (Process, error) {
 	if rootID == "" || sessionKey == "" {
 		return Start(ctx, opts)
 	}
-	return defaultLongShells.start(ctx, longShellKey(rootID, sessionKey, opts.Shell), opts)
+	return defaultLongShells.start(ctx, longShellKey(rootID, sessionKey, resolvedSessionShell(opts)), opts)
+}
+
+// resolvedSessionShell returns the canonical shell identity used to retain one terminal per session.
+func resolvedSessionShell(opts Options) string {
+	if spec, ok := ResolveConfiguredShell(opts.Shells, opts.Shell); ok {
+		return spec.Command
+	}
+	return DefaultShell()
 }
 
 func CloseSession(rootID, sessionKey string) {
