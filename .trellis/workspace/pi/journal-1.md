@@ -75,3 +75,37 @@ Reduced entry JS by 16.89%, added build-time Brotli/gzip with q-aware Go serving
 ### Next Steps
 
 - None - task complete
+
+
+## Session 3: Restore MindFS relay and Pi recovery
+
+**Date**: 2026-07-22
+**Task**: Restore MindFS relay and Pi recovery
+**Branch**: `main`
+
+### Summary
+
+Made systemd the canonical persistent supervisor, restored automatic relay reconnect, and fixed Pi SDK model discovery and selection after service restart.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `d1ae4ab` | (see git log) |
+| `bf0826e` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
