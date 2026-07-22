@@ -78,13 +78,6 @@ health_check() {
   return 1
 }
 
-systemd_unit_loaded() {
-  local state
-  command -v systemctl >/dev/null 2>&1 || return 1
-  state="$(systemctl show "${SERVICE_NAME}" -p LoadState --value 2>/dev/null || true)"
-  [[ "${state}" == "loaded" ]]
-}
-
 restart_systemd() {
   systemctl daemon-reload
   systemctl restart "${SERVICE_NAME}"
@@ -143,7 +136,8 @@ if [[ "${pid}" == "1" ]]; then
   exit 2
 fi
 
-if systemd_unit_loaded && systemctl is-active --quiet "${SERVICE_NAME}"; then
+if command -v systemctl >/dev/null 2>&1 &&
+  [[ "$(systemctl show "${SERVICE_NAME}" -p LoadState --value 2>/dev/null || true)" == "loaded" ]]; then
   restart_systemd
   exit 0
 fi
@@ -152,11 +146,6 @@ if compose_restart; then
   if health_check; then
     "${BIN}" -addr "${ADDR}" -status || true
   fi
-  exit 0
-fi
-
-if systemd_unit_loaded; then
-  restart_systemd
   exit 0
 fi
 
