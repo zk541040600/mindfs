@@ -523,6 +523,27 @@ func TestRuntimeUIDemoEmitsExtensionUIAndAcceptsResponses(t *testing.T) {
 	}
 }
 
+func TestRuntimeRealSDKListsModelsFromServiceRuntime(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	sess, err := NewRuntime().OpenSession(ctx, OpenOptions{
+		AgentName:  "pi",
+		SessionKey: "sdk-real-model-list-test",
+		RootPath:   t.TempDir(),
+		Command:    "pi",
+		Probe:      true,
+		ProbePath:  filepath.Join(repoRoot(t), "server", "internal", "agent", "pi_sdk_bridge", "probe.mjs"),
+		AgentDir:   t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sess.Close() })
+	if _, err := sess.ListModels(ctx); err != nil {
+		t.Fatalf("ListModels with the real Pi SDK: %v", err)
+	}
+}
+
 func TestRuntimeRealSDKExtensionUIRoundTripCompletesTurn(t *testing.T) {
 	repo := repoRoot(t)
 	runtimeRoot := t.TempDir()

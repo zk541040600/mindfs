@@ -21,7 +21,9 @@ This directory contains guidelines for backend development. Fill in each file wi
 | [Filesystem Boundaries](./filesystem-boundaries.md) | Managed-root, symbolic-link, and metadata containment | Active |
 | [Command Execution](./command-execution.md) | Persistent shell identity, configured-shell selection, and cleanup | Active |
 | [Hosted Agent Configuration](./hosted-agent-config.md) | Remote metadata refresh without remote process authority | Active |
+| [Pi SDK Runtime](./pi-sdk-runtime.md) | Service-owned model discovery and JSONL runtime compatibility | Active |
 | [Self Update](./self-update.md) | Verified package installation and Windows detached restart layout | Active |
+| [Service Supervision](./service-supervision.md) | Single-supervisor startup and persistent relay recovery | Active |
 | [Quality Guidelines](./quality-guidelines.md) | Code standards, forbidden patterns | To fill |
 | [Logging Guidelines](./logging-guidelines.md) | Structured logging, log levels | To fill |
 

@@ -2452,7 +2452,11 @@ async function createJsonlSDKRuntime(options) {
     cwd,
     agentDir,
   });
-  const model = resolveJsonlModel(services.modelRegistry, options.model);
+  const modelRuntime = services.modelRuntime ?? services.modelRegistry;
+  if (!modelRuntime) {
+    throw new ProbeError("E_SDK_LOAD", "Pi SDK services do not expose a model runtime");
+  }
+  const model = resolveJsonlModel(modelRuntime, options.model);
   const pendingQuestions = new Map();
   const { session } = await createAgentSessionFromServices({
     services,
@@ -2761,11 +2765,11 @@ async function createJsonlSDKRuntime(options) {
       }, request.id));
     },
     getAvailableModels: async function (request) {
-      const models = await filterModelsByPiEnabledModels(await session.modelRegistry.getAvailable(), agentDir);
+      const models = await filterModelsByPiEnabledModels(await modelRuntime.getAvailable(), agentDir);
       writeJsonl(successResponse("get_available_models", { models }, request.id));
     },
     setModel: async function (request) {
-      const models = await filterModelsByPiEnabledModels(await session.modelRegistry.getAvailable(), agentDir);
+      const models = await filterModelsByPiEnabledModels(await modelRuntime.getAvailable(), agentDir);
       const model = models.find((item) => item.provider === request.provider && item.id === request.modelId);
       if (!model) {
         throw new ProbeError("E_PARAM", `model not found: ${request.provider}/${request.modelId}`);
@@ -3010,7 +3014,7 @@ async function openJsonlSDKSessionManager(options, cwd, agentDir) {
   };
 }
 
-function resolveJsonlModel(modelRegistry, modelRef) {
+function resolveJsonlModel(modelRuntime, modelRef) {
   const ref = String(modelRef ?? "").trim();
   if (!ref) {
     return undefined;
@@ -3021,7 +3025,7 @@ function resolveJsonlModel(modelRegistry, modelRef) {
   }
   const provider = ref.slice(0, slash);
   const modelId = ref.slice(slash + 1);
-  const model = modelRegistry.find(provider, modelId);
+  const model = modelRuntime.getModel?.(provider, modelId) ?? modelRuntime.find?.(provider, modelId);
   if (!model) {
     throw new ProbeError("E_PARAM", `model not found: ${ref}`);
   }
